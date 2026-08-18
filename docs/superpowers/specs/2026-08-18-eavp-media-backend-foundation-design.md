@@ -1,6 +1,6 @@
 # EAVP Media Backend Foundation 0.2 设计规格
 
-> 状态：待审阅
+> 状态：已批准
 >
 > 适用版本：0.2.0
 >
