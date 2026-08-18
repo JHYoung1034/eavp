@@ -28,6 +28,8 @@ cmake --build --preset linux-debug-fetch-deps
 ctest --preset linux-debug-fetch-deps
 ```
 
+Release 和 Sanitizer 环境没有系统 GoogleTest 时，分别使用 `linux-release-fetch-deps` 和 `linux-asan-fetch-deps`。
+
 安装和消费示例见 `docs/architecture/build-and-portability.md`。
 
 ## 文档
@@ -40,4 +42,3 @@ ctest --preset linux-debug-fetch-deps
 ## 发布属性
 
 本仓库当前按内部专有软件管理，未授予开源许可。第三方测试依赖及许可证记录在 `docs/standards/third-party-dependencies.md`。
-

@@ -44,6 +44,13 @@
       }
     },
     {
+      "name": "linux-release-fetch-deps",
+      "inherits": "linux-release",
+      "cacheVariables": {
+        "EAVP_FETCH_TEST_DEPS": "ON"
+      }
+    },
+    {
       "name": "linux-asan",
       "inherits": "linux-base",
       "cacheVariables": {
@@ -52,6 +59,13 @@
         "EAVP_BUILD_EXAMPLES": "ON",
         "EAVP_FETCH_TEST_DEPS": "OFF",
         "EAVP_ENABLE_SANITIZERS": "ON"
+      }
+    },
+    {
+      "name": "linux-asan-fetch-deps",
+      "inherits": "linux-asan",
+      "cacheVariables": {
+        "EAVP_FETCH_TEST_DEPS": "ON"
       }
     },
     {
@@ -70,7 +84,9 @@
     { "name": "linux-debug", "configurePreset": "linux-debug" },
     { "name": "linux-debug-fetch-deps", "configurePreset": "linux-debug-fetch-deps" },
     { "name": "linux-release", "configurePreset": "linux-release" },
+    { "name": "linux-release-fetch-deps", "configurePreset": "linux-release-fetch-deps" },
     { "name": "linux-asan", "configurePreset": "linux-asan" },
+    { "name": "linux-asan-fetch-deps", "configurePreset": "linux-asan-fetch-deps" },
     { "name": "aarch64-release", "configurePreset": "aarch64-release" }
   ],
   "testPresets": [
@@ -90,10 +106,19 @@
       "output": { "outputOnFailure": true }
     },
     {
+      "name": "linux-release-fetch-deps",
+      "configurePreset": "linux-release-fetch-deps",
+      "output": { "outputOnFailure": true }
+    },
+    {
       "name": "linux-asan",
       "configurePreset": "linux-asan",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-asan-fetch-deps",
+      "configurePreset": "linux-asan-fetch-deps",
       "output": { "outputOnFailure": true }
     }
   ]
 }
-

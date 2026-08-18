@@ -4,6 +4,7 @@ project(EAVP VERSION 0.1.0 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
+find_package(Threads REQUIRED)
 
 option(EAVP_BUILD_TESTS "构建 EAVP 测试" ON)
 option(EAVP_BUILD_EXAMPLES "构建 EAVP 示例" ON)
@@ -30,6 +31,20 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 add_subdirectory(src)
+
+if(EAVP_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    foreach(eavp_sanitized_target IN ITEMS
+            eavp_media eavp_control eavp_management eavp_platform)
+        target_compile_options(
+            ${eavp_sanitized_target}
+            INTERFACE -fsanitize=address,undefined -fno-omit-frame-pointer
+        )
+        target_link_options(
+            ${eavp_sanitized_target}
+            INTERFACE -fsanitize=address,undefined
+        )
+    endforeach()
+endif()
 
 if(EAVP_BUILD_EXAMPLES)
     add_subdirectory(examples)
@@ -67,4 +82,3 @@ install(
         ${CMAKE_CURRENT_BINARY_DIR}/EAVPConfigVersion.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/EAVP
 )
-

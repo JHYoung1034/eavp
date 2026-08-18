@@ -26,6 +26,13 @@ TEST(ResultTest, HoldsEitherValueOrFailure) {
     EXPECT_EQ(eavp::StatusCode::kNotFound, failure.status().code());
 }
 
+TEST(ResultTest, RejectsSuccessStatusWithoutAValue) {
+    const eavp::Result<int> invalid(eavp::Status::ok_status());
+
+    EXPECT_FALSE(invalid.ok());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument, invalid.status().code());
+}
+
 TEST(TimeBaseTest, RejectsNonPositiveDenominator) {
     EXPECT_TRUE(eavp::TimeBase::create(1, 90000).ok());
     EXPECT_EQ(eavp::StatusCode::kInvalidArgument,

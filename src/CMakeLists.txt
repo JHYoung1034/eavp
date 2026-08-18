@@ -49,7 +49,7 @@ add_library(eavp_control STATIC
 add_library(EAVP::control ALIAS eavp_control)
 target_link_libraries(
     eavp_control
-    PUBLIC EAVP::media
+    PUBLIC EAVP::media Threads::Threads
     PRIVATE $<BUILD_INTERFACE:eavp_project_options>
 )
 target_include_directories(
@@ -71,7 +71,7 @@ add_library(eavp_management STATIC
 add_library(EAVP::management ALIAS eavp_management)
 target_link_libraries(
     eavp_management
-    PUBLIC EAVP::base
+    PUBLIC EAVP::base Threads::Threads
     PRIVATE $<BUILD_INTERFACE:eavp_project_options>
 )
 target_include_directories(
