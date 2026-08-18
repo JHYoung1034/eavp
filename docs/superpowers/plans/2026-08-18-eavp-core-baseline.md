@@ -19,11 +19,18 @@
 
 ## 任务
 
-- [ ] 建立规范、文档索引、构建预设、测试依赖和安装导出。
-- [ ] 以失败测试驱动 Status/Result、ID、时间基准和 Buffer/Packet。
-- [ ] 以失败测试驱动 Queue/Port、Graph、Node/Pipeline 状态机和失败回滚。
-- [ ] 以失败测试驱动 StateStore、Command/Query 和 PipelineReconciler。
-- [ ] 以失败测试驱动 Metrics、Health 和模拟平台纵切面。
-- [ ] 完成 Debug、Release、Sanitizer、安装消费和 aarch64 交叉构建验证。
-- [ ] 补齐架构、ADR、测试、ABI 和路线图文档并进行规格覆盖复核。
+- [x] 建立规范、文档索引、构建预设、测试依赖和安装导出。
+- [x] 以失败测试驱动 Status/Result、ID、时间基准和 Buffer/Packet。
+- [x] 以失败测试驱动 Queue/Port、Graph、Node/Pipeline 状态机和失败回滚。
+- [x] 以失败测试驱动 StateStore、Command/Query 和 PipelineReconciler。
+- [x] 以失败测试驱动 Metrics、Health 和模拟平台纵切面。
+- [x] 完成 Debug、Release、Sanitizer、安装消费和 aarch64 交叉构建验证。
+- [x] 补齐架构、ADR、测试、ABI 和路线图文档并进行规格覆盖复核。
 
+## 验证记录
+
+- `linux-debug-fetch-deps`：23/23 测试通过。
+- `linux-release-fetch-deps`：23/23 测试通过。
+- `linux-asan-fetch-deps`：23/23 测试通过，包含安装消费工程。
+- `aarch64-release`：五个公开 target 交叉编译通过，产物确认为 aarch64。
+- 模拟示例输出：`pipeline=live0 state=running processed=100`。
