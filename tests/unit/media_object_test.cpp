@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "eavp/media/buffer.hpp"
+#include "eavp/media/frame.hpp"
 #include "eavp/media/media_packet.hpp"
 
 namespace {
@@ -34,6 +35,28 @@ TEST(MediaPacketTest, CopyRetainsSharedPayloadAndMetadata) {
     EXPECT_EQ(9000, copy.pts());
     EXPECT_EQ(3600, copy.duration());
     EXPECT_TRUE(copy.key_frame());
+}
+
+TEST(FrameTest, VideoAndAudioFramesValidateShapeAndShareBuffer) {
+    const eavp::Buffer video_buffer = eavp::Buffer::allocate(128U).value();
+    const eavp::TimeBase video_time_base = eavp::TimeBase::create(1, 90000).value();
+    const eavp::Result<eavp::VideoFrame> video = eavp::VideoFrame::create(
+        video_buffer, eavp::PixelFormat::kNv12, 16, 8, 16, 9000, video_time_base);
+    ASSERT_TRUE(video.ok());
+    EXPECT_EQ(video_buffer.data(), video.value().buffer().data());
+    EXPECT_EQ(16, video.value().width());
+    EXPECT_EQ(8, video.value().height());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::VideoFrame::create(video_buffer, eavp::PixelFormat::kNv12, 0, 8, 16,
+                                       0, video_time_base).status().code());
+
+    const eavp::Buffer audio_buffer = eavp::Buffer::allocate(64U).value();
+    const eavp::Result<eavp::AudioFrame> audio = eavp::AudioFrame::create(
+        audio_buffer, eavp::SampleFormat::kSigned16, 48000, 2, 16, 0,
+        eavp::TimeBase::create(1, 48000).value());
+    ASSERT_TRUE(audio.ok());
+    EXPECT_EQ(48000, audio.value().sample_rate());
+    EXPECT_EQ(2, audio.value().channels());
 }
 
 }  // namespace

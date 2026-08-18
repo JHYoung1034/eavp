@@ -40,3 +40,69 @@ install(TARGETS eavp_media EXPORT EAVPTargets)
 install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/eavp/media
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eavp
         OPTIONAL)
+
+add_library(eavp_control STATIC
+    control/command.cpp
+    control/pipeline_reconciler.cpp
+    control/state_store.cpp
+)
+add_library(EAVP::control ALIAS eavp_control)
+target_link_libraries(
+    eavp_control
+    PUBLIC EAVP::media
+    PRIVATE $<BUILD_INTERFACE:eavp_project_options>
+)
+target_include_directories(
+    eavp_control
+    PUBLIC
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+set_target_properties(eavp_control PROPERTIES EXPORT_NAME control)
+install(TARGETS eavp_control EXPORT EAVPTargets)
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/eavp/control
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eavp
+        OPTIONAL)
+
+add_library(eavp_management STATIC
+    management/health.cpp
+    management/metrics.cpp
+)
+add_library(EAVP::management ALIAS eavp_management)
+target_link_libraries(
+    eavp_management
+    PUBLIC EAVP::base
+    PRIVATE $<BUILD_INTERFACE:eavp_project_options>
+)
+target_include_directories(
+    eavp_management
+    PUBLIC
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+set_target_properties(eavp_management PROPERTIES EXPORT_NAME management)
+install(TARGETS eavp_management EXPORT EAVPTargets)
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/eavp/management
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eavp
+        OPTIONAL)
+
+add_library(eavp_platform STATIC
+    platform/simulated_platform.cpp
+)
+add_library(EAVP::platform ALIAS eavp_platform)
+target_link_libraries(
+    eavp_platform
+    PUBLIC EAVP::control EAVP::management
+    PRIVATE $<BUILD_INTERFACE:eavp_project_options>
+)
+target_include_directories(
+    eavp_platform
+    PUBLIC
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+set_target_properties(eavp_platform PROPERTIES EXPORT_NAME platform)
+install(TARGETS eavp_platform EXPORT EAVPTargets)
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/eavp/platform
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eavp
+        OPTIONAL)

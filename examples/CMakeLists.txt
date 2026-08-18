@@ -1,2 +1,1 @@
-# 示例在对应端到端行为实现后加入，避免发布无行为占位程序。
-
+add_subdirectory(simulated_live)

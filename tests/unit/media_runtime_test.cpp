@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "eavp/media/graph.hpp"
+#include "eavp/media/executor.hpp"
 #include "eavp/media/media_packet.hpp"
 #include "eavp/media/node.hpp"
 #include "eavp/media/pipeline.hpp"
@@ -40,6 +41,17 @@ TEST(QueueTest, DropOldestRetainsNewestPacket) {
 
     ASSERT_TRUE(packet.ok());
     EXPECT_EQ(20, packet.value()->pts());
+    EXPECT_EQ(1U, queue.dropped_count());
+}
+
+TEST(QueueTest, DropNewestKeepsAlreadyQueuedPacket) {
+    eavp::BoundedQueue<eavp::MediaPacket> queue(1, eavp::OverflowPolicy::kDropNewest);
+    ASSERT_TRUE(queue.push(make_packet(10)).ok());
+    ASSERT_TRUE(queue.push(make_packet(20)).ok());
+
+    const eavp::Result<std::shared_ptr<const eavp::MediaPacket> > packet = queue.pop();
+    ASSERT_TRUE(packet.ok());
+    EXPECT_EQ(10, packet.value()->pts());
     EXPECT_EQ(1U, queue.dropped_count());
 }
 
@@ -131,6 +143,34 @@ TEST(PipelineTest, RepeatedStartAndStopDoNotRepeatNodeSideEffects) {
 
     EXPECT_EQ(1, node->starts());
     EXPECT_EQ(1, node->stops());
+}
+
+class FailingTickNode : public eavp::MediaNode {
+public:
+    FailingTickNode() : eavp::MediaNode("tick"), ticks_(0) {}
+    int ticks() const { return ticks_; }
+
+protected:
+    eavp::Status on_tick() override {
+        ++ticks_;
+        return ticks_ == 3 ? eavp::Status(eavp::StatusCode::kInternal, "tick failed")
+                           : eavp::Status::ok_status();
+    }
+
+private:
+    int ticks_;
+};
+
+TEST(ExecutorTest, StopsAtFirstPipelineTickFailure) {
+    eavp::MediaPipeline pipeline("live0");
+    FailingTickNode* node = new FailingTickNode();
+    ASSERT_TRUE(pipeline.add_node(std::unique_ptr<eavp::MediaNode>(node)).ok());
+    ASSERT_TRUE(pipeline.start().ok());
+    eavp::DeterministicExecutor executor;
+
+    EXPECT_EQ(eavp::StatusCode::kInternal, executor.run(&pipeline, 10U).code());
+    EXPECT_EQ(3, node->ticks());
+    EXPECT_EQ(eavp::PipelineState::kError, pipeline.state());
 }
 
 }  // namespace

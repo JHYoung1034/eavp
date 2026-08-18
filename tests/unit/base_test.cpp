@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "eavp/base/result.hpp"
+#include "eavp/base/strong_id.hpp"
 #include "eavp/base/status.hpp"
 #include "eavp/base/time.hpp"
 
@@ -31,5 +32,14 @@ TEST(TimeBaseTest, RejectsNonPositiveDenominator) {
               eavp::TimeBase::create(1, 0).status().code());
 }
 
-}  // namespace
+TEST(StrongIdTest, RejectsEmptyValueAndPreservesTypeSpecificValue) {
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::PipelineId::create("").status().code());
+    const eavp::PipelineId pipeline = eavp::PipelineId::create("live0").value();
+    const eavp::NodeId node = eavp::NodeId::create("source").value();
 
+    EXPECT_EQ("live0", pipeline.value());
+    EXPECT_EQ("source", node.value());
+}
+
+}  // namespace
