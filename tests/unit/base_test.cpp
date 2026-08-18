@@ -1,0 +1,35 @@
+#include <gtest/gtest.h>
+
+#include "eavp/base/result.hpp"
+#include "eavp/base/status.hpp"
+#include "eavp/base/time.hpp"
+
+namespace {
+
+TEST(StatusTest, FailurePreservesCodeAndMessage) {
+    const eavp::Status status(eavp::StatusCode::kInvalidArgument, "invalid width");
+
+    EXPECT_FALSE(status.ok());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument, status.code());
+    EXPECT_EQ("invalid width", status.message());
+}
+
+TEST(ResultTest, HoldsEitherValueOrFailure) {
+    const eavp::Result<int> value(42);
+    const eavp::Result<int> failure(
+        eavp::Status(eavp::StatusCode::kNotFound, "pipeline missing"));
+
+    ASSERT_TRUE(value.ok());
+    EXPECT_EQ(42, value.value());
+    EXPECT_FALSE(failure.ok());
+    EXPECT_EQ(eavp::StatusCode::kNotFound, failure.status().code());
+}
+
+TEST(TimeBaseTest, RejectsNonPositiveDenominator) {
+    EXPECT_TRUE(eavp::TimeBase::create(1, 90000).ok());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::TimeBase::create(1, 0).status().code());
+}
+
+}  // namespace
+

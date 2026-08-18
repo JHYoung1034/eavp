@@ -1,0 +1,70 @@
+cmake_minimum_required(VERSION 3.21)
+
+project(EAVP VERSION 0.1.0 LANGUAGES C CXX)
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+option(EAVP_BUILD_TESTS "构建 EAVP 测试" ON)
+option(EAVP_BUILD_EXAMPLES "构建 EAVP 示例" ON)
+option(EAVP_FETCH_TEST_DEPS "允许下载固定版本的测试依赖" OFF)
+option(EAVP_WARNINGS_AS_ERRORS "把编译器警告视为错误" OFF)
+option(EAVP_ENABLE_SANITIZERS "启用 AddressSanitizer 和 UndefinedBehaviorSanitizer" OFF)
+
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+add_library(eavp_project_options INTERFACE)
+target_compile_features(eavp_project_options INTERFACE cxx_std_11)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(eavp_project_options INTERFACE -Wall -Wextra -Wpedantic)
+    if(EAVP_WARNINGS_AS_ERRORS)
+        target_compile_options(eavp_project_options INTERFACE -Werror)
+    endif()
+    if(EAVP_ENABLE_SANITIZERS)
+        target_compile_options(eavp_project_options INTERFACE -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(eavp_project_options INTERFACE -fsanitize=address,undefined)
+    endif()
+endif()
+
+add_subdirectory(src)
+
+if(EAVP_BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif()
+
+if(EAVP_BUILD_TESTS)
+    include(CTest)
+    enable_testing()
+    include(cmake/EavpTesting.cmake)
+    add_subdirectory(tests)
+endif()
+
+install(
+    EXPORT EAVPTargets
+    FILE EAVPTargets.cmake
+    NAMESPACE EAVP::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/EAVP
+)
+
+configure_package_config_file(
+    cmake/EAVPConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/EAVPConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/EAVP
+)
+
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/EAVPConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMinorVersion
+)
+
+install(
+    FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/EAVPConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/EAVPConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/EAVP
+)
+

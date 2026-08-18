@@ -1,0 +1,99 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "linux-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "EAVP_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "linux-debug",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "EAVP_BUILD_TESTS": "ON",
+        "EAVP_BUILD_EXAMPLES": "ON",
+        "EAVP_FETCH_TEST_DEPS": "OFF"
+      }
+    },
+    {
+      "name": "linux-debug-fetch-deps",
+      "inherits": "linux-debug",
+      "cacheVariables": {
+        "EAVP_FETCH_TEST_DEPS": "ON"
+      }
+    },
+    {
+      "name": "linux-release",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "EAVP_BUILD_TESTS": "ON",
+        "EAVP_BUILD_EXAMPLES": "ON",
+        "EAVP_FETCH_TEST_DEPS": "OFF"
+      }
+    },
+    {
+      "name": "linux-asan",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "EAVP_BUILD_TESTS": "ON",
+        "EAVP_BUILD_EXAMPLES": "ON",
+        "EAVP_FETCH_TEST_DEPS": "OFF",
+        "EAVP_ENABLE_SANITIZERS": "ON"
+      }
+    },
+    {
+      "name": "aarch64-release",
+      "inherits": "linux-base",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/aarch64-linux-gnu.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "EAVP_BUILD_TESTS": "OFF",
+        "EAVP_BUILD_EXAMPLES": "OFF",
+        "EAVP_FETCH_TEST_DEPS": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "linux-debug", "configurePreset": "linux-debug" },
+    { "name": "linux-debug-fetch-deps", "configurePreset": "linux-debug-fetch-deps" },
+    { "name": "linux-release", "configurePreset": "linux-release" },
+    { "name": "linux-asan", "configurePreset": "linux-asan" },
+    { "name": "aarch64-release", "configurePreset": "aarch64-release" }
+  ],
+  "testPresets": [
+    {
+      "name": "linux-debug",
+      "configurePreset": "linux-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-debug-fetch-deps",
+      "configurePreset": "linux-debug-fetch-deps",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-release",
+      "configurePreset": "linux-release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-asan",
+      "configurePreset": "linux-asan",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}
+
