@@ -17,6 +17,7 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/eavp/base
         OPTIONAL)
 
 add_library(eavp_media STATIC
+    media/backend_registry.cpp
     media/buffer.cpp
     media/capability.cpp
     media/graph.cpp
@@ -31,7 +32,7 @@ add_library(EAVP::media ALIAS eavp_media)
 target_link_libraries(
     eavp_media
     PUBLIC EAVP::base
-    PRIVATE $<BUILD_INTERFACE:eavp_project_options>
+    PRIVATE $<BUILD_INTERFACE:eavp_project_options> Threads::Threads
 )
 target_include_directories(
     eavp_media

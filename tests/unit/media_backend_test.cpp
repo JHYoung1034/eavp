@@ -1,9 +1,14 @@
 #include <gtest/gtest.h>
 
 #include <limits>
+#include <memory>
 #include <string>
+#include <thread>
+#include <type_traits>
 #include <vector>
 
+#include "eavp/media/backend.hpp"
+#include "eavp/media/backend_registry.hpp"
 #include "eavp/media/capability.hpp"
 
 namespace {
@@ -125,6 +130,216 @@ eavp::ProviderCapability make_provider_with_encoder_capability(
         std::vector<eavp::VideoProcessorCapability>(),
         std::vector<eavp::VideoEncoderCapability>{capability}, 4,
         std::vector<std::string>{"encoder_sessions=4"});
+}
+
+eavp::VideoProcessorCapability make_processor_capability_for_test(
+    bool zero_copy = true) {
+    return eavp::VideoProcessorCapability(
+        eavp::DimensionRange(16, 1920, 2, 16),
+        eavp::DimensionRange(16, 1088, 2, 16),
+        eavp::DimensionRange(16, 1920, 2, 16),
+        eavp::DimensionRange(16, 1088, 2, 16),
+        std::vector<eavp::FormatMemoryDomain>{nv12_dmabuf_format()},
+        std::vector<eavp::FormatMemoryDomain>{nv12_dmabuf_format()},
+        std::vector<eavp::VideoProcessingOperation>{
+            eavp::VideoProcessingOperation::kScaling},
+        zero_copy);
+}
+
+eavp::VideoProcessorRequest make_processor_request(
+    const eavp::SelectionPreferences& preferences = no_preferences(),
+    const std::string& required_provider_id = "") {
+    const eavp::VideoProcessorConfig config =
+        eavp::VideoProcessorConfig::create(
+            make_nv12_format(1920, 1080, eavp::MemoryDomain::kDmaBuf),
+            make_nv12_format(1280, 720, eavp::MemoryDomain::kDmaBuf), 0, 0,
+            1920, 1080, 0)
+            .take_value();
+    return eavp::VideoProcessorRequest(
+        config,
+        std::vector<eavp::VideoProcessingOperation>{
+            eavp::VideoProcessingOperation::kScaling},
+        64U, 64U, false, eavp::SelectionConstraints(required_provider_id),
+        preferences);
+}
+
+eavp::VideoEncoderRequest make_encoder_request_with_preferences(
+    const eavp::SelectionPreferences& preferences,
+    const std::string& required_provider_id = "") {
+    return eavp::VideoEncoderRequest(
+        make_nv12_format(1920, 1080, eavp::MemoryDomain::kDmaBuf),
+        make_h264_config(1920, 1080, eavp::CodecProfile::kH264Main), 64U,
+        false, eavp::SelectionConstraints(required_provider_id), preferences);
+}
+
+class TestProcessor : public eavp::VideoProcessor {
+public:
+    TestProcessor() : state_(eavp::BackendState::kCreated) {}
+
+    eavp::BackendState state() const { return state_; }
+
+    eavp::Status configure(const eavp::VideoProcessorConfig&) {
+        const eavp::Status affinity = bind_to_current_thread();
+        if (!affinity.ok()) {
+            return affinity;
+        }
+        state_ = eavp::BackendState::kConfigured;
+        return eavp::Status::ok_status();
+    }
+
+    eavp::Status submit(
+        const std::shared_ptr<const eavp::VideoFrame>&) {
+        const eavp::Status affinity = verify_current_thread();
+        if (!affinity.ok()) {
+            return affinity;
+        }
+        state_ = eavp::BackendState::kRunning;
+        return eavp::Status::ok_status();
+    }
+
+    eavp::Result<std::shared_ptr<const eavp::VideoFrame> > receive() {
+        const eavp::Status affinity = verify_current_thread();
+        if (!affinity.ok()) {
+            return eavp::Result<std::shared_ptr<const eavp::VideoFrame> >(
+                affinity);
+        }
+        return eavp::Result<std::shared_ptr<const eavp::VideoFrame> >(
+            eavp::Status(eavp::StatusCode::kWouldBlock, "no test frame"));
+    }
+
+    eavp::Status begin_drain() {
+        const eavp::Status affinity = verify_current_thread();
+        if (!affinity.ok()) {
+            return affinity;
+        }
+        state_ = eavp::BackendState::kDraining;
+        return eavp::Status::ok_status();
+    }
+
+    eavp::Status reset() {
+        const eavp::Status affinity = verify_current_thread();
+        if (!affinity.ok()) {
+            return affinity;
+        }
+        state_ = eavp::BackendState::kCreated;
+        return eavp::Status::ok_status();
+    }
+
+private:
+    eavp::BackendState state_;
+};
+
+class TestEncoder : public eavp::VideoEncoder {
+public:
+    explicit TestEncoder(bool* destroyed = NULL)
+        : state_(eavp::BackendState::kCreated), destroyed_(destroyed) {}
+
+    ~TestEncoder() {
+        if (destroyed_ != NULL) {
+            *destroyed_ = true;
+        }
+    }
+
+    eavp::BackendState state() const { return state_; }
+
+    eavp::Status configure(const eavp::VideoFormat&,
+                           const eavp::VideoEncoderConfig&) {
+        const eavp::Status affinity = bind_to_current_thread();
+        if (!affinity.ok()) {
+            return affinity;
+        }
+        state_ = eavp::BackendState::kConfigured;
+        return eavp::Status::ok_status();
+    }
+
+    eavp::Status submit(
+        const std::shared_ptr<const eavp::VideoFrame>&) {
+        const eavp::Status affinity = verify_current_thread();
+        if (!affinity.ok()) {
+            return affinity;
+        }
+        state_ = eavp::BackendState::kRunning;
+        return eavp::Status::ok_status();
+    }
+
+    eavp::Result<std::shared_ptr<const eavp::MediaPacket> > receive() {
+        const eavp::Status affinity = verify_current_thread();
+        if (!affinity.ok()) {
+            return eavp::Result<std::shared_ptr<const eavp::MediaPacket> >(
+                affinity);
+        }
+        return eavp::Result<std::shared_ptr<const eavp::MediaPacket> >(
+            eavp::Status(eavp::StatusCode::kWouldBlock, "no test packet"));
+    }
+
+    eavp::Status begin_drain() {
+        const eavp::Status affinity = verify_current_thread();
+        if (!affinity.ok()) {
+            return affinity;
+        }
+        state_ = eavp::BackendState::kDraining;
+        return eavp::Status::ok_status();
+    }
+
+    eavp::Status reset() {
+        const eavp::Status affinity = verify_current_thread();
+        if (!affinity.ok()) {
+            return affinity;
+        }
+        state_ = eavp::BackendState::kCreated;
+        return eavp::Status::ok_status();
+    }
+
+private:
+    eavp::BackendState state_;
+    bool* destroyed_;
+};
+
+class TestBackendProvider : public eavp::MediaBackendProvider {
+public:
+    TestBackendProvider(const std::string& provider_id, bool available,
+                        eavp::ProviderKind kind, bool zero_copy)
+        : capability_(
+              provider_id, "test-1", "test-device",
+              available
+                  ? eavp::Status::ok_status()
+                  : eavp::Status(eavp::StatusCode::kDeviceLost,
+                                 "test device is unavailable"),
+              kind,
+              std::vector<eavp::VideoProcessorCapability>{
+                  make_processor_capability_for_test(zero_copy)},
+              std::vector<eavp::VideoEncoderCapability>{
+                  make_h264_capability_for_test(zero_copy)},
+              2, std::vector<std::string>()) {}
+
+    eavp::Result<eavp::ProviderCapability> probe() const {
+        return eavp::Result<eavp::ProviderCapability>(capability_);
+    }
+
+    eavp::Result<std::unique_ptr<eavp::VideoProcessor> >
+    create_video_processor() const {
+        std::unique_ptr<eavp::VideoProcessor> processor(new TestProcessor());
+        return eavp::Result<std::unique_ptr<eavp::VideoProcessor> >(
+            std::move(processor));
+    }
+
+    eavp::Result<std::unique_ptr<eavp::VideoEncoder> > create_video_encoder()
+        const {
+        std::unique_ptr<eavp::VideoEncoder> encoder(new TestEncoder());
+        return eavp::Result<std::unique_ptr<eavp::VideoEncoder> >(
+            std::move(encoder));
+    }
+
+private:
+    eavp::ProviderCapability capability_;
+};
+
+std::shared_ptr<eavp::MediaBackendProvider> make_test_provider(
+    const std::string& provider_id, bool available,
+    eavp::ProviderKind kind = eavp::ProviderKind::kSoftware,
+    bool zero_copy = true) {
+    return std::shared_ptr<eavp::MediaBackendProvider>(
+        new TestBackendProvider(provider_id, available, kind, zero_copy));
 }
 
 TEST(CapabilityTest, RejectsInvalidRangeAndChecksStepAndAlignmentCapacity) {
@@ -593,6 +808,241 @@ TEST(CapabilityTest, ZeroCopyScoreComesFromMatchedLayoutNotCallerInput) {
     ASSERT_TRUE(zero_copy.preference_score(request).ok());
     EXPECT_LT(zero_copy.preference_score(request).value(),
               needs_copy.preference_score(request).value());
+}
+
+TEST(BackendRegistryTest, RejectsDuplicateAndRegistrationAfterFreeze) {
+    eavp::BackendRegistry registry;
+    std::shared_ptr<eavp::MediaBackendProvider> first =
+        make_test_provider("same", true);
+    std::shared_ptr<eavp::MediaBackendProvider> second =
+        make_test_provider("same", true);
+
+    ASSERT_TRUE(registry.register_provider(first).ok());
+    EXPECT_EQ(eavp::StatusCode::kAlreadyExists,
+              registry.register_provider(second).code());
+    ASSERT_TRUE(registry.freeze().ok());
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              registry.register_provider(make_test_provider("late", true))
+                  .code());
+}
+
+TEST(BackendRegistryTest, SelectionIsIndependentOfRegistrationOrder) {
+    eavp::BackendRegistry forward;
+    ASSERT_TRUE(
+        forward.register_provider(make_test_provider("provider.a", true)).ok());
+    ASSERT_TRUE(
+        forward.register_provider(make_test_provider("provider.z", true)).ok());
+    ASSERT_TRUE(forward.freeze().ok());
+
+    eavp::BackendRegistry reverse;
+    ASSERT_TRUE(
+        reverse.register_provider(make_test_provider("provider.z", true)).ok());
+    ASSERT_TRUE(
+        reverse.register_provider(make_test_provider("provider.a", true)).ok());
+    ASSERT_TRUE(reverse.freeze().ok());
+
+    const eavp::VideoEncoderRequest encoder_request =
+        make_encoder_request_with_preferences(no_preferences());
+    const eavp::Result<eavp::EncoderSelection> forward_encoder =
+        forward.select_video_encoder(encoder_request);
+    const eavp::Result<eavp::EncoderSelection> reverse_encoder =
+        reverse.select_video_encoder(encoder_request);
+    ASSERT_TRUE(forward_encoder.ok());
+    ASSERT_TRUE(reverse_encoder.ok());
+    EXPECT_EQ("provider.a", forward_encoder.value().negotiation.provider_id);
+    EXPECT_EQ(forward_encoder.value().negotiation.provider_id,
+              reverse_encoder.value().negotiation.provider_id);
+
+    const eavp::VideoProcessorRequest processor_request =
+        make_processor_request();
+    const eavp::Result<eavp::ProcessorSelection> forward_processor =
+        forward.select_video_processor(processor_request);
+    const eavp::Result<eavp::ProcessorSelection> reverse_processor =
+        reverse.select_video_processor(processor_request);
+    ASSERT_TRUE(forward_processor.ok());
+    ASSERT_TRUE(reverse_processor.ok());
+    EXPECT_EQ("provider.a", forward_processor.value().negotiation.provider_id);
+    EXPECT_EQ(forward_processor.value().negotiation.provider_id,
+              reverse_processor.value().negotiation.provider_id);
+}
+
+TEST(BackendRegistryTest, UsesCapabilityPreferenceScoreInDocumentedOrder) {
+    eavp::BackendRegistry registry;
+    ASSERT_TRUE(registry
+                    .register_provider(make_test_provider(
+                        "z.preferred", true, eavp::ProviderKind::kSoftware,
+                        false))
+                    .ok());
+    ASSERT_TRUE(registry
+                    .register_provider(make_test_provider(
+                        "b.hardware-copy", true,
+                        eavp::ProviderKind::kHardware, false))
+                    .ok());
+    ASSERT_TRUE(registry
+                    .register_provider(make_test_provider(
+                        "c.hardware-zero", true,
+                        eavp::ProviderKind::kHardware, true))
+                    .ok());
+    ASSERT_TRUE(registry
+                    .register_provider(make_test_provider(
+                        "a.reference", true,
+                        eavp::ProviderKind::kReference, true))
+                    .ok());
+    ASSERT_TRUE(registry.freeze().ok());
+
+    const eavp::SelectionPreferences explicit_preference(
+        std::vector<std::string>{"z.preferred"}, true, true);
+    const eavp::Result<eavp::EncoderSelection> preferred =
+        registry.select_video_encoder(
+            make_encoder_request_with_preferences(explicit_preference));
+    ASSERT_TRUE(preferred.ok());
+    EXPECT_EQ("z.preferred", preferred.value().negotiation.provider_id);
+
+    const eavp::SelectionPreferences hardware_and_zero_copy(
+        std::vector<std::string>(), true, true);
+    const eavp::Result<eavp::EncoderSelection> zero_copy =
+        registry.select_video_encoder(make_encoder_request_with_preferences(
+            hardware_and_zero_copy));
+    ASSERT_TRUE(zero_copy.ok());
+    EXPECT_EQ("c.hardware-zero", zero_copy.value().negotiation.provider_id);
+
+    const eavp::SelectionPreferences hardware_only(std::vector<std::string>(),
+                                                    true, false);
+    const eavp::Result<eavp::EncoderSelection> hardware =
+        registry.select_video_encoder(
+            make_encoder_request_with_preferences(hardware_only));
+    ASSERT_TRUE(hardware.ok());
+    EXPECT_EQ("b.hardware-copy", hardware.value().negotiation.provider_id);
+
+    const eavp::Result<eavp::EncoderSelection> lexical =
+        registry.select_video_encoder(
+            make_encoder_request_with_preferences(no_preferences()));
+    ASSERT_TRUE(lexical.ok());
+    EXPECT_EQ("a.reference", lexical.value().negotiation.provider_id);
+}
+
+TEST(BackendRegistryTest, RequiredUnavailableProviderDoesNotFallBack) {
+    eavp::BackendRegistry registry;
+    ASSERT_TRUE(registry
+                    .register_provider(make_test_provider(
+                        "required.gone", false,
+                        eavp::ProviderKind::kHardware))
+                    .ok());
+    ASSERT_TRUE(registry
+                    .register_provider(make_test_provider(
+                        "healthy", true, eavp::ProviderKind::kSoftware))
+                    .ok());
+    ASSERT_TRUE(registry.freeze().ok());
+
+    const eavp::Result<eavp::EncoderSelection> result =
+        registry.select_video_encoder(make_encoder_request_with_preferences(
+            no_preferences(), "required.gone"));
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, result.status().code());
+    EXPECT_EQ("test device is unavailable", result.status().message());
+}
+
+TEST(BackendRegistryTest, AggregatesEachCandidatesFirstRejectionReason) {
+    eavp::BackendRegistry registry;
+    ASSERT_TRUE(
+        registry.register_provider(make_test_provider("provider.a", true)).ok());
+    ASSERT_TRUE(
+        registry.register_provider(make_test_provider("provider.b", true)).ok());
+    ASSERT_TRUE(registry.freeze().ok());
+    const eavp::VideoEncoderRequest unsupported = make_encoder_request(
+        1920, 1080, eavp::MemoryDomain::kCpu);
+
+    const eavp::Result<eavp::EncoderSelection> result =
+        registry.select_video_encoder(unsupported);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch, result.status().code());
+    EXPECT_NE(std::string::npos, result.status().message().find("provider.a"));
+    EXPECT_NE(std::string::npos, result.status().message().find("provider.b"));
+    EXPECT_NE(std::string::npos,
+              result.status().message().find("memory domain"));
+}
+
+TEST(BackendInterfaceTest, IsMoveOnlyAndDestroysThroughBaseUniquePointer) {
+    static_assert(!std::is_copy_constructible<TestEncoder>::value,
+                  "backend instances must not be copy constructible");
+    static_assert(!std::is_copy_assignable<TestEncoder>::value,
+                  "backend instances must not be copy assignable");
+
+    bool destroyed = false;
+    {
+        std::unique_ptr<eavp::VideoEncoder> encoder(
+            new TestEncoder(&destroyed));
+        EXPECT_EQ(eavp::BackendState::kCreated, encoder->state());
+    }
+    EXPECT_TRUE(destroyed);
+
+    const std::shared_ptr<eavp::MediaBackendProvider> provider =
+        make_test_provider("factory", true);
+    eavp::Result<std::unique_ptr<eavp::VideoEncoder> > factory_result =
+        provider->create_video_encoder();
+    ASSERT_TRUE(factory_result.ok());
+    std::unique_ptr<eavp::VideoEncoder> factory_encoder =
+        factory_result.take_value();
+    EXPECT_EQ(eavp::BackendState::kCreated, factory_encoder->state());
+}
+
+TEST(BackendInterfaceTest,
+     EncoderRejectsEveryLifecycleAndDataCallFromAnotherThread) {
+    TestEncoder encoder;
+    ASSERT_TRUE(encoder
+                    .configure(
+                        make_nv12_format(1920, 1080,
+                                         eavp::MemoryDomain::kDmaBuf),
+                        make_h264_config(
+                            1920, 1080, eavp::CodecProfile::kH264Main))
+                    .ok());
+
+    eavp::StatusCode submit_code = eavp::StatusCode::kOk;
+    eavp::StatusCode receive_code = eavp::StatusCode::kOk;
+    eavp::StatusCode drain_code = eavp::StatusCode::kOk;
+    eavp::StatusCode reset_code = eavp::StatusCode::kOk;
+    eavp::StatusCode configure_code = eavp::StatusCode::kOk;
+    std::thread other([&encoder, &submit_code, &receive_code, &drain_code,
+                       &reset_code, &configure_code]() {
+        configure_code =
+            encoder
+                .configure(
+                    make_nv12_format(1920, 1080,
+                                     eavp::MemoryDomain::kDmaBuf),
+                    make_h264_config(
+                        1920, 1080, eavp::CodecProfile::kH264Main))
+                .code();
+        submit_code = encoder
+                          .submit(std::shared_ptr<const eavp::VideoFrame>())
+                          .code();
+        receive_code = encoder.receive().status().code();
+        drain_code = encoder.begin_drain().code();
+        reset_code = encoder.reset().code();
+    });
+    other.join();
+
+    EXPECT_EQ(eavp::StatusCode::kInvalidState, configure_code);
+    EXPECT_EQ(eavp::StatusCode::kInvalidState, submit_code);
+    EXPECT_EQ(eavp::StatusCode::kInvalidState, receive_code);
+    EXPECT_EQ(eavp::StatusCode::kInvalidState, drain_code);
+    EXPECT_EQ(eavp::StatusCode::kInvalidState, reset_code);
+    EXPECT_EQ(eavp::BackendState::kConfigured, encoder.state());
+}
+
+TEST(BackendInterfaceTest, ProcessorUsesTheSameThreadAffinityContract) {
+    TestProcessor processor;
+    ASSERT_TRUE(processor.configure(make_processor_request().config()).ok());
+
+    eavp::StatusCode submit_code = eavp::StatusCode::kOk;
+    std::thread other([&processor, &submit_code]() {
+        submit_code = processor
+                          .submit(std::shared_ptr<const eavp::VideoFrame>())
+                          .code();
+    });
+    other.join();
+
+    EXPECT_EQ(eavp::StatusCode::kInvalidState, submit_code);
+    EXPECT_EQ(eavp::BackendState::kConfigured, processor.state());
 }
 
 }  // namespace
