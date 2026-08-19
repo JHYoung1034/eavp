@@ -2,6 +2,7 @@
 
 #include <limits>
 #include <memory>
+#include <new>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -332,6 +333,17 @@ public:
 
 private:
     eavp::ProviderCapability capability_;
+};
+
+class AllocationFailingProbeProvider : public TestBackendProvider {
+public:
+    AllocationFailingProbeProvider()
+        : TestBackendProvider("allocation.failure", true,
+                              eavp::ProviderKind::kSoftware, true) {}
+
+    eavp::Result<eavp::ProviderCapability> probe() const {
+        throw std::bad_alloc();
+    }
 };
 
 std::shared_ptr<eavp::MediaBackendProvider> make_test_provider(
@@ -826,6 +838,16 @@ TEST(BackendRegistryTest, RejectsDuplicateAndRegistrationAfterFreeze) {
                   .code());
 }
 
+TEST(BackendRegistryTest, ConvertsProbeAllocationFailureToResourceExhausted) {
+    eavp::BackendRegistry registry;
+    const std::shared_ptr<eavp::MediaBackendProvider> provider(
+        new AllocationFailingProbeProvider());
+
+    const eavp::Status status = registry.register_provider(provider);
+
+    EXPECT_EQ(eavp::StatusCode::kResourceExhausted, status.code());
+}
+
 TEST(BackendRegistryTest, SelectionIsIndependentOfRegistrationOrder) {
     eavp::BackendRegistry forward;
     ASSERT_TRUE(
@@ -940,6 +962,38 @@ TEST(BackendRegistryTest, RequiredUnavailableProviderDoesNotFallBack) {
     ASSERT_FALSE(result.ok());
     EXPECT_EQ(eavp::StatusCode::kDeviceLost, result.status().code());
     EXPECT_EQ("test device is unavailable", result.status().message());
+}
+
+TEST(BackendRegistryTest, RequiredUnregisteredProcessorReturnsNotFound) {
+    eavp::BackendRegistry registry;
+    ASSERT_TRUE(
+        registry.register_provider(make_test_provider("healthy", true)).ok());
+    ASSERT_TRUE(registry.freeze().ok());
+
+    const eavp::Result<eavp::ProcessorSelection> result =
+        registry.select_video_processor(
+            make_processor_request(no_preferences(), "missing.processor"));
+
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(eavp::StatusCode::kNotFound, result.status().code());
+    EXPECT_NE(std::string::npos,
+              result.status().message().find("missing.processor"));
+}
+
+TEST(BackendRegistryTest, RequiredUnregisteredEncoderReturnsNotFound) {
+    eavp::BackendRegistry registry;
+    ASSERT_TRUE(
+        registry.register_provider(make_test_provider("healthy", true)).ok());
+    ASSERT_TRUE(registry.freeze().ok());
+
+    const eavp::Result<eavp::EncoderSelection> result =
+        registry.select_video_encoder(make_encoder_request_with_preferences(
+            no_preferences(), "missing.encoder"));
+
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(eavp::StatusCode::kNotFound, result.status().code());
+    EXPECT_NE(std::string::npos,
+              result.status().message().find("missing.encoder"));
 }
 
 TEST(BackendRegistryTest, AggregatesEachCandidatesFirstRejectionReason) {

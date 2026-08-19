@@ -15,7 +15,7 @@ Status capability_mismatch(const std::string& message) {
 
 Status allocation_failure() {
     return Status(StatusCode::kResourceExhausted,
-                  "failed to allocate backend registry selection state");
+                  "failed to allocate backend registry state");
 }
 
 std::string rejection_message(const std::string& provider_id,
@@ -84,21 +84,20 @@ Status BackendRegistry::register_provider(
                       "backend provider must not be null");
     }
 
-    Result<ProviderCapability> probed = provider->probe();
-    if (!probed.ok()) {
-        return probed.status();
-    }
-    const std::string provider_id = probed.value().provider_id();
-    if (provider_id.empty()) {
-        return Status(StatusCode::kInvalidArgument,
-                      "backend provider id must not be empty");
-    }
-    if (providers_.find(provider_id) != providers_.end()) {
-        return Status(StatusCode::kAlreadyExists,
-                      "backend provider id is already registered");
-    }
-
     try {
+        Result<ProviderCapability> probed = provider->probe();
+        if (!probed.ok()) {
+            return probed.status();
+        }
+        const std::string provider_id = probed.value().provider_id();
+        if (provider_id.empty()) {
+            return Status(StatusCode::kInvalidArgument,
+                          "backend provider id must not be empty");
+        }
+        if (providers_.find(provider_id) != providers_.end()) {
+            return Status(StatusCode::kAlreadyExists,
+                          "backend provider id is already registered");
+        }
         providers_.insert(std::make_pair(
             provider_id,
             std::shared_ptr<const MediaBackendProvider>(provider)));
@@ -122,7 +121,8 @@ Result<ProcessorSelection> BackendRegistry::select_video_processor(
             const ProviderMap::const_iterator required =
                 providers_.find(required_provider_id);
             if (required == providers_.end()) {
-                return Result<ProcessorSelection>(capability_mismatch(
+                return Result<ProcessorSelection>(Status(
+                    StatusCode::kNotFound,
                     "required backend provider is not registered: " +
                     required_provider_id));
             }
@@ -197,7 +197,8 @@ Result<EncoderSelection> BackendRegistry::select_video_encoder(
             const ProviderMap::const_iterator required =
                 providers_.find(required_provider_id);
             if (required == providers_.end()) {
-                return Result<EncoderSelection>(capability_mismatch(
+                return Result<EncoderSelection>(Status(
+                    StatusCode::kNotFound,
                     "required backend provider is not registered: " +
                     required_provider_id));
             }
