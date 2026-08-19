@@ -15,6 +15,11 @@ public:
     Result(const T& value) : status_(), value_(new T(value)) {}
     Result(T&& value) : status_(), value_(new T(std::move(value))) {}
 
+    Result(Result&& other) noexcept = default;
+    Result& operator=(Result&& other) noexcept = default;
+    Result(const Result&) = delete;
+    Result& operator=(const Result&) = delete;
+
     explicit Result(const Status& status)
         : status_(status.ok()
                       ? Status(StatusCode::kInvalidArgument,
@@ -34,9 +39,14 @@ public:
         return *value_;
     }
 
+    T take_value() {
+        assert(ok());
+        return std::move(*value_);
+    }
+
 private:
     Status status_;
-    std::shared_ptr<T> value_;
+    std::unique_ptr<T> value_;
 };
 
 }  // namespace eavp
