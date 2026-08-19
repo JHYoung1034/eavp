@@ -15,8 +15,19 @@ public:
     Result(const T& value) : status_(), value_(new T(value)) {}
     Result(T&& value) : status_(), value_(new T(std::move(value))) {}
 
-    Result(Result&& other) noexcept = default;
-    Result& operator=(Result&& other) noexcept = default;
+    Result(Result&& other) noexcept
+        : status_(std::move(other.status_)), value_(std::move(other.value_)) {
+        other.status_ = Status(StatusCode::kInvalidState, "result has been moved");
+    }
+
+    Result& operator=(Result&& other) noexcept {
+        if (this != &other) {
+            status_ = std::move(other.status_);
+            value_ = std::move(other.value_);
+            other.status_ = Status(StatusCode::kInvalidState, "result has been moved");
+        }
+        return *this;
+    }
     Result(const Result&) = delete;
     Result& operator=(const Result&) = delete;
 
