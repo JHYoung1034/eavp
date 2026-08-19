@@ -846,6 +846,7 @@ TEST(BackendRegistryTest, ConvertsProbeAllocationFailureToResourceExhausted) {
     const eavp::Status status = registry.register_provider(provider);
 
     EXPECT_EQ(eavp::StatusCode::kResourceExhausted, status.code());
+    EXPECT_TRUE(status.message().empty());
 }
 
 TEST(BackendRegistryTest, SelectionIsIndependentOfRegistrationOrder) {

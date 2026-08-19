@@ -29,6 +29,9 @@ public:
     Status()
         : code_(StatusCode::kOk), native_code_(0), has_native_code_(false) {}
 
+    explicit Status(StatusCode code)
+        : code_(code), native_code_(0), has_native_code_(false) {}
+
     Status(StatusCode code, const std::string& message)
         : code_(code), message_(message), native_code_(0), has_native_code_(false) {}
 

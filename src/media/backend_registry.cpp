@@ -14,8 +14,7 @@ Status capability_mismatch(const std::string& message) {
 }
 
 Status allocation_failure() {
-    return Status(StatusCode::kResourceExhausted,
-                  "failed to allocate backend registry state");
+    return Status(StatusCode::kResourceExhausted);
 }
 
 std::string rejection_message(const std::string& provider_id,
