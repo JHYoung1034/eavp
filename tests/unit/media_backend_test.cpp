@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -252,6 +253,64 @@ TEST(CapabilityTest, RequiredZeroCopyValidatesPlaneExtentStrideOffsetAndAddress)
     EXPECT_TRUE(capability.supports(eavp::VideoEncoderRequest(
         make_nv12_format(1920, 1080, eavp::MemoryDomain::kDmaBuf), config,
         64U, true, automatic_selection(), no_preferences())));
+}
+
+TEST(CapabilityTest, RejectsOverlappingAlignedPlaneRangesForRequiredZeroCopy) {
+    const std::size_t y_size = 1920U * 1088U;
+    const std::vector<eavp::PlaneLayout> overlapping_planes{
+        eavp::PlaneLayout(0U, y_size, 1920U),
+        eavp::PlaneLayout(64U, 1920U * 544U, 1920U)};
+    const eavp::Result<eavp::VideoFormat> format =
+        eavp::VideoFormat::create(eavp::PixelFormat::kNv12, 1920, 1080,
+                                  eavp::MemoryDomain::kDmaBuf,
+                                  overlapping_planes);
+    ASSERT_TRUE(format.ok());
+    const eavp::VideoEncoderRequest request(
+        format.value(),
+        make_h264_config(1920, 1080, eavp::CodecProfile::kH264Main), 64U,
+        true, automatic_selection(), no_preferences());
+
+    EXPECT_FALSE(make_h264_capability_for_test(true).supports(request));
+}
+
+TEST(CapabilityTest, RejectsPlaneRangeWhoseOffsetAndSizeOverflow) {
+    const std::size_t y_size = 1920U * 1088U;
+    const std::size_t overflowing_offset =
+        std::numeric_limits<std::size_t>::max() - 63U;
+    const std::vector<eavp::PlaneLayout> overflowing_planes{
+        eavp::PlaneLayout(0U, y_size, 1920U),
+        eavp::PlaneLayout(overflowing_offset, 1920U * 544U, 1920U)};
+    const eavp::Result<eavp::VideoFormat> format =
+        eavp::VideoFormat::create(eavp::PixelFormat::kNv12, 1920, 1080,
+                                  eavp::MemoryDomain::kDmaBuf,
+                                  overflowing_planes);
+    ASSERT_TRUE(format.ok());
+    const eavp::VideoEncoderRequest request(
+        format.value(),
+        make_h264_config(1920, 1080, eavp::CodecProfile::kH264Main), 64U,
+        true, automatic_selection(), no_preferences());
+
+    EXPECT_FALSE(make_h264_capability_for_test(true).supports(request));
+
+    const eavp::VideoEncoderRequest conversion_request(
+        format.value(),
+        make_h264_config(1920, 1080, eavp::CodecProfile::kH264Main), 64U,
+        false, automatic_selection(), no_preferences());
+    const eavp::Result<eavp::VideoEncoderNegotiation> negotiation =
+        make_provider("overflow.safe", eavp::ProviderKind::kHardware, true)
+            .negotiate(conversion_request);
+    ASSERT_TRUE(negotiation.ok());
+    EXPECT_TRUE(negotiation.value().requires_explicit_conversion);
+    const std::vector<eavp::PlaneLayout>& actual_planes =
+        negotiation.value().actual_format.planes();
+    ASSERT_EQ(2U, actual_planes.size());
+    ASSERT_LE(actual_planes[0].offset,
+              std::numeric_limits<std::size_t>::max() - actual_planes[0].size);
+    ASSERT_LE(actual_planes[1].offset,
+              std::numeric_limits<std::size_t>::max() - actual_planes[1].size);
+    ASSERT_LE(actual_planes[0].offset, actual_planes[1].offset);
+    EXPECT_LE(actual_planes[0].size,
+              actual_planes[1].offset - actual_planes[0].offset);
 }
 
 TEST(CapabilityTest, NegotiationReportsExplicitPlaneLayoutConversion) {

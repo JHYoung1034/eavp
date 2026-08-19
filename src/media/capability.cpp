@@ -165,6 +165,23 @@ bool layout_matches(const VideoFormat& format,
         const PlaneLayout& plane = format.planes()[index];
         const PlaneLayoutConstraint& constraint =
             format_capability.plane_constraints()[index];
+        if (plane.offset >
+            std::numeric_limits<std::size_t>::max() - plane.size) {
+            return false;
+        }
+        const std::size_t plane_end = plane.offset + plane.size;
+        for (std::size_t previous_index = 0; previous_index < index;
+             ++previous_index) {
+            const PlaneLayout& previous = format.planes()[previous_index];
+            if (previous.offset >
+                std::numeric_limits<std::size_t>::max() - previous.size) {
+                return false;
+            }
+            const std::size_t previous_end = previous.offset + previous.size;
+            if (plane.offset < previous_end && previous.offset < plane_end) {
+                return false;
+            }
+        }
         std::size_t samples = 0U;
         std::size_t minimum_stride = 0U;
         std::size_t aligned_stride = 0U;
