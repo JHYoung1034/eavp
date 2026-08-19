@@ -19,8 +19,11 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/eavp/base
 add_library(eavp_media STATIC
     media/buffer.cpp
     media/graph.cpp
+    media/media_packet.cpp
     media/node.cpp
     media/pipeline.cpp
+    media/video_codec.cpp
+    media/video_format.cpp
 )
 add_library(EAVP::media ALIAS eavp_media)
 

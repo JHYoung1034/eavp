@@ -5,15 +5,9 @@
 
 #include "eavp/base/time.hpp"
 #include "eavp/media/buffer.hpp"
+#include "eavp/media/video_format.hpp"
 
 namespace eavp {
-
-enum class PixelFormat {
-    kUnknown,
-    kNv12,
-    kYuv420p,
-    kRgb24,
-};
 
 enum class SampleFormat {
     kUnknown,
@@ -24,41 +18,48 @@ enum class SampleFormat {
 
 class VideoFrame {
 public:
-    static Result<VideoFrame> create(const Buffer& buffer, PixelFormat format, int width,
-                                     int height, int stride, std::int64_t pts,
+    static Result<VideoFrame> create(const Buffer& buffer, const VideoFormat& format,
+                                     std::int64_t pts,
                                      const TimeBase& time_base) {
-        if (width <= 0 || height <= 0 || stride <= 0) {
+        if (buffer.memory_domain() != format.memory_domain()) {
             return Result<VideoFrame>(
-                Status(StatusCode::kInvalidArgument, "video frame shape must be positive"));
+                Status(StatusCode::kCapabilityMismatch,
+                       "video frame buffer memory domain does not match its format"));
         }
-        return Result<VideoFrame>(
-            VideoFrame(buffer, format, width, height, stride, pts, time_base));
+        if (buffer.plane_count() != format.planes().size()) {
+            return Result<VideoFrame>(
+                Status(StatusCode::kCapabilityMismatch,
+                       "video frame buffer plane count does not match its format"));
+        }
+        for (std::size_t index = 0U; index < buffer.plane_count(); ++index) {
+            const Result<PlaneLayout> buffer_layout = buffer.plane_layout(index);
+            const PlaneLayout& format_layout = format.planes()[index];
+            if (!buffer_layout.ok() || buffer_layout.value().offset != format_layout.offset ||
+                buffer_layout.value().size != format_layout.size ||
+                buffer_layout.value().stride != format_layout.stride) {
+                return Result<VideoFrame>(
+                    Status(StatusCode::kCapabilityMismatch,
+                           "video frame buffer planes do not match its format"));
+            }
+        }
+        return Result<VideoFrame>(VideoFrame(buffer, format, pts, time_base));
     }
 
     const Buffer& buffer() const { return buffer_; }
-    PixelFormat format() const { return format_; }
-    int width() const { return width_; }
-    int height() const { return height_; }
-    int stride() const { return stride_; }
+    const VideoFormat& format() const { return format_; }
     std::int64_t pts() const { return pts_; }
     const TimeBase& time_base() const { return time_base_; }
 
 private:
-    VideoFrame(const Buffer& buffer, PixelFormat format, int width, int height, int stride,
-               std::int64_t pts, const TimeBase& time_base)
+    VideoFrame(const Buffer& buffer, const VideoFormat& format, std::int64_t pts,
+               const TimeBase& time_base)
         : buffer_(buffer),
           format_(format),
-          width_(width),
-          height_(height),
-          stride_(stride),
           pts_(pts),
           time_base_(time_base) {}
 
     Buffer buffer_;
-    PixelFormat format_;
-    int width_;
-    int height_;
-    int stride_;
+    VideoFormat format_;
     std::int64_t pts_;
     TimeBase time_base_;
 };
@@ -107,4 +108,3 @@ private:
 }  // namespace eavp
 
 #endif  // EAVP_MEDIA_FRAME_HPP_
-

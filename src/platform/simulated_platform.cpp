@@ -31,8 +31,14 @@ protected:
         }
         MappedRegion mapped = mapped_result.take_value();
         mapped.mutable_data()[0] = static_cast<std::uint8_t>(next_pts_ & 0xff);
-        const std::shared_ptr<const MediaPacket> packet(new MediaPacket(
-            buffer, CodecId::kH264, next_pts_, next_pts_, 1, time_base_, true));
+        Result<MediaPacket> packet_result = MediaPacket::create(
+            buffer, CodecId::kReference, EncodedStreamFormat::kReference, 0, next_pts_,
+            next_pts_, 1, time_base_, true, CodecConfigData());
+        if (!packet_result.ok()) {
+            return packet_result.status();
+        }
+        const std::shared_ptr<const MediaPacket> packet(
+            new MediaPacket(packet_result.take_value()));
         ++next_pts_;
         return output_.send(packet);
     }

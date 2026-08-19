@@ -21,9 +21,14 @@ std::shared_ptr<const eavp::MediaPacket> make_packet(std::int64_t pts) {
         return std::shared_ptr<const eavp::MediaPacket>();
     }
     const eavp::Buffer buffer = allocated.take_value();
-    return std::shared_ptr<const eavp::MediaPacket>(new eavp::MediaPacket(
-        buffer, eavp::CodecId::kH264, pts, pts, 1, eavp::TimeBase::create(1, 1000).value(),
-        true));
+    eavp::Result<eavp::MediaPacket> packet = eavp::MediaPacket::create(
+        buffer, eavp::CodecId::kReference, eavp::EncodedStreamFormat::kReference, 0, pts, pts,
+        1, eavp::TimeBase::create(1, 1000).take_value(), true, eavp::CodecConfigData());
+    if (!packet.ok()) {
+        ADD_FAILURE() << packet.status().message();
+        return std::shared_ptr<const eavp::MediaPacket>();
+    }
+    return std::shared_ptr<const eavp::MediaPacket>(new eavp::MediaPacket(packet.take_value()));
 }
 
 TEST(QueueTest, BlockSignalsBackpressureWithoutDroppingQueuedPacket) {

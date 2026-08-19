@@ -12,6 +12,8 @@
 #include "eavp/media/buffer.hpp"
 #include "eavp/media/frame.hpp"
 #include "eavp/media/media_packet.hpp"
+#include "eavp/media/video_codec.hpp"
+#include "eavp/media/video_format.hpp"
 
 namespace {
 
@@ -287,8 +289,9 @@ TEST(MediaPacketTest, CopyRetainsSharedPayloadAndMetadata) {
         mapped.mutable_data()[0] = 0x3c;
     }
     const eavp::TimeBase time_base = eavp::TimeBase::create(1, 90000).take_value();
-    const eavp::MediaPacket packet(buffer, eavp::CodecId::kH264, 9000, 9000, 3600,
-                                   time_base, true);
+    const eavp::MediaPacket packet = eavp::MediaPacket::create(
+        buffer, eavp::CodecId::kH264, eavp::EncodedStreamFormat::kAnnexB, 0, 9000, 9000,
+        3600, time_base, true, eavp::CodecConfigData()).take_value();
     const eavp::MediaPacket copy = packet;
 
     eavp::MappedRegion mapped =
@@ -298,29 +301,106 @@ TEST(MediaPacketTest, CopyRetainsSharedPayloadAndMetadata) {
     EXPECT_EQ(9000, copy.pts());
     EXPECT_EQ(3600, copy.duration());
     EXPECT_TRUE(copy.key_frame());
+    EXPECT_EQ(eavp::EncodedStreamFormat::kAnnexB, copy.stream_format());
+    EXPECT_EQ(0, copy.stream_index());
 }
 
-TEST(FrameTest, VideoAndAudioFramesValidateShapeAndShareBuffer) {
-    eavp::Buffer video_buffer = eavp::Buffer::allocate(128U).take_value();
-    {
-        eavp::MappedRegion mapped =
-            video_buffer.map_plane(0U, eavp::MapMode::kReadWrite).take_value();
-        mapped.mutable_data()[0] = 0x7e;
-    }
-    const eavp::TimeBase video_time_base = eavp::TimeBase::create(1, 90000).take_value();
-    const eavp::Result<eavp::VideoFrame> video = eavp::VideoFrame::create(
-        video_buffer, eavp::PixelFormat::kNv12, 16, 8, 16, 9000, video_time_base);
-    ASSERT_TRUE(video.ok());
-    eavp::MappedRegion video_mapped = video.value().buffer()
-                                           .map_plane(0U, eavp::MapMode::kReadOnly)
-                                           .take_value();
-    EXPECT_EQ(0x7e, video_mapped.data()[0]);
-    EXPECT_EQ(16, video.value().width());
-    EXPECT_EQ(8, video.value().height());
-    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
-              eavp::VideoFrame::create(video_buffer, eavp::PixelFormat::kNv12, 0, 8, 16,
-                                       0, video_time_base).status().code());
+TEST(VideoFormatTest, ValidatesPixelFormatPlaneCountStrideAndSize) {
+    std::vector<eavp::PlaneLayout> nv12_planes;
+    nv12_planes.push_back(eavp::PlaneLayout(0U, 128U, 16U));
+    nv12_planes.push_back(eavp::PlaneLayout(128U, 64U, 16U));
+    EXPECT_TRUE(eavp::VideoFormat::create(eavp::PixelFormat::kNv12, 16, 8,
+                                           eavp::MemoryDomain::kCpu, nv12_planes)
+                    .ok());
 
+    nv12_planes.pop_back();
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::VideoFormat::create(eavp::PixelFormat::kNv12, 16, 8,
+                                         eavp::MemoryDomain::kCpu, nv12_planes)
+                  .status()
+                  .code());
+
+    std::vector<eavp::PlaneLayout> rgb24_planes;
+    rgb24_planes.push_back(eavp::PlaneLayout(0U, 383U, 48U));
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::VideoFormat::create(eavp::PixelFormat::kRgb24, 16, 8,
+                                         eavp::MemoryDomain::kCpu, rgb24_planes)
+                  .status()
+                  .code());
+
+    rgb24_planes[0] = eavp::PlaneLayout(0U, 384U, 48U);
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::VideoFormat::create(eavp::PixelFormat::kRgb24, 16, 8,
+                                         static_cast<eavp::MemoryDomain>(99), rgb24_planes)
+                  .status()
+                  .code());
+}
+
+TEST(VideoFormatTest, RejectsOddChromaDimensions) {
+    std::vector<eavp::PlaneLayout> nv12_planes;
+    nv12_planes.push_back(eavp::PlaneLayout(0U, 144U, 16U));
+    nv12_planes.push_back(eavp::PlaneLayout(144U, 80U, 16U));
+
+    EXPECT_EQ(eavp::StatusCode::kUnsupported,
+              eavp::VideoFormat::create(eavp::PixelFormat::kNv12, 16, 9,
+                                         eavp::MemoryDomain::kCpu, nv12_planes)
+                  .status()
+                  .code());
+}
+
+TEST(FrameTest, VideoFrameRequiresBufferFormatDomainAndPlaneLayoutMatch) {
+    std::shared_ptr<eavp::BufferStorage> storage(new UnmappableStorage(192U));
+    std::vector<eavp::PlaneLayout> planes;
+    planes.push_back(eavp::PlaneLayout(0U, 128U, 16U));
+    planes.push_back(eavp::PlaneLayout(128U, 64U, 16U));
+    const eavp::Buffer video_buffer = eavp::Buffer::create(storage, planes).take_value();
+    const eavp::VideoFormat format = eavp::VideoFormat::create(
+        eavp::PixelFormat::kNv12, 16, 8, eavp::MemoryDomain::kDeviceOpaque, planes)
+                                          .take_value();
+    const eavp::TimeBase video_time_base = eavp::TimeBase::create(1, 90000).take_value();
+    const eavp::Result<eavp::VideoFrame> video =
+        eavp::VideoFrame::create(video_buffer, format, 9000, video_time_base);
+    ASSERT_TRUE(video.ok());
+    EXPECT_EQ(16, video.value().format().width());
+    EXPECT_EQ(8, video.value().format().height());
+
+    std::vector<eavp::PlaneLayout> single_plane;
+    single_plane.push_back(eavp::PlaneLayout(0U, 192U, 16U));
+    const eavp::Buffer mismatched_buffer =
+        eavp::Buffer::create(storage, single_plane).take_value();
+    EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch,
+              eavp::VideoFrame::create(mismatched_buffer, format, 0, video_time_base)
+                  .status()
+                  .code());
+}
+
+TEST(MediaPacketTest, RejectsCodecAndStreamFormatMismatch) {
+    eavp::Buffer payload = eavp::Buffer::allocate(4U).take_value();
+    const eavp::TimeBase time_base = eavp::TimeBase::create(1, 90000).take_value();
+
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::MediaPacket::create(payload, eavp::CodecId::kH264,
+                                         eavp::EncodedStreamFormat::kHvcc, 0, 0, 0, 3600,
+                                         time_base, true, eavp::CodecConfigData())
+                  .status()
+                  .code());
+}
+
+TEST(VideoEncoderConfigTest, ValidatesTimeBaseAndFrameRate) {
+    const eavp::TimeBase time_base = eavp::TimeBase::create(1, 90000).take_value();
+    EXPECT_TRUE(eavp::VideoEncoderConfig::create(
+                    eavp::CodecId::kH264, 16, 8, 30, 1, time_base, 1000000, 1200000, 30, 0,
+                    eavp::RateControlMode::kCbr, eavp::CodecProfile::kH264Main, 40, true)
+                    .ok());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::VideoEncoderConfig::create(
+                  eavp::CodecId::kH264, 16, 8, 0, 1, time_base, 1000000, 1200000, 30, 0,
+                  eavp::RateControlMode::kCbr, eavp::CodecProfile::kH264Main, 40, true)
+                  .status()
+                  .code());
+}
+
+TEST(FrameTest, AudioFramesValidateShapeAndShareBuffer) {
     const eavp::Buffer audio_buffer = eavp::Buffer::allocate(64U).take_value();
     const eavp::Result<eavp::AudioFrame> audio = eavp::AudioFrame::create(
         audio_buffer, eavp::SampleFormat::kSigned16, 48000, 2, 16, 0,
