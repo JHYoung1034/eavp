@@ -20,12 +20,17 @@ public:
 
 protected:
     Status on_tick() override {
-        const Result<Buffer> buffer_result = Buffer::allocate(16U);
+        Result<Buffer> buffer_result = Buffer::allocate(16U);
         if (!buffer_result.ok()) {
             return buffer_result.status();
         }
-        Buffer buffer = buffer_result.value();
-        buffer.mutable_data()[0] = static_cast<std::uint8_t>(next_pts_ & 0xff);
+        Buffer buffer = buffer_result.take_value();
+        Result<MappedRegion> mapped_result = buffer.map_plane(0U, MapMode::kReadWrite);
+        if (!mapped_result.ok()) {
+            return mapped_result.status();
+        }
+        MappedRegion mapped = mapped_result.take_value();
+        mapped.mutable_data()[0] = static_cast<std::uint8_t>(next_pts_ & 0xff);
         const std::shared_ptr<const MediaPacket> packet(new MediaPacket(
             buffer, CodecId::kH264, next_pts_, next_pts_, 1, time_base_, true));
         ++next_pts_;

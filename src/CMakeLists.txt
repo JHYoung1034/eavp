@@ -17,6 +17,7 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/eavp/base
         OPTIONAL)
 
 add_library(eavp_media STATIC
+    media/buffer.cpp
     media/graph.cpp
     media/node.cpp
     media/pipeline.cpp
