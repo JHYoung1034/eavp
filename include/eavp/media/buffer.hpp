@@ -101,7 +101,13 @@ public:
 
     MemoryDomain memory_domain() const { return storage_->memory_domain(); }
     std::size_t plane_count() const { return planes_.size(); }
-    const PlaneLayout& plane_layout(std::size_t plane_index) const { return planes_[plane_index]; }
+    Result<PlaneLayout> plane_layout(std::size_t plane_index) const {
+        if (plane_index >= planes_.size()) {
+            return Result<PlaneLayout>(
+                Status(StatusCode::kInvalidArgument, "plane index is invalid"));
+        }
+        return Result<PlaneLayout>(planes_[plane_index]);
+    }
 
 private:
     Buffer(const std::shared_ptr<BufferStorage>& storage, const std::vector<PlaneLayout>& planes)

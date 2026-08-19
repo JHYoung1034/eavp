@@ -15,7 +15,12 @@
 namespace {
 
 std::shared_ptr<const eavp::MediaPacket> make_packet(std::int64_t pts) {
-    const eavp::Buffer buffer = eavp::Buffer::allocate(4).value();
+    eavp::Result<eavp::Buffer> allocated = eavp::Buffer::allocate(4U);
+    if (!allocated.ok()) {
+        ADD_FAILURE() << allocated.status().message();
+        return std::shared_ptr<const eavp::MediaPacket>();
+    }
+    const eavp::Buffer buffer = allocated.take_value();
     return std::shared_ptr<const eavp::MediaPacket>(new eavp::MediaPacket(
         buffer, eavp::CodecId::kH264, pts, pts, 1, eavp::TimeBase::create(1, 1000).value(),
         true));

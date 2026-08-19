@@ -188,6 +188,40 @@ TEST(BufferTest, MovingMappedRegionUnmapsStorageOnlyOnce) {
     EXPECT_EQ(1, storage->unmap_count());
 }
 
+TEST(BufferTest, RejectsInvalidPlaneLayoutIndex) {
+    eavp::Result<eavp::Buffer> allocated = eavp::Buffer::allocate(8U);
+    ASSERT_TRUE(allocated.ok());
+    eavp::Buffer buffer = allocated.take_value();
+
+    const eavp::Result<eavp::PlaneLayout> layout = buffer.plane_layout(1U);
+
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument, layout.status().code());
+}
+
+TEST(BufferTest, MappedRegionKeepsStorageAliveAfterBufferDestruction) {
+    std::weak_ptr<CountingMappingStorage> weak_storage;
+    std::unique_ptr<eavp::MappedRegion> mapped;
+    {
+        std::shared_ptr<CountingMappingStorage> storage(new CountingMappingStorage());
+        weak_storage = storage;
+        std::vector<eavp::PlaneLayout> planes;
+        planes.push_back(eavp::PlaneLayout(0U, 8U, 8U));
+        eavp::Result<eavp::Buffer> created = eavp::Buffer::create(storage, planes);
+        ASSERT_TRUE(created.ok());
+        eavp::Buffer buffer = created.take_value();
+        eavp::Result<eavp::MappedRegion> mapped_result =
+            buffer.map_plane(0U, eavp::MapMode::kReadOnly);
+        ASSERT_TRUE(mapped_result.ok());
+        mapped.reset(new eavp::MappedRegion(mapped_result.take_value()));
+    }
+
+    std::shared_ptr<CountingMappingStorage> retained_storage = weak_storage.lock();
+    ASSERT_TRUE(retained_storage);
+    EXPECT_EQ(0, retained_storage->unmap_count());
+    mapped.reset();
+    EXPECT_EQ(1, retained_storage->unmap_count());
+}
+
 TEST(BufferTest, ExportedDmaBufHandleClosesOnlyDuplicateAfterMove) {
     int fds[2] = {-1, -1};
     ASSERT_EQ(0, pipe(fds));
