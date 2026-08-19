@@ -1,6 +1,7 @@
 #include "eavp/media/capability.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <new>
 
 namespace eavp {
@@ -11,15 +12,60 @@ Status mismatch(const std::string& message) {
     return Status(StatusCode::kCapabilityMismatch, message);
 }
 
-bool contains_format(const std::vector<FormatMemoryDomain>& formats,
-                     PixelFormat pixel_format, MemoryDomain memory_domain) {
+bool checked_add(std::size_t left, std::size_t right, std::size_t* result) {
+    if (left > std::numeric_limits<std::size_t>::max() - right) {
+        return false;
+    }
+    *result = left + right;
+    return true;
+}
+
+bool checked_multiply(std::size_t left, std::size_t right,
+                      std::size_t* result) {
+    if (left != 0U && right > std::numeric_limits<std::size_t>::max() / left) {
+        return false;
+    }
+    *result = left * right;
+    return true;
+}
+
+bool align_up(std::size_t value, std::size_t alignment, std::size_t* result) {
+    if (alignment == 0U) {
+        return false;
+    }
+    const std::size_t remainder = value % alignment;
+    if (remainder == 0U) {
+        *result = value;
+        return true;
+    }
+    return checked_add(value, alignment - remainder, result);
+}
+
+std::size_t greatest_common_divisor(std::size_t left, std::size_t right) {
+    while (right != 0U) {
+        const std::size_t remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    return left;
+}
+
+bool least_common_multiple(std::size_t left, std::size_t right,
+                           std::size_t* result) {
+    const std::size_t divisor = greatest_common_divisor(left, right);
+    return divisor != 0U && checked_multiply(left / divisor, right, result);
+}
+
+const FormatMemoryDomain* find_format(
+    const std::vector<FormatMemoryDomain>& formats, PixelFormat pixel_format,
+    MemoryDomain memory_domain) {
     for (std::size_t index = 0; index < formats.size(); ++index) {
         if (formats[index].pixel_format() == pixel_format &&
             formats[index].memory_domain() == memory_domain) {
-            return true;
+            return &formats[index];
         }
     }
-    return false;
+    return NULL;
 }
 
 template <typename T>
@@ -49,9 +95,16 @@ const char* operation_name(VideoProcessingOperation operation) {
 bool requires_operation(const VideoProcessorConfig& config,
                         VideoProcessingOperation operation) {
     switch (operation) {
-        case VideoProcessingOperation::kScaling:
-            return config.crop_width != config.output_format.width() ||
-                   config.crop_height != config.output_format.height();
+        case VideoProcessingOperation::kScaling: {
+            const bool swaps_axes = config.rotation_degrees == 90 ||
+                                    config.rotation_degrees == 270;
+            const int rotated_width =
+                swaps_axes ? config.crop_height : config.crop_width;
+            const int rotated_height =
+                swaps_axes ? config.crop_width : config.crop_height;
+            return rotated_width != config.output_format.width() ||
+                   rotated_height != config.output_format.height();
+        }
         case VideoProcessingOperation::kCropping:
             return config.crop_x != 0 || config.crop_y != 0 ||
                    config.crop_width != config.input_format.width() ||
@@ -72,6 +125,152 @@ Status check_operation(const std::vector<VideoProcessingOperation>& supported,
                         operation_name(operation));
     }
     return Status::ok_status();
+}
+
+bool plane_address_is_proven(const PlaneLayoutConstraint& constraint,
+                             const PlaneLayout& plane,
+                             std::size_t address_alignment) {
+    if (constraint.address_alignment() == 1U) {
+        return true;
+    }
+    return address_alignment != 0U &&
+           address_alignment % constraint.address_alignment() == 0U &&
+           plane.offset % constraint.address_alignment() == 0U;
+}
+
+bool layout_matches(const VideoFormat& format,
+                    const FormatMemoryDomain& format_capability,
+                    const DimensionRange& width_range,
+                    const DimensionRange& height_range,
+                    std::size_t address_alignment) {
+    if (!format_capability.valid() ||
+        format.planes().size() != format_capability.plane_constraints().size() ||
+        !width_range.contains(format.width()) ||
+        !height_range.contains(format.height())) {
+        return false;
+    }
+
+    std::size_t storage_width = 0U;
+    std::size_t storage_height = 0U;
+    if (!align_up(static_cast<std::size_t>(format.width()),
+                  static_cast<std::size_t>(width_range.alignment()),
+                  &storage_width) ||
+        !align_up(static_cast<std::size_t>(format.height()),
+                  static_cast<std::size_t>(height_range.alignment()),
+                  &storage_height)) {
+        return false;
+    }
+
+    for (std::size_t index = 0; index < format.planes().size(); ++index) {
+        const PlaneLayout& plane = format.planes()[index];
+        const PlaneLayoutConstraint& constraint =
+            format_capability.plane_constraints()[index];
+        std::size_t samples = 0U;
+        std::size_t minimum_stride = 0U;
+        std::size_t aligned_stride = 0U;
+        std::size_t required_size = 0U;
+        const std::size_t horizontal =
+            static_cast<std::size_t>(constraint.horizontal_subsampling());
+        const std::size_t vertical =
+            static_cast<std::size_t>(constraint.vertical_subsampling());
+        if (!checked_add(storage_width, horizontal - 1U, &samples)) {
+            return false;
+        }
+        samples /= horizontal;
+        if (!checked_multiply(samples, constraint.bytes_per_sample(),
+                              &minimum_stride) ||
+            !align_up(minimum_stride, constraint.stride_alignment(),
+                      &aligned_stride) ||
+            plane.stride < aligned_stride ||
+            plane.stride % constraint.stride_alignment() != 0U ||
+            plane.offset % constraint.offset_alignment() != 0U ||
+            plane.size % constraint.size_alignment() != 0U ||
+            !plane_address_is_proven(constraint, plane, address_alignment)) {
+            return false;
+        }
+        std::size_t rows = 0U;
+        if (!checked_add(storage_height, vertical - 1U, &rows)) {
+            return false;
+        }
+        rows /= vertical;
+        if (!checked_multiply(plane.stride, rows, &required_size) ||
+            plane.size < required_size) {
+            return false;
+        }
+    }
+    return true;
+}
+
+Result<VideoFormat> make_actual_format(
+    const VideoFormat& requested, const FormatMemoryDomain& format_capability,
+    const DimensionRange& width_range, const DimensionRange& height_range) {
+    if (!format_capability.valid()) {
+        return Result<VideoFormat>(
+            mismatch("capability plane layout constraints are invalid"));
+    }
+    std::size_t storage_width = 0U;
+    std::size_t storage_height = 0U;
+    if (!align_up(static_cast<std::size_t>(requested.width()),
+                  static_cast<std::size_t>(width_range.alignment()),
+                  &storage_width) ||
+        !align_up(static_cast<std::size_t>(requested.height()),
+                  static_cast<std::size_t>(height_range.alignment()),
+                  &storage_height)) {
+        return Result<VideoFormat>(Status(
+            StatusCode::kResourceExhausted,
+            "video format storage extent overflows capability representation"));
+    }
+
+    std::vector<PlaneLayout> planes;
+    try {
+        planes.reserve(format_capability.plane_constraints().size());
+        std::size_t next_offset = 0U;
+        for (std::size_t index = 0;
+             index < format_capability.plane_constraints().size(); ++index) {
+            const PlaneLayoutConstraint& constraint =
+                format_capability.plane_constraints()[index];
+            const std::size_t horizontal =
+                static_cast<std::size_t>(constraint.horizontal_subsampling());
+            const std::size_t vertical =
+                static_cast<std::size_t>(constraint.vertical_subsampling());
+            std::size_t samples = 0U;
+            std::size_t stride = 0U;
+            std::size_t rows = 0U;
+            std::size_t size = 0U;
+            std::size_t offset_alignment = 0U;
+            std::size_t offset = 0U;
+            if (!checked_add(storage_width, horizontal - 1U, &samples)) {
+                throw std::bad_alloc();
+            }
+            samples /= horizontal;
+            if (!checked_multiply(samples, constraint.bytes_per_sample(),
+                                  &stride) ||
+                !align_up(stride, constraint.stride_alignment(), &stride) ||
+                !checked_add(storage_height, vertical - 1U, &rows)) {
+                throw std::bad_alloc();
+            }
+            rows /= vertical;
+            if (!checked_multiply(stride, rows, &size) ||
+                !align_up(size, constraint.size_alignment(), &size) ||
+                !least_common_multiple(constraint.offset_alignment(),
+                                       constraint.address_alignment(),
+                                       &offset_alignment) ||
+                !align_up(next_offset, offset_alignment, &offset) ||
+                !checked_add(offset, size, &next_offset)) {
+                throw std::bad_alloc();
+            }
+            planes.push_back(PlaneLayout(offset, size, stride));
+        }
+    } catch (const std::bad_alloc&) {
+        return Result<VideoFormat>(Status(
+            StatusCode::kResourceExhausted,
+            "failed to create aligned video plane layout"));
+    }
+
+    return VideoFormat::create(
+        requested.pixel_format(), requested.width(), requested.height(),
+        requested.memory_domain(), planes, requested.color_range(),
+        requested.color_primaries(), requested.transfer(), requested.matrix());
 }
 
 int preferred_provider_rank(const std::vector<std::string>& preferred,
@@ -99,6 +298,15 @@ int provider_kind_rank(ProviderKind kind, bool prefer_hardware) {
     return 3;
 }
 
+Status required_provider_status(const std::string& provider_id,
+                                const SelectionConstraints& constraints) {
+    if (!constraints.required_provider_id().empty() &&
+        constraints.required_provider_id() != provider_id) {
+        return mismatch("candidate is not the explicitly required provider");
+    }
+    return Status::ok_status();
+}
+
 }  // namespace
 
 bool DimensionRange::valid() const {
@@ -118,11 +326,44 @@ bool DimensionRange::contains(int value) const {
         (value - minimum_) % step_ != 0) {
         return false;
     }
-    // 1080 等逻辑尺寸不必自身整除硬件对齐；对齐后的存储尺寸必须仍在能力上限内。
+    // 对齐描述可见尺寸对应的存储 extent；1080 可由 1088 的对齐存储承载。
     const std::int64_t aligned_value =
         ((static_cast<std::int64_t>(value) + alignment_ - 1) / alignment_) *
         alignment_;
     return aligned_value <= maximum_;
+}
+
+bool PlaneLayoutConstraint::valid() const {
+    return horizontal_subsampling_ > 0 && vertical_subsampling_ > 0 &&
+           bytes_per_sample_ > 0U && stride_alignment_ > 0U &&
+           offset_alignment_ > 0U && size_alignment_ > 0U &&
+           address_alignment_ > 0U;
+}
+
+bool FormatMemoryDomain::valid() const {
+    std::size_t expected_plane_count = 0U;
+    switch (pixel_format_) {
+        case PixelFormat::kRgb24:
+            expected_plane_count = 1U;
+            break;
+        case PixelFormat::kNv12:
+            expected_plane_count = 2U;
+            break;
+        case PixelFormat::kYuv420p:
+            expected_plane_count = 3U;
+            break;
+        case PixelFormat::kUnknown:
+            return false;
+    }
+    if (plane_constraints_.size() != expected_plane_count) {
+        return false;
+    }
+    for (std::size_t index = 0; index < plane_constraints_.size(); ++index) {
+        if (!plane_constraints_[index].valid()) {
+            return false;
+        }
+    }
+    return true;
 }
 
 Status VideoProcessorCapability::match(
@@ -141,15 +382,22 @@ Status VideoProcessorCapability::match(
         !output_height_.contains(config.output_format.height())) {
         return mismatch("video processor output dimensions are outside capability");
     }
-    if (!contains_format(input_formats_, config.input_format.pixel_format(),
-                         config.input_format.memory_domain())) {
+    const FormatMemoryDomain* input_format = find_format(
+        input_formats_, config.input_format.pixel_format(),
+        config.input_format.memory_domain());
+    if (input_format == NULL) {
         return mismatch(
             "video processor input pixel format or memory domain is unsupported");
     }
-    if (!contains_format(output_formats_, config.output_format.pixel_format(),
-                         config.output_format.memory_domain())) {
+    const FormatMemoryDomain* output_format = find_format(
+        output_formats_, config.output_format.pixel_format(),
+        config.output_format.memory_domain());
+    if (output_format == NULL) {
         return mismatch(
             "video processor output pixel format or memory domain is unsupported");
+    }
+    if (!input_format->valid() || !output_format->valid()) {
+        return mismatch("video processor capability has invalid plane layout constraints");
     }
 
     for (std::size_t index = 0; index < request.required_operations().size();
@@ -179,7 +427,63 @@ Status VideoProcessorCapability::match(
     if (request.require_zero_copy() && !zero_copy_) {
         return mismatch("video processor does not support required zero-copy");
     }
+    if (request.require_zero_copy() && requires_explicit_conversion(request)) {
+        return mismatch(
+            "required zero-copy video processor plane layout or address alignment is unsupported");
+    }
     return Status::ok_status();
+}
+
+bool VideoProcessorCapability::requires_explicit_conversion(
+    const VideoProcessorRequest& request) const {
+    const VideoProcessorConfig& config = request.config();
+    const FormatMemoryDomain* input_format = find_format(
+        input_formats_, config.input_format.pixel_format(),
+        config.input_format.memory_domain());
+    const FormatMemoryDomain* output_format = find_format(
+        output_formats_, config.output_format.pixel_format(),
+        config.output_format.memory_domain());
+    return input_format == NULL || output_format == NULL ||
+           !layout_matches(config.input_format, *input_format, input_width_,
+                           input_height_, request.input_address_alignment()) ||
+           !layout_matches(config.output_format, *output_format, output_width_,
+                           output_height_, request.output_address_alignment());
+}
+
+bool VideoProcessorCapability::uses_zero_copy(
+    const VideoProcessorRequest& request) const {
+    return zero_copy_ && !requires_explicit_conversion(request);
+}
+
+Result<VideoProcessorConfig> VideoProcessorCapability::negotiated_config(
+    const VideoProcessorRequest& request) const {
+    const Status status = match(request);
+    if (!status.ok()) {
+        return Result<VideoProcessorConfig>(status);
+    }
+    const VideoProcessorConfig& config = request.config();
+    if (!requires_explicit_conversion(request)) {
+        return Result<VideoProcessorConfig>(config);
+    }
+    const FormatMemoryDomain* input_format = find_format(
+        input_formats_, config.input_format.pixel_format(),
+        config.input_format.memory_domain());
+    const FormatMemoryDomain* output_format = find_format(
+        output_formats_, config.output_format.pixel_format(),
+        config.output_format.memory_domain());
+    Result<VideoFormat> actual_input = make_actual_format(
+        config.input_format, *input_format, input_width_, input_height_);
+    if (!actual_input.ok()) {
+        return Result<VideoProcessorConfig>(actual_input.status());
+    }
+    Result<VideoFormat> actual_output = make_actual_format(
+        config.output_format, *output_format, output_width_, output_height_);
+    if (!actual_output.ok()) {
+        return Result<VideoProcessorConfig>(actual_output.status());
+    }
+    return VideoProcessorConfig::create(
+        actual_input.value(), actual_output.value(), config.crop_x, config.crop_y,
+        config.crop_width, config.crop_height, config.rotation_degrees);
 }
 
 Status VideoEncoderCapability::match(
@@ -197,10 +501,15 @@ Status VideoEncoderCapability::match(
         return mismatch(
             "video encoder input dimensions do not match required configuration");
     }
-    if (!contains_format(input_formats_, request.input_format().pixel_format(),
-                         request.input_format().memory_domain())) {
+    const FormatMemoryDomain* input_format = find_format(
+        input_formats_, request.input_format().pixel_format(),
+        request.input_format().memory_domain());
+    if (input_format == NULL) {
         return mismatch(
             "video encoder input pixel format or memory domain is unsupported");
+    }
+    if (!input_format->valid()) {
+        return mismatch("video encoder capability has invalid plane layout constraints");
     }
     if (config.codec != codec_) {
         return mismatch("video encoder codec is unsupported");
@@ -217,7 +526,42 @@ Status VideoEncoderCapability::match(
     if (request.require_zero_copy() && !zero_copy_) {
         return mismatch("video encoder does not support required zero-copy");
     }
+    if (request.require_zero_copy() && requires_explicit_conversion(request)) {
+        return mismatch(
+            "required zero-copy video encoder plane layout or address alignment is unsupported");
+    }
     return Status::ok_status();
+}
+
+bool VideoEncoderCapability::requires_explicit_conversion(
+    const VideoEncoderRequest& request) const {
+    const FormatMemoryDomain* input_format = find_format(
+        input_formats_, request.input_format().pixel_format(),
+        request.input_format().memory_domain());
+    return input_format == NULL ||
+           !layout_matches(request.input_format(), *input_format, width_, height_,
+                           request.input_address_alignment());
+}
+
+bool VideoEncoderCapability::uses_zero_copy(
+    const VideoEncoderRequest& request) const {
+    return zero_copy_ && !requires_explicit_conversion(request);
+}
+
+Result<VideoFormat> VideoEncoderCapability::actual_input_format(
+    const VideoEncoderRequest& request) const {
+    const Status status = match(request);
+    if (!status.ok()) {
+        return Result<VideoFormat>(status);
+    }
+    if (!requires_explicit_conversion(request)) {
+        return Result<VideoFormat>(request.input_format());
+    }
+    const FormatMemoryDomain* input_format = find_format(
+        input_formats_, request.input_format().pixel_format(),
+        request.input_format().memory_domain());
+    return make_actual_format(request.input_format(), *input_format, width_,
+                              height_);
 }
 
 bool ProviderPreferenceScore::operator<(
@@ -235,18 +579,22 @@ bool ProviderPreferenceScore::operator<(
 }
 
 Status ProviderCapability::match(const VideoProcessorRequest& request) const {
+    const Status provider_status =
+        required_provider_status(provider_id_, request.constraints());
+    if (!provider_status.ok()) {
+        return provider_status;
+    }
     if (!availability_status_.ok()) {
         return availability_status_;
     }
     if (processor_capabilities_.empty()) {
         return mismatch("provider has no video processor capability");
     }
-    Status first_mismatch = processor_capabilities_[0].match(request);
+    const Status first_mismatch = processor_capabilities_[0].match(request);
     if (first_mismatch.ok()) {
         return first_mismatch;
     }
-    for (std::size_t index = 1; index < processor_capabilities_.size();
-         ++index) {
+    for (std::size_t index = 1; index < processor_capabilities_.size(); ++index) {
         const Status status = processor_capabilities_[index].match(request);
         if (status.ok()) {
             return status;
@@ -256,18 +604,22 @@ Status ProviderCapability::match(const VideoProcessorRequest& request) const {
 }
 
 Status ProviderCapability::match(const VideoEncoderRequest& request) const {
+    const Status provider_status =
+        required_provider_status(provider_id_, request.constraints());
+    if (!provider_status.ok()) {
+        return provider_status;
+    }
     if (!availability_status_.ok()) {
         return availability_status_;
     }
     if (encoder_capabilities_.empty()) {
         return mismatch("provider has no video encoder capability");
     }
-    Status first_mismatch = encoder_capabilities_[0].match(request);
+    const Status first_mismatch = encoder_capabilities_[0].match(request);
     if (first_mismatch.ok()) {
         return first_mismatch;
     }
-    for (std::size_t index = 1; index < encoder_capabilities_.size();
-         ++index) {
+    for (std::size_t index = 1; index < encoder_capabilities_.size(); ++index) {
         const Status status = encoder_capabilities_[index].match(request);
         if (status.ok()) {
             return status;
@@ -282,14 +634,30 @@ Result<VideoProcessorNegotiation> ProviderCapability::negotiate(
     if (!status.ok()) {
         return Result<VideoProcessorNegotiation>(status);
     }
-    try {
-        return Result<VideoProcessorNegotiation>(VideoProcessorNegotiation(
-            provider_id_, request.config(), request.config().output_format, false));
-    } catch (const std::bad_alloc&) {
-        return Result<VideoProcessorNegotiation>(Status(
-            StatusCode::kResourceExhausted,
-            "failed to create video processor negotiation result"));
+    for (std::size_t index = 0; index < processor_capabilities_.size(); ++index) {
+        if (!processor_capabilities_[index].match(request).ok()) {
+            continue;
+        }
+        Result<VideoProcessorConfig> config =
+            processor_capabilities_[index].negotiated_config(request);
+        if (!config.ok()) {
+            return Result<VideoProcessorNegotiation>(config.status());
+        }
+        const bool conversion =
+            processor_capabilities_[index].requires_explicit_conversion(request);
+        const bool zero_copy =
+            processor_capabilities_[index].uses_zero_copy(request);
+        try {
+            return Result<VideoProcessorNegotiation>(VideoProcessorNegotiation(
+                provider_id_, config.value(), config.value().output_format,
+                conversion, zero_copy));
+        } catch (const std::bad_alloc&) {
+            return Result<VideoProcessorNegotiation>(Status(
+                StatusCode::kResourceExhausted,
+                "failed to create video processor negotiation result"));
+        }
     }
+    return Result<VideoProcessorNegotiation>(status);
 }
 
 Result<VideoEncoderNegotiation> ProviderCapability::negotiate(
@@ -298,23 +666,89 @@ Result<VideoEncoderNegotiation> ProviderCapability::negotiate(
     if (!status.ok()) {
         return Result<VideoEncoderNegotiation>(status);
     }
-    try {
-        return Result<VideoEncoderNegotiation>(VideoEncoderNegotiation(
-            provider_id_, request.config(), request.input_format(), false));
-    } catch (const std::bad_alloc&) {
-        return Result<VideoEncoderNegotiation>(Status(
-            StatusCode::kResourceExhausted,
-            "failed to create video encoder negotiation result"));
+    for (std::size_t index = 0; index < encoder_capabilities_.size(); ++index) {
+        if (!encoder_capabilities_[index].match(request).ok()) {
+            continue;
+        }
+        Result<VideoFormat> actual_format =
+            encoder_capabilities_[index].actual_input_format(request);
+        if (!actual_format.ok()) {
+            return Result<VideoEncoderNegotiation>(actual_format.status());
+        }
+        const bool conversion =
+            encoder_capabilities_[index].requires_explicit_conversion(request);
+        const bool zero_copy = encoder_capabilities_[index].uses_zero_copy(request);
+        try {
+            return Result<VideoEncoderNegotiation>(VideoEncoderNegotiation(
+                provider_id_, request.config(), actual_format.value(), conversion,
+                zero_copy));
+        } catch (const std::bad_alloc&) {
+            return Result<VideoEncoderNegotiation>(Status(
+                StatusCode::kResourceExhausted,
+                "failed to create video encoder negotiation result"));
+        }
     }
+    return Result<VideoEncoderNegotiation>(status);
 }
 
-ProviderPreferenceScore ProviderCapability::preference_score(
-    const SelectionPreferences& preferences, bool zero_copy) const {
-    return ProviderPreferenceScore(
-        preferred_provider_rank(preferences.preferred_provider_ids(),
-                                provider_id_),
-        provider_kind_rank(kind_, preferences.prefer_hardware()),
-        preferences.prefer_zero_copy() && !zero_copy ? 1 : 0, provider_id_);
+Result<ProviderPreferenceScore> ProviderCapability::preference_score(
+    const VideoProcessorRequest& request) const {
+    const Status status = match(request);
+    if (!status.ok()) {
+        return Result<ProviderPreferenceScore>(status);
+    }
+    for (std::size_t index = 0; index < processor_capabilities_.size(); ++index) {
+        if (processor_capabilities_[index].match(request).ok()) {
+            try {
+                return Result<ProviderPreferenceScore>(ProviderPreferenceScore(
+                    preferred_provider_rank(
+                        request.preferences().preferred_provider_ids(),
+                        provider_id_),
+                    provider_kind_rank(kind_,
+                                       request.preferences().prefer_hardware()),
+                    request.preferences().prefer_zero_copy() &&
+                            !processor_capabilities_[index].uses_zero_copy(request)
+                        ? 1
+                        : 0,
+                    provider_id_));
+            } catch (const std::bad_alloc&) {
+                return Result<ProviderPreferenceScore>(Status(
+                    StatusCode::kResourceExhausted,
+                    "failed to create provider preference score"));
+            }
+        }
+    }
+    return Result<ProviderPreferenceScore>(status);
+}
+
+Result<ProviderPreferenceScore> ProviderCapability::preference_score(
+    const VideoEncoderRequest& request) const {
+    const Status status = match(request);
+    if (!status.ok()) {
+        return Result<ProviderPreferenceScore>(status);
+    }
+    for (std::size_t index = 0; index < encoder_capabilities_.size(); ++index) {
+        if (encoder_capabilities_[index].match(request).ok()) {
+            try {
+                return Result<ProviderPreferenceScore>(ProviderPreferenceScore(
+                    preferred_provider_rank(
+                        request.preferences().preferred_provider_ids(),
+                        provider_id_),
+                    provider_kind_rank(kind_,
+                                       request.preferences().prefer_hardware()),
+                    request.preferences().prefer_zero_copy() &&
+                            !encoder_capabilities_[index].uses_zero_copy(request)
+                        ? 1
+                        : 0,
+                    provider_id_));
+            } catch (const std::bad_alloc&) {
+                return Result<ProviderPreferenceScore>(Status(
+                    StatusCode::kResourceExhausted,
+                    "failed to create provider preference score"));
+            }
+        }
+    }
+    return Result<ProviderPreferenceScore>(status);
 }
 
 }  // namespace eavp
