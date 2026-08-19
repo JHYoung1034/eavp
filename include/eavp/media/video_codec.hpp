@@ -28,6 +28,13 @@ enum class CodecProfile {
 };
 
 struct VideoProcessorConfig {
+public:
+    static Result<VideoProcessorConfig> create(const VideoFormat& input_format_value,
+                                               const VideoFormat& output_format_value,
+                                               int crop_x_value, int crop_y_value,
+                                               int crop_width_value, int crop_height_value,
+                                               int rotation_degrees_value);
+
     VideoFormat input_format;
     VideoFormat output_format;
     int crop_x;
@@ -35,6 +42,19 @@ struct VideoProcessorConfig {
     int crop_width;
     int crop_height;
     int rotation_degrees;
+
+private:
+    VideoProcessorConfig(const VideoFormat& input_format_value,
+                         const VideoFormat& output_format_value, int crop_x_value,
+                         int crop_y_value, int crop_width_value, int crop_height_value,
+                         int rotation_degrees_value)
+        : input_format(input_format_value),
+          output_format(output_format_value),
+          crop_x(crop_x_value),
+          crop_y(crop_y_value),
+          crop_width(crop_width_value),
+          crop_height(crop_height_value),
+          rotation_degrees(rotation_degrees_value) {}
 };
 
 struct VideoEncoderConfig {

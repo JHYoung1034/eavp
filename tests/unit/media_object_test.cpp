@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <fcntl.h>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unistd.h>
@@ -19,10 +20,13 @@ namespace {
 
 class UnmappableStorage : public eavp::BufferStorage {
 public:
-    explicit UnmappableStorage(std::size_t capacity) : capacity_(capacity), provider_id_("test") {}
+    explicit UnmappableStorage(
+        std::size_t capacity,
+        eavp::MemoryDomain memory_domain = eavp::MemoryDomain::kDeviceOpaque)
+        : capacity_(capacity), memory_domain_(memory_domain), provider_id_("test") {}
 
     eavp::MemoryDomain memory_domain() const override {
-        return eavp::MemoryDomain::kDeviceOpaque;
+        return memory_domain_;
     }
     std::size_t capacity() const override { return capacity_; }
     const std::string& provider_id() const override { return provider_id_; }
@@ -37,6 +41,7 @@ public:
 
 private:
     std::size_t capacity_;
+    eavp::MemoryDomain memory_domain_;
     std::string provider_id_;
 };
 
@@ -290,18 +295,18 @@ TEST(MediaPacketTest, CopyRetainsSharedPayloadAndMetadata) {
     }
     const eavp::TimeBase time_base = eavp::TimeBase::create(1, 90000).take_value();
     const eavp::MediaPacket packet = eavp::MediaPacket::create(
-        buffer, eavp::CodecId::kH264, eavp::EncodedStreamFormat::kAnnexB, 0, 9000, 9000,
-        3600, time_base, true, eavp::CodecConfigData()).take_value();
+        buffer, eavp::CodecId::kReference, eavp::EncodedStreamFormat::kReference, 0, 9000,
+        9000, 3600, time_base, true, eavp::CodecConfigData()).take_value();
     const eavp::MediaPacket copy = packet;
 
     eavp::MappedRegion mapped =
         copy.buffer().map_plane(0U, eavp::MapMode::kReadOnly).take_value();
     EXPECT_EQ(0x3c, mapped.data()[0]);
-    EXPECT_EQ(eavp::CodecId::kH264, copy.codec());
+    EXPECT_EQ(eavp::CodecId::kReference, copy.codec());
     EXPECT_EQ(9000, copy.pts());
     EXPECT_EQ(3600, copy.duration());
     EXPECT_TRUE(copy.key_frame());
-    EXPECT_EQ(eavp::EncodedStreamFormat::kAnnexB, copy.stream_format());
+    EXPECT_EQ(eavp::EncodedStreamFormat::kReference, copy.stream_format());
     EXPECT_EQ(0, copy.stream_index());
 }
 
@@ -348,6 +353,25 @@ TEST(VideoFormatTest, RejectsOddChromaDimensions) {
                   .code());
 }
 
+TEST(VideoFormatTest, ValidatesYuv420pAndRejectsPlaneSizeOverflow) {
+    std::vector<eavp::PlaneLayout> yuv420p_planes;
+    yuv420p_planes.push_back(eavp::PlaneLayout(0U, 128U, 16U));
+    yuv420p_planes.push_back(eavp::PlaneLayout(128U, 32U, 8U));
+    yuv420p_planes.push_back(eavp::PlaneLayout(160U, 32U, 8U));
+    EXPECT_TRUE(eavp::VideoFormat::create(eavp::PixelFormat::kYuv420p, 16, 8,
+                                           eavp::MemoryDomain::kCpu, yuv420p_planes)
+                    .ok());
+
+    std::vector<eavp::PlaneLayout> overflowing_planes;
+    overflowing_planes.push_back(eavp::PlaneLayout(
+        0U, std::numeric_limits<std::size_t>::max(), std::numeric_limits<std::size_t>::max()));
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::VideoFormat::create(eavp::PixelFormat::kRgb24, 1, 2,
+                                         eavp::MemoryDomain::kCpu, overflowing_planes)
+                  .status()
+                  .code());
+}
+
 TEST(FrameTest, VideoFrameRequiresBufferFormatDomainAndPlaneLayoutMatch) {
     std::shared_ptr<eavp::BufferStorage> storage(new UnmappableStorage(192U));
     std::vector<eavp::PlaneLayout> planes;
@@ -370,6 +394,50 @@ TEST(FrameTest, VideoFrameRequiresBufferFormatDomainAndPlaneLayoutMatch) {
         eavp::Buffer::create(storage, single_plane).take_value();
     EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch,
               eavp::VideoFrame::create(mismatched_buffer, format, 0, video_time_base)
+                  .status()
+                  .code());
+
+    std::vector<eavp::PlaneLayout> layout_mismatch;
+    layout_mismatch.push_back(eavp::PlaneLayout(0U, 128U, 16U));
+    layout_mismatch.push_back(eavp::PlaneLayout(129U, 63U, 16U));
+    const eavp::Buffer layout_mismatched_buffer =
+        eavp::Buffer::create(storage, layout_mismatch).take_value();
+    EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch,
+              eavp::VideoFrame::create(layout_mismatched_buffer, format, 0, video_time_base)
+                  .status()
+                  .code());
+
+    std::shared_ptr<eavp::BufferStorage> mmap_storage(
+        new UnmappableStorage(192U, eavp::MemoryDomain::kMmap));
+    const eavp::Buffer domain_mismatched_buffer =
+        eavp::Buffer::create(mmap_storage, planes).take_value();
+    EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch,
+              eavp::VideoFrame::create(domain_mismatched_buffer, format, 0, video_time_base)
+                  .status()
+                  .code());
+}
+
+TEST(VideoProcessorConfigTest, RejectsInvalidCropAndRotation) {
+    std::vector<eavp::PlaneLayout> rgb24_planes;
+    rgb24_planes.push_back(eavp::PlaneLayout(0U, 384U, 48U));
+    const eavp::VideoFormat format = eavp::VideoFormat::create(
+        eavp::PixelFormat::kRgb24, 16, 8, eavp::MemoryDomain::kCpu, rgb24_planes)
+                                          .take_value();
+    EXPECT_TRUE(eavp::VideoProcessorConfig::create(format, format, 0, 0, 16, 8, 0).ok());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::VideoProcessorConfig::create(format, format, -1, 0, 16, 8, 0)
+                  .status()
+                  .code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::VideoProcessorConfig::create(format, format, 0, 0, 0, 8, 0)
+                  .status()
+                  .code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::VideoProcessorConfig::create(format, format, 1, 0, 16, 8, 0)
+                  .status()
+                  .code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::VideoProcessorConfig::create(format, format, 0, 0, 16, 8, 45)
                   .status()
                   .code());
 }

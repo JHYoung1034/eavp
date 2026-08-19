@@ -2,6 +2,7 @@
 #define EAVP_MEDIA_FRAME_HPP_
 
 #include <cstdint>
+#include <new>
 
 #include "eavp/base/time.hpp"
 #include "eavp/media/buffer.hpp"
@@ -42,7 +43,12 @@ public:
                            "video frame buffer planes do not match its format"));
             }
         }
-        return Result<VideoFrame>(VideoFrame(buffer, format, pts, time_base));
+        try {
+            return Result<VideoFrame>(VideoFrame(buffer, format, pts, time_base));
+        } catch (const std::bad_alloc&) {
+            return Result<VideoFrame>(
+                Status(StatusCode::kResourceExhausted, "failed to create video frame metadata"));
+        }
     }
 
     const Buffer& buffer() const { return buffer_; }
