@@ -171,6 +171,98 @@ private:
     int ticks_;
 };
 
+class AsynchronousDrainNode : public eavp::MediaNode {
+public:
+    AsynchronousDrainNode(const std::string& id, int blocked_stops,
+                          std::vector<std::string>* events)
+        : eavp::MediaNode(id), blocked_stops_(blocked_stops),
+          stop_calls_(0), reset_calls_(0), events_(events) {}
+
+    int reset_calls() const { return reset_calls_; }
+
+protected:
+    eavp::Status on_stop() override {
+        events_->push_back(id() + ":drain");
+        if (stop_calls_++ < blocked_stops_) {
+            return eavp::Status(eavp::StatusCode::kWouldBlock,
+                                "drain needs another executor turn");
+        }
+        return eavp::Status(eavp::StatusCode::kEndOfStream,
+                            "drain reached end of stream");
+    }
+
+    eavp::Status on_reset() override {
+        ++reset_calls_;
+        events_->push_back(id() + ":reset");
+        return eavp::Status::ok_status();
+    }
+
+private:
+    int blocked_stops_;
+    int stop_calls_;
+    int reset_calls_;
+    std::vector<std::string>* events_;
+};
+
+TEST(PipelineTest, StopsSubmissionThenContinuesTopologicalDrainAcrossCalls) {
+    std::vector<std::string> events;
+    eavp::MediaPipeline pipeline("drain");
+    AsynchronousDrainNode* source =
+        new AsynchronousDrainNode("source", 0, &events);
+    AsynchronousDrainNode* processor =
+        new AsynchronousDrainNode("processor", 1, &events);
+    AsynchronousDrainNode* sink =
+        new AsynchronousDrainNode("sink", 1, &events);
+    ASSERT_TRUE(pipeline.add_node(
+        std::unique_ptr<eavp::MediaNode>(source)).ok());
+    ASSERT_TRUE(pipeline.add_node(
+        std::unique_ptr<eavp::MediaNode>(processor)).ok());
+    ASSERT_TRUE(pipeline.add_node(
+        std::unique_ptr<eavp::MediaNode>(sink)).ok());
+    ASSERT_TRUE(pipeline.connect("source", "processor").ok());
+    ASSERT_TRUE(pipeline.connect("processor", "sink").ok());
+    ASSERT_TRUE(pipeline.start().ok());
+
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock, pipeline.stop().code());
+    EXPECT_EQ(eavp::PipelineState::kDraining, pipeline.state());
+    const std::vector<std::string> first_turn{
+        "source:drain", "processor:drain"};
+    EXPECT_EQ(first_turn, events);
+
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock, pipeline.stop().code());
+    EXPECT_EQ(eavp::PipelineState::kDraining, pipeline.state());
+    ASSERT_TRUE(pipeline.stop().ok());
+    EXPECT_EQ(eavp::PipelineState::kStopped, pipeline.state());
+
+    const std::vector<std::string> expected{
+        "source:drain", "processor:drain", "processor:drain",
+        "sink:drain", "sink:drain", "sink:reset", "processor:reset",
+        "source:reset"};
+    EXPECT_EQ(expected, events);
+    EXPECT_EQ(1, source->reset_calls());
+    EXPECT_EQ(1, processor->reset_calls());
+    EXPECT_EQ(1, sink->reset_calls());
+    ASSERT_TRUE(pipeline.stop().ok());
+    EXPECT_EQ(expected, events);
+}
+
+TEST(PipelineTest, RejectsStartAndGraphMutationWhileDraining) {
+    std::vector<std::string> events;
+    eavp::MediaPipeline pipeline("drain");
+    ASSERT_TRUE(pipeline.add_node(std::unique_ptr<eavp::MediaNode>(
+        new AsynchronousDrainNode("source", 1, &events))).ok());
+    ASSERT_TRUE(pipeline.start().ok());
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock, pipeline.stop().code());
+    ASSERT_EQ(eavp::PipelineState::kDraining, pipeline.state());
+
+    EXPECT_EQ(eavp::StatusCode::kInvalidState, pipeline.start().code());
+    EXPECT_EQ(eavp::PipelineState::kDraining, pipeline.state());
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              pipeline.add_node(std::unique_ptr<eavp::MediaNode>(
+                  new RecordingNode("late", &events, false))).code());
+    EXPECT_EQ(eavp::PipelineState::kDraining, pipeline.state());
+}
+
 TEST(ExecutorTest, StopsAtFirstPipelineTickFailure) {
     eavp::MediaPipeline pipeline("live0");
     FailingTickNode* node = new FailingTickNode();

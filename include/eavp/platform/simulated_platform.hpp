@@ -9,13 +9,9 @@
 #include "eavp/management/health.hpp"
 #include "eavp/management/metrics.hpp"
 #include "eavp/media/executor.hpp"
+#include "eavp/platform/pipeline_query.hpp"
 
 namespace eavp {
-
-struct PipelineStateQuery {
-    explicit PipelineStateQuery(const std::string& pipeline) : pipeline_id(pipeline) {}
-    std::string pipeline_id;
-};
 
 class SimulatedPlatform {
 public:

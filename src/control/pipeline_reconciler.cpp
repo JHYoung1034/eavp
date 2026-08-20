@@ -50,10 +50,13 @@ Status PipelineReconciler::reconcile_once() {
         return Status(StatusCode::kInvalidArgument, "unsupported desired pipeline state");
     }
     if (!result.ok()) {
+        if (result.code() == StatusCode::kWouldBlock) {
+            actual_->set(state_key(), StateValue("draining"));
+            return result;
+        }
         return publish_failure(result);
     }
     return actual_->set(state_key(), StateValue(desired_state.value()));
 }
 
 }  // namespace eavp
-

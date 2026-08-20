@@ -4,7 +4,8 @@
 
 namespace eavp {
 
-MediaPipeline::MediaPipeline(const std::string& id) : id_(id), state_(PipelineState::kCreated) {}
+MediaPipeline::MediaPipeline(const std::string& id)
+    : id_(id), state_(PipelineState::kCreated), drain_index_(0U) {}
 
 MediaPipeline::~MediaPipeline() { stop(); }
 
@@ -15,8 +16,10 @@ Status MediaPipeline::add_node(std::unique_ptr<MediaNode> node) {
     if (!node) {
         return Status(StatusCode::kInvalidArgument, "node must not be null");
     }
-    if (state_ == PipelineState::kRunning) {
-        return Status(StatusCode::kInvalidState, "cannot modify a running pipeline");
+    if (state_ == PipelineState::kRunning ||
+        state_ == PipelineState::kDraining) {
+        return Status(StatusCode::kInvalidState,
+                      "cannot modify an active pipeline");
     }
     const std::string node_id = node->id();
     const Status graph_status = graph_.add_node(node_id);
@@ -29,8 +32,10 @@ Status MediaPipeline::add_node(std::unique_ptr<MediaNode> node) {
 }
 
 Status MediaPipeline::connect(const std::string& source, const std::string& sink) {
-    if (state_ == PipelineState::kRunning) {
-        return Status(StatusCode::kInvalidState, "cannot modify a running pipeline");
+    if (state_ == PipelineState::kRunning ||
+        state_ == PipelineState::kDraining) {
+        return Status(StatusCode::kInvalidState,
+                      "cannot modify an active pipeline");
     }
     return graph_.connect(source, sink);
 }
@@ -51,13 +56,31 @@ void MediaPipeline::stop_nodes_reverse(const std::vector<MediaNode*>& nodes) {
     }
 }
 
+Status MediaPipeline::reset_nodes_reverse(const std::vector<MediaNode*>& nodes) {
+    Status first_failure = Status::ok_status();
+    for (std::vector<MediaNode*>::const_reverse_iterator it = nodes.rbegin();
+         it != nodes.rend(); ++it) {
+        const Status status = (*it)->reset();
+        if (first_failure.ok() && !status.ok()) {
+            first_failure = status;
+        }
+    }
+    return first_failure;
+}
+
 Status MediaPipeline::start() {
     if (state_ == PipelineState::kRunning) {
         return Status::ok_status();
     }
+    if (state_ == PipelineState::kDraining) {
+        return Status(StatusCode::kInvalidState,
+                      "pipeline is still draining");
+    }
     if (state_ == PipelineState::kError) {
         return Status(StatusCode::kInvalidState, "pipeline must be reset after an error");
     }
+    drain_order_.clear();
+    drain_index_ = 0U;
     const Result<std::vector<std::string> > order_result = graph_.topological_order();
     if (!order_result.ok()) {
         state_ = PipelineState::kError;
@@ -100,21 +123,47 @@ Status MediaPipeline::stop() {
         state_ = PipelineState::kStopped;
         return Status::ok_status();
     }
-    const Result<std::vector<std::string> > order_result = graph_.topological_order();
-    if (!order_result.ok()) {
-        state_ = PipelineState::kError;
-        return order_result.status();
+    if (state_ != PipelineState::kDraining) {
+        const Result<std::vector<std::string> > order_result =
+            graph_.topological_order();
+        if (!order_result.ok()) {
+            state_ = PipelineState::kError;
+            return order_result.status();
+        }
+        drain_order_ = ordered_nodes(order_result.value());
+        drain_index_ = 0U;
+        if (state_ == PipelineState::kError) {
+            const Status reset_status = reset_nodes_reverse(drain_order_);
+            state_ = reset_status.ok() ? PipelineState::kStopped
+                                       : PipelineState::kError;
+            return reset_status;
+        }
+        state_ = PipelineState::kDraining;
     }
-    const std::vector<MediaNode*> order = ordered_nodes(order_result.value());
-    for (std::vector<MediaNode*>::const_reverse_iterator it = order.rbegin(); it != order.rend();
-         ++it) {
-        const Status status = (*it)->stop();
+
+    while (drain_index_ < drain_order_.size()) {
+        const Status status = drain_order_[drain_index_]->stop();
+        if (status.code() == StatusCode::kWouldBlock ||
+            status.code() == StatusCode::kNotFound) {
+            return Status(StatusCode::kWouldBlock,
+                          "pipeline drain requires another executor turn");
+        }
         if (!status.ok()) {
+            reset_nodes_reverse(drain_order_);
             state_ = PipelineState::kError;
             return status;
         }
+        ++drain_index_;
+    }
+
+    const Status reset_status = reset_nodes_reverse(drain_order_);
+    if (!reset_status.ok()) {
+        state_ = PipelineState::kError;
+        return reset_status;
     }
     state_ = PipelineState::kStopped;
+    drain_order_.clear();
+    drain_index_ = 0U;
     return Status::ok_status();
 }
 
@@ -130,7 +179,8 @@ Status MediaPipeline::tick() {
     for (std::vector<MediaNode*>::const_iterator it = order.begin(); it != order.end(); ++it) {
         const Status status = (*it)->tick();
         if (!status.ok() && status.code() != StatusCode::kWouldBlock &&
-            status.code() != StatusCode::kNotFound) {
+            status.code() != StatusCode::kNotFound &&
+            status.code() != StatusCode::kEndOfStream) {
             state_ = PipelineState::kError;
             return status;
         }
@@ -139,4 +189,3 @@ Status MediaPipeline::tick() {
 }
 
 }  // namespace eavp
-

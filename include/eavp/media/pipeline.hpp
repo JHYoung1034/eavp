@@ -14,6 +14,7 @@ namespace eavp {
 enum class PipelineState {
     kCreated,
     kRunning,
+    kDraining,
     kStopped,
     kError,
 };
@@ -35,15 +36,17 @@ public:
 private:
     std::vector<MediaNode*> ordered_nodes(const std::vector<std::string>& order) const;
     void stop_nodes_reverse(const std::vector<MediaNode*>& nodes);
+    Status reset_nodes_reverse(const std::vector<MediaNode*>& nodes);
 
     std::string id_;
     PipelineState state_;
     MediaGraph graph_;
     std::vector<std::unique_ptr<MediaNode> > nodes_;
     std::map<std::string, MediaNode*> nodes_by_id_;
+    std::vector<MediaNode*> drain_order_;
+    std::size_t drain_index_;
 };
 
 }  // namespace eavp
 
 #endif  // EAVP_MEDIA_PIPELINE_HPP_
-

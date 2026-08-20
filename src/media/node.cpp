@@ -40,12 +40,26 @@ Status MediaNode::stop() {
         state_ = NodeState::kStopped;
         return Status::ok_status();
     }
+    if (state_ != NodeState::kDraining) {
+        state_ = NodeState::kDraining;
+    }
     const Status status = on_stop();
-    state_ = status.ok() ? NodeState::kStopped : NodeState::kError;
+    if (status.ok() || status.code() == StatusCode::kEndOfStream) {
+        state_ = NodeState::kStopped;
+        return Status::ok_status();
+    }
+    if (status.code() == StatusCode::kWouldBlock ||
+        status.code() == StatusCode::kNotFound) {
+        return status;
+    }
+    state_ = NodeState::kError;
     return status;
 }
 
 Status MediaNode::reset() {
+    if (state_ == NodeState::kCreated) {
+        return Status::ok_status();
+    }
     const Status status = on_reset();
     state_ = status.ok() ? NodeState::kCreated : NodeState::kError;
     return status;
@@ -57,7 +71,8 @@ Status MediaNode::tick() {
     }
     const Status status = on_tick();
     if (!status.ok() && status.code() != StatusCode::kWouldBlock &&
-        status.code() != StatusCode::kNotFound) {
+        status.code() != StatusCode::kNotFound &&
+        status.code() != StatusCode::kEndOfStream) {
         state_ = NodeState::kError;
     }
     return status;
@@ -70,4 +85,3 @@ Status MediaNode::on_reset() { return Status::ok_status(); }
 Status MediaNode::on_tick() { return Status::ok_status(); }
 
 }  // namespace eavp
-

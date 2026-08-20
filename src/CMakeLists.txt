@@ -17,6 +17,7 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/eavp/base
         OPTIONAL)
 
 add_library(eavp_media STATIC
+    media/backend_node.cpp
     media/backend_registry.cpp
     media/buffer.cpp
     media/capability.cpp
@@ -94,6 +95,7 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/eavp/management
         OPTIONAL)
 
 add_library(eavp_platform STATIC
+    platform/reference_media_platform.cpp
     platform/simulated_platform.cpp
 )
 add_library(EAVP::platform ALIAS eavp_platform)

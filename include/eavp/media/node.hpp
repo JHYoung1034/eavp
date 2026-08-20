@@ -11,6 +11,7 @@ enum class NodeState {
     kCreated,
     kPrepared,
     kRunning,
+    kDraining,
     kStopped,
     kError,
 };
@@ -44,4 +45,3 @@ private:
 }  // namespace eavp
 
 #endif  // EAVP_MEDIA_NODE_HPP_
-
