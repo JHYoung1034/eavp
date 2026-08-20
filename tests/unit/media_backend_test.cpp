@@ -11,6 +11,8 @@
 #include "eavp/media/backend.hpp"
 #include "eavp/media/backend_registry.hpp"
 #include "eavp/media/capability.hpp"
+#include "eavp/media/reference_backend.hpp"
+#include "support/backend_contract.hpp"
 
 namespace {
 
@@ -1098,6 +1100,144 @@ TEST(BackendInterfaceTest, ProcessorUsesTheSameThreadAffinityContract) {
 
     EXPECT_EQ(eavp::StatusCode::kInvalidState, submit_code);
     EXPECT_EQ(eavp::BackendState::kConfigured, processor.state());
+}
+
+TEST(BackendContractTest, ReferenceProviderSatisfiesReusableContract) {
+    run_backend_contract(
+        eavp::create_reference_backend(eavp::ReferenceBackendOptions()));
+}
+
+TEST(ReferenceBackendTest, AdvertisesOnlyTheBehaviorItImplements) {
+    std::shared_ptr<eavp::MediaBackendProvider> provider =
+        eavp::create_reference_backend(eavp::ReferenceBackendOptions());
+    ASSERT_TRUE(provider.get() != NULL);
+    eavp::Result<eavp::ProviderCapability> probe = provider->probe();
+    ASSERT_TRUE(probe.ok());
+    const eavp::ProviderCapability capability = probe.take_value();
+
+    EXPECT_EQ("reference", capability.provider_id());
+    EXPECT_EQ(eavp::ProviderKind::kReference, capability.kind());
+    EXPECT_TRUE(capability.available());
+    ASSERT_EQ(1U, capability.processor_capabilities().size());
+    EXPECT_TRUE(capability.processor_capabilities()[0].operations().empty());
+    ASSERT_EQ(1U, capability.encoder_capabilities().size());
+    EXPECT_EQ(eavp::CodecId::kReference,
+              capability.encoder_capabilities()[0].codec());
+}
+
+TEST(ReferenceBackendTest, ProcessorBackpressurePreservesSharedInputAndResetClearsQueue) {
+    eavp::ReferenceBackendOptions options;
+    options.queue_capacity = 1U;
+    const std::shared_ptr<eavp::MediaBackendProvider> provider =
+        eavp::create_reference_backend(options);
+    eavp::Result<std::unique_ptr<eavp::VideoProcessor> > created =
+        provider->create_video_processor();
+    ASSERT_TRUE(created.ok());
+    std::unique_ptr<eavp::VideoProcessor> processor = created.take_value();
+    ASSERT_TRUE(processor
+                    ->configure(
+                        backend_contract_detail::make_reference_processor_config())
+                    .ok());
+
+    const std::shared_ptr<const eavp::VideoFrame> first =
+        make_reference_frame(10);
+    ASSERT_TRUE(processor->submit(first).ok());
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock,
+              processor->submit(make_reference_frame(11)).code());
+    eavp::Result<std::shared_ptr<const eavp::VideoFrame> > output =
+        processor->receive();
+    ASSERT_TRUE(output.ok());
+    EXPECT_EQ(first.get(), output.value().get());
+
+    eavp::Result<eavp::MappedRegion> input_map =
+        first->buffer().map_plane(0U, eavp::MapMode::kReadOnly);
+    eavp::Result<eavp::MappedRegion> output_map =
+        output.value()->buffer().map_plane(0U, eavp::MapMode::kReadOnly);
+    ASSERT_TRUE(input_map.ok());
+    ASSERT_TRUE(output_map.ok());
+    EXPECT_EQ(input_map.value().data(), output_map.value().data());
+
+    ASSERT_TRUE(processor->submit(make_reference_frame(12)).ok());
+    ASSERT_TRUE(processor->reset().ok());
+    EXPECT_EQ(eavp::BackendState::kCreated, processor->state());
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              processor->receive().status().code());
+}
+
+TEST(ReferenceBackendTest, EncoderDelaysOutputAndDrainEndsStably) {
+    eavp::ReferenceBackendOptions options;
+    options.output_delay = 1U;
+    std::unique_ptr<eavp::VideoEncoder> encoder =
+        create_configured_reference_encoder(options);
+    ASSERT_TRUE(encoder.get() != NULL);
+
+    ASSERT_TRUE(encoder->submit(make_reference_frame(0)).ok());
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock,
+              encoder->receive().status().code());
+    ASSERT_TRUE(encoder->submit(make_reference_frame(1)).ok());
+    ASSERT_TRUE(encoder->receive().ok());
+
+    ASSERT_TRUE(encoder->begin_drain().ok());
+    eavp::Result<std::shared_ptr<const eavp::MediaPacket> > last =
+        encoder->receive();
+    ASSERT_TRUE(last.ok());
+    EXPECT_EQ(1, last.value()->pts());
+    EXPECT_EQ(eavp::StatusCode::kEndOfStream,
+              encoder->receive().status().code());
+    EXPECT_EQ(eavp::StatusCode::kEndOfStream,
+              encoder->receive().status().code());
+    EXPECT_EQ(eavp::BackendState::kStopped, encoder->state());
+}
+
+TEST(ReferenceBackendTest, EncoderProducesOnlyDeterministicReferencePayload) {
+    std::unique_ptr<eavp::VideoEncoder> encoder =
+        create_configured_reference_encoder(eavp::ReferenceBackendOptions());
+    ASSERT_TRUE(encoder.get() != NULL);
+    ASSERT_TRUE(encoder->submit(make_reference_frame(0x0102030405060708LL)).ok());
+    eavp::Result<std::shared_ptr<const eavp::MediaPacket> > output =
+        encoder->receive();
+    ASSERT_TRUE(output.ok());
+    EXPECT_EQ(eavp::CodecId::kReference, output.value()->codec());
+    EXPECT_EQ(eavp::EncodedStreamFormat::kReference,
+              output.value()->stream_format());
+
+    eavp::Result<eavp::MappedRegion> payload =
+        output.value()->buffer().map_plane(0U, eavp::MapMode::kReadOnly);
+    ASSERT_TRUE(payload.ok());
+    const std::uint8_t expected[16] = {
+        0x45U, 0x41U, 0x56U, 0x50U, 0x01U, 0x02U, 0x03U, 0x04U,
+        0x05U, 0x06U, 0x07U, 0x08U, 0x00U, 0x00U, 0x00U, 0x42U};
+    ASSERT_EQ(sizeof(expected), payload.value().size());
+    EXPECT_TRUE(std::equal(expected, expected + sizeof(expected),
+                           payload.value().data()));
+}
+
+TEST(ReferenceBackendTest, ThirdSubmissionInjectsDeviceLostWithContext) {
+    eavp::ReferenceBackendOptions options;
+    options.device_lost_after_submissions = 2U;
+    std::unique_ptr<eavp::VideoEncoder> encoder =
+        create_configured_reference_encoder(options);
+    ASSERT_TRUE(encoder.get() != NULL);
+
+    ASSERT_TRUE(encoder->submit(make_reference_frame(0)).ok());
+    ASSERT_TRUE(encoder->submit(make_reference_frame(1)).ok());
+    const eavp::Status status = encoder->submit(make_reference_frame(2));
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, status.code());
+    EXPECT_EQ("reference", status.provider_id());
+    EXPECT_EQ("submit", status.operation());
+    EXPECT_EQ(eavp::BackendState::kError, encoder->state());
+
+    ASSERT_TRUE(encoder->reset().ok());
+    EXPECT_EQ(eavp::BackendState::kCreated, encoder->state());
+    ASSERT_TRUE(encoder
+                    ->configure(
+                        backend_contract_detail::make_reference_format(),
+                        backend_contract_detail::make_reference_encoder_config())
+                    .ok());
+    EXPECT_TRUE(encoder->submit(make_reference_frame(3)).ok());
+    EXPECT_TRUE(encoder->submit(make_reference_frame(4)).ok());
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost,
+              encoder->submit(make_reference_frame(5)).code());
 }
 
 }  // namespace

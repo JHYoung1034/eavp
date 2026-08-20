@@ -12,6 +12,7 @@ gtest_discover_tests(eavp_media_runtime_tests)
 
 add_executable(eavp_media_backend_tests media_backend_test.cpp)
 target_link_libraries(eavp_media_backend_tests PRIVATE EAVP::media GTest::gtest_main)
+target_include_directories(eavp_media_backend_tests PRIVATE ${PROJECT_SOURCE_DIR}/tests)
 gtest_discover_tests(eavp_media_backend_tests)
 
 add_executable(eavp_control_tests control_test.cpp)

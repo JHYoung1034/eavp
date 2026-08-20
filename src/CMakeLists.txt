@@ -24,6 +24,7 @@ add_library(eavp_media STATIC
     media/media_packet.cpp
     media/node.cpp
     media/pipeline.cpp
+    media/reference_backend.cpp
     media/video_codec.cpp
     media/video_format.cpp
 )
