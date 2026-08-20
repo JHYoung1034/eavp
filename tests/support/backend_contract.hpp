@@ -43,6 +43,16 @@ private:
     std::string provider_id_;
 };
 
+struct FrameStorageProbe {
+    FrameStorageProbe(
+        const std::shared_ptr<const eavp::VideoFrame>& frame_value,
+        const std::weak_ptr<eavp::BufferStorage>& storage_value)
+        : frame(frame_value), storage(storage_value) {}
+
+    std::shared_ptr<const eavp::VideoFrame> frame;
+    std::weak_ptr<eavp::BufferStorage> storage;
+};
+
 inline eavp::VideoFormat make_reference_format() {
     const std::vector<eavp::PlaneLayout> planes{
         eavp::PlaneLayout(0U, 12U, 6U)};
@@ -57,6 +67,19 @@ inline eavp::VideoProcessorConfig make_reference_processor_config() {
         .take_value();
 }
 
+inline eavp::VideoProcessorConfig make_non_identity_reference_processor_config() {
+    const eavp::VideoFormat input = make_reference_format();
+    const std::vector<eavp::PlaneLayout> planes{
+        eavp::PlaneLayout(0U, 12U, 6U)};
+    const eavp::VideoFormat output =
+        eavp::VideoFormat::create(
+            eavp::PixelFormat::kRgb24, 2, 2, eavp::MemoryDomain::kCpu,
+            planes, eavp::ColorRange::kFull)
+            .take_value();
+    return eavp::VideoProcessorConfig::create(input, output, 0, 0, 2, 2, 0)
+        .take_value();
+}
+
 inline eavp::VideoEncoderConfig make_reference_encoder_config(
     eavp::CodecId codec = eavp::CodecId::kReference) {
     return eavp::VideoEncoderConfig::create(
@@ -66,7 +89,7 @@ inline eavp::VideoEncoderConfig make_reference_encoder_config(
         .take_value();
 }
 
-inline std::shared_ptr<const eavp::VideoFrame> make_frame(std::int64_t pts) {
+inline FrameStorageProbe make_frame_storage_probe(std::int64_t pts) {
     const eavp::VideoFormat format = make_reference_format();
     std::shared_ptr<eavp::BufferStorage> storage(new CpuStorage(12U));
     eavp::Buffer buffer =
@@ -75,7 +98,9 @@ inline std::shared_ptr<const eavp::VideoFrame> make_frame(std::int64_t pts) {
         buffer.map_plane(0U, eavp::MapMode::kReadWrite);
     if (!mapped.ok()) {
         ADD_FAILURE() << "契约测试帧必须可映射";
-        return std::shared_ptr<const eavp::VideoFrame>();
+        return FrameStorageProbe(
+            std::shared_ptr<const eavp::VideoFrame>(),
+            std::weak_ptr<eavp::BufferStorage>());
     }
     for (std::size_t index = 0U; index < mapped.value().size(); ++index) {
         mapped.value().mutable_data()[index] = static_cast<std::uint8_t>(index);
@@ -84,10 +109,18 @@ inline std::shared_ptr<const eavp::VideoFrame> make_frame(std::int64_t pts) {
         buffer, format, pts, eavp::TimeBase::create(1, 30).take_value());
     if (!frame.ok()) {
         ADD_FAILURE() << "契约测试帧必须有效";
-        return std::shared_ptr<const eavp::VideoFrame>();
+        return FrameStorageProbe(
+            std::shared_ptr<const eavp::VideoFrame>(),
+            std::weak_ptr<eavp::BufferStorage>());
     }
-    return std::shared_ptr<const eavp::VideoFrame>(
-        new eavp::VideoFrame(frame.take_value()));
+    return FrameStorageProbe(
+        std::shared_ptr<const eavp::VideoFrame>(
+            new eavp::VideoFrame(frame.take_value())),
+        storage);
+}
+
+inline std::shared_ptr<const eavp::VideoFrame> make_frame(std::int64_t pts) {
+    return make_frame_storage_probe(pts).frame;
 }
 
 class ReferenceFixture {
@@ -97,10 +130,7 @@ public:
     }
 
     eavp::VideoProcessorConfig unsupported_processor_config() const {
-        const eavp::VideoFormat format = make_reference_format();
-        return eavp::VideoProcessorConfig::create(
-                   format, format, 0, 0, 2, 2, 90)
-            .take_value();
+        return make_non_identity_reference_processor_config();
     }
 
     eavp::VideoFormat encoder_input_format() const {
@@ -117,6 +147,10 @@ public:
 
     std::shared_ptr<const eavp::VideoFrame> frame(std::int64_t pts) const {
         return make_frame(pts);
+    }
+
+    FrameStorageProbe frame_storage_probe(std::int64_t pts) const {
+        return make_frame_storage_probe(pts);
     }
 };
 
@@ -175,6 +209,20 @@ inline void verify_capability_and_unsupported_config(
     EXPECT_FALSE(processor_negotiation.value().requires_explicit_conversion);
     EXPECT_FALSE(encoder_negotiation.value().requires_explicit_conversion);
 
+    const eavp::VideoProcessorRequest unsupported_processor_request(
+        fixture.unsupported_processor_config(),
+        std::vector<eavp::VideoProcessingOperation>(), 1U, 1U, false,
+        automatic, no_preferences);
+    const eavp::VideoEncoderRequest unsupported_encoder_request(
+        fixture.encoder_input_format(), fixture.unsupported_encoder_config(),
+        1U, false, automatic, no_preferences);
+    EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch,
+              probe.value().match(unsupported_processor_request).code())
+        << "Capability 不得声明实例 configure 会拒绝的 Processor 配置";
+    EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch,
+              probe.value().match(unsupported_encoder_request).code())
+        << "Capability 不得声明实例 configure 会拒绝的 Encoder 配置";
+
     std::unique_ptr<eavp::VideoProcessor> processor = create_processor(provider);
     ASSERT_TRUE(processor.get() != NULL);
     EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch,
@@ -205,28 +253,33 @@ inline void verify_processor_backpressure_lifetime_drain_and_reset(
     ASSERT_TRUE(processor->configure(fixture.processor_config()).ok());
 
     std::vector<std::int64_t> submitted_pts;
-    std::vector<std::weak_ptr<const eavp::VideoFrame> > pending;
+    std::vector<std::weak_ptr<eavp::BufferStorage> > pending_storage;
     for (std::int64_t pts = 0; pts < 128; ++pts) {
-        std::shared_ptr<const eavp::VideoFrame> frame = fixture.frame(pts);
-        const eavp::Status status = processor->submit(frame);
+        FrameStorageProbe probe = fixture.frame_storage_probe(pts);
+        const eavp::Status status = processor->submit(probe.frame);
         if (status.code() == eavp::StatusCode::kWouldBlock) {
             break;
         }
         ASSERT_TRUE(status.ok());
         submitted_pts.push_back(pts);
-        pending.push_back(frame);
+        pending_storage.push_back(probe.storage);
+        probe.frame.reset();
     }
     ASSERT_FALSE(submitted_pts.empty());
     ASSERT_LT(submitted_pts.size(), 128U);
-    for (std::size_t index = 0U; index < pending.size(); ++index) {
-        EXPECT_FALSE(pending[index].expired());
+    for (std::size_t index = 0U; index < pending_storage.size(); ++index) {
+        EXPECT_FALSE(pending_storage[index].expired());
     }
 
     for (std::size_t index = 0U; index < submitted_pts.size(); ++index) {
-        eavp::Result<std::shared_ptr<const eavp::VideoFrame> > output =
-            processor->receive();
-        ASSERT_TRUE(output.ok());
-        EXPECT_EQ(submitted_pts[index], output.value()->pts());
+        {
+            eavp::Result<std::shared_ptr<const eavp::VideoFrame> > output =
+                processor->receive();
+            ASSERT_TRUE(output.ok());
+            EXPECT_EQ(submitted_pts[index], output.value()->pts());
+            EXPECT_FALSE(pending_storage[index].expired());
+        }
+        EXPECT_TRUE(pending_storage[index].expired());
     }
     ASSERT_TRUE(processor->begin_drain().ok());
     EXPECT_EQ(eavp::StatusCode::kEndOfStream,
@@ -239,6 +292,14 @@ inline void verify_processor_backpressure_lifetime_drain_and_reset(
     EXPECT_EQ(eavp::BackendState::kCreated, processor->state());
     EXPECT_EQ(eavp::StatusCode::kInvalidState,
               processor->receive().status().code());
+
+    ASSERT_TRUE(processor->configure(fixture.processor_config()).ok());
+    FrameStorageProbe reset_probe = fixture.frame_storage_probe(150);
+    ASSERT_TRUE(processor->submit(reset_probe.frame).ok());
+    reset_probe.frame.reset();
+    EXPECT_FALSE(reset_probe.storage.expired());
+    ASSERT_TRUE(processor->reset().ok());
+    EXPECT_TRUE(reset_probe.storage.expired());
 }
 
 template <typename Fixture>
@@ -253,21 +314,22 @@ inline void verify_encoder_backpressure_lifetime_drain_and_reset(
                     .ok());
 
     std::vector<std::int64_t> submitted_pts;
-    std::vector<std::weak_ptr<const eavp::VideoFrame> > pending;
+    std::vector<std::weak_ptr<eavp::BufferStorage> > pending_storage;
     for (std::int64_t pts = 0; pts < 128; ++pts) {
-        std::shared_ptr<const eavp::VideoFrame> frame = fixture.frame(pts);
-        const eavp::Status status = encoder->submit(frame);
+        FrameStorageProbe probe = fixture.frame_storage_probe(pts);
+        const eavp::Status status = encoder->submit(probe.frame);
         if (status.code() == eavp::StatusCode::kWouldBlock) {
             break;
         }
         ASSERT_TRUE(status.ok());
         submitted_pts.push_back(pts);
-        pending.push_back(frame);
+        pending_storage.push_back(probe.storage);
+        probe.frame.reset();
     }
     ASSERT_FALSE(submitted_pts.empty());
     ASSERT_LT(submitted_pts.size(), 128U);
-    for (std::size_t index = 0U; index < pending.size(); ++index) {
-        EXPECT_FALSE(pending[index].expired());
+    for (std::size_t index = 0U; index < pending_storage.size(); ++index) {
+        EXPECT_FALSE(pending_storage[index].expired());
     }
 
     ASSERT_TRUE(encoder->begin_drain().ok());
@@ -276,6 +338,7 @@ inline void verify_encoder_backpressure_lifetime_drain_and_reset(
             encoder->receive();
         ASSERT_TRUE(output.ok());
         EXPECT_EQ(submitted_pts[index], output.value()->pts());
+        EXPECT_TRUE(pending_storage[index].expired());
     }
     EXPECT_EQ(eavp::StatusCode::kEndOfStream,
               encoder->receive().status().code());
@@ -287,6 +350,17 @@ inline void verify_encoder_backpressure_lifetime_drain_and_reset(
     EXPECT_EQ(eavp::BackendState::kCreated, encoder->state());
     EXPECT_EQ(eavp::StatusCode::kInvalidState,
               encoder->receive().status().code());
+
+    ASSERT_TRUE(encoder
+                    ->configure(fixture.encoder_input_format(),
+                                fixture.encoder_config())
+                    .ok());
+    FrameStorageProbe reset_probe = fixture.frame_storage_probe(160);
+    ASSERT_TRUE(encoder->submit(reset_probe.frame).ok());
+    reset_probe.frame.reset();
+    EXPECT_FALSE(reset_probe.storage.expired());
+    ASSERT_TRUE(encoder->reset().ok());
+    EXPECT_TRUE(reset_probe.storage.expired());
 }
 
 template <typename Fixture>
@@ -320,14 +394,15 @@ inline void verify_thread_affinity_and_destruction(
     EXPECT_EQ(eavp::StatusCode::kInvalidState, processor_reset_code);
     EXPECT_EQ(eavp::BackendState::kConfigured, processor->state());
 
-    std::shared_ptr<const eavp::VideoFrame> held = fixture.frame(201);
-    std::weak_ptr<const eavp::VideoFrame> held_weak = held;
-    ASSERT_TRUE(processor->submit(held).ok());
-    held.reset();
+    FrameStorageProbe processor_destruction_probe =
+        fixture.frame_storage_probe(201);
+    ASSERT_TRUE(processor->submit(processor_destruction_probe.frame).ok());
+    processor_destruction_probe.frame.reset();
+    EXPECT_FALSE(processor_destruction_probe.storage.expired());
     eavp::VideoProcessor* raw_processor = processor.release();
     std::thread processor_destroyer([raw_processor]() { delete raw_processor; });
     processor_destroyer.join();
-    EXPECT_TRUE(held_weak.expired());
+    EXPECT_TRUE(processor_destruction_probe.storage.expired());
 
     std::unique_ptr<eavp::VideoEncoder> encoder = create_encoder(provider);
     ASSERT_TRUE(encoder.get() != NULL);
@@ -362,14 +437,15 @@ inline void verify_thread_affinity_and_destruction(
     EXPECT_EQ(eavp::StatusCode::kInvalidState, encoder_reset_code);
     EXPECT_EQ(eavp::BackendState::kConfigured, encoder->state());
 
-    held = fixture.frame(301);
-    held_weak = held;
-    ASSERT_TRUE(encoder->submit(held).ok());
-    held.reset();
+    FrameStorageProbe encoder_destruction_probe =
+        fixture.frame_storage_probe(301);
+    ASSERT_TRUE(encoder->submit(encoder_destruction_probe.frame).ok());
+    encoder_destruction_probe.frame.reset();
+    EXPECT_FALSE(encoder_destruction_probe.storage.expired());
     eavp::VideoEncoder* raw_encoder = encoder.release();
     std::thread encoder_destroyer([raw_encoder]() { delete raw_encoder; });
     encoder_destroyer.join();
-    EXPECT_TRUE(held_weak.expired());
+    EXPECT_TRUE(encoder_destruction_probe.storage.expired());
 }
 
 }  // namespace backend_contract_detail

@@ -109,7 +109,7 @@ ProviderCapability make_reference_capability() {
     const std::vector<FormatMemoryDomain> formats = reference_formats();
     const VideoProcessorCapability processor(
         width, height, width, height, formats, formats,
-        std::vector<VideoProcessingOperation>(), true);
+        std::vector<VideoProcessingOperation>(), true, true);
     const VideoEncoderCapability encoder(
         width, height, CodecId::kReference,
         std::vector<CodecProfile>{CodecProfile::kUnknown},

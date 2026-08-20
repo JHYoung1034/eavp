@@ -78,6 +78,29 @@ bool contains_value(const std::vector<T>& values, T value) {
     return false;
 }
 
+bool same_plane_layout(const PlaneLayout& left, const PlaneLayout& right) {
+    return left.offset == right.offset && left.size == right.size &&
+           left.stride == right.stride;
+}
+
+bool same_video_format(const VideoFormat& left, const VideoFormat& right) {
+    if (left.pixel_format() != right.pixel_format() ||
+        left.width() != right.width() || left.height() != right.height() ||
+        left.memory_domain() != right.memory_domain() ||
+        left.color_range() != right.color_range() ||
+        left.color_primaries() != right.color_primaries() ||
+        left.transfer() != right.transfer() || left.matrix() != right.matrix() ||
+        left.planes().size() != right.planes().size()) {
+        return false;
+    }
+    for (std::size_t index = 0U; index < left.planes().size(); ++index) {
+        if (!same_plane_layout(left.planes()[index], right.planes()[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 const char* operation_name(VideoProcessingOperation operation) {
     switch (operation) {
         case VideoProcessingOperation::kScaling:
@@ -391,6 +414,11 @@ Status VideoProcessorCapability::match(
     }
 
     const VideoProcessorConfig& config = request.config();
+    if (requires_identical_formats_ &&
+        !same_video_format(config.input_format, config.output_format)) {
+        return mismatch(
+            "video processor requires identical input and output formats");
+    }
     if (!input_width_.contains(config.input_format.width()) ||
         !input_height_.contains(config.input_format.height())) {
         return mismatch("video processor input dimensions are outside capability");

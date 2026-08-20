@@ -215,7 +215,7 @@ public:
         const std::vector<FormatMemoryDomain>& input_formats,
         const std::vector<FormatMemoryDomain>& output_formats,
         const std::vector<VideoProcessingOperation>& operations,
-        bool zero_copy)
+        bool zero_copy, bool requires_identical_formats = false)
         : input_width_(input_width),
           input_height_(input_height),
           output_width_(output_width),
@@ -223,7 +223,8 @@ public:
           input_formats_(input_formats),
           output_formats_(output_formats),
           operations_(operations),
-          zero_copy_(zero_copy) {}
+          zero_copy_(zero_copy),
+          requires_identical_formats_(requires_identical_formats) {}
 
     Status match(const VideoProcessorRequest& request) const;
     bool supports(const VideoProcessorRequest& request) const {
@@ -249,6 +250,9 @@ public:
         return operations_;
     }
     bool zero_copy() const { return zero_copy_; }
+    bool requires_identical_formats() const {
+        return requires_identical_formats_;
+    }
 
 private:
     DimensionRange input_width_;
@@ -259,6 +263,7 @@ private:
     std::vector<FormatMemoryDomain> output_formats_;
     std::vector<VideoProcessingOperation> operations_;
     bool zero_copy_;
+    bool requires_identical_formats_;
 };
 
 class VideoEncoderCapability {

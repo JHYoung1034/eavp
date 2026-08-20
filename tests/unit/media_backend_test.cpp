@@ -636,6 +636,68 @@ TEST(CapabilityTest, ProcessorLayoutMismatchRejectsZeroCopyOrReportsConversion) 
               result.value().config.input_format.planes()[0].size);
 }
 
+TEST(CapabilityTest,
+     IdentityProcessorRejectsPlaneLayoutAndColorDifferences) {
+    const eavp::VideoFormat input =
+        eavp::VideoFormat::create(
+            eavp::PixelFormat::kRgb24, 2, 2, eavp::MemoryDomain::kCpu,
+            std::vector<eavp::PlaneLayout>{
+                eavp::PlaneLayout(0U, 12U, 6U)})
+            .take_value();
+    const eavp::VideoFormat different_layout =
+        eavp::VideoFormat::create(
+            eavp::PixelFormat::kRgb24, 2, 2, eavp::MemoryDomain::kCpu,
+            std::vector<eavp::PlaneLayout>{
+                eavp::PlaneLayout(4U, 18U, 9U)})
+            .take_value();
+    const eavp::VideoFormat different_color =
+        eavp::VideoFormat::create(
+            eavp::PixelFormat::kRgb24, 2, 2, eavp::MemoryDomain::kCpu,
+            std::vector<eavp::PlaneLayout>{
+                eavp::PlaneLayout(0U, 12U, 6U)},
+            eavp::ColorRange::kFull)
+            .take_value();
+    const eavp::FormatMemoryDomain rgb_cpu(
+        eavp::PixelFormat::kRgb24, eavp::MemoryDomain::kCpu,
+        std::vector<eavp::PlaneLayoutConstraint>{
+            eavp::PlaneLayoutConstraint(1, 1, 3U, 1U, 1U, 1U, 1U)});
+    const eavp::VideoProcessorCapability identity(
+        eavp::DimensionRange(1, 4096, 1, 1),
+        eavp::DimensionRange(1, 4096, 1, 1),
+        eavp::DimensionRange(1, 4096, 1, 1),
+        eavp::DimensionRange(1, 4096, 1, 1),
+        std::vector<eavp::FormatMemoryDomain>{rgb_cpu},
+        std::vector<eavp::FormatMemoryDomain>{rgb_cpu},
+        std::vector<eavp::VideoProcessingOperation>(), true, true);
+    const eavp::SelectionConstraints automatic("");
+    const eavp::SelectionPreferences preferences(
+        std::vector<std::string>(), false, false);
+
+    const eavp::VideoProcessorRequest exact(
+        eavp::VideoProcessorConfig::create(input, input, 0, 0, 2, 2, 0)
+            .take_value(),
+        std::vector<eavp::VideoProcessingOperation>(), 1U, 1U, false,
+        automatic, preferences);
+    const eavp::VideoProcessorRequest layout_mismatch(
+        eavp::VideoProcessorConfig::create(
+            input, different_layout, 0, 0, 2, 2, 0)
+            .take_value(),
+        std::vector<eavp::VideoProcessingOperation>(), 1U, 1U, false,
+        automatic, preferences);
+    const eavp::VideoProcessorRequest color_mismatch(
+        eavp::VideoProcessorConfig::create(
+            input, different_color, 0, 0, 2, 2, 0)
+            .take_value(),
+        std::vector<eavp::VideoProcessingOperation>(), 1U, 1U, false,
+        automatic, preferences);
+
+    EXPECT_TRUE(identity.supports(exact));
+    EXPECT_FALSE(identity.supports(layout_mismatch));
+    EXPECT_FALSE(identity.supports(color_mismatch));
+    EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch,
+              identity.negotiated_config(color_mismatch).status().code());
+}
+
 TEST(CapabilityTest, RotationByNinetyDegreesDoesNotImplyScaling) {
     const eavp::VideoFormat input =
         make_nv12_format(1920, 1080, eavp::MemoryDomain::kDmaBuf);
@@ -1125,6 +1187,28 @@ TEST(ReferenceBackendTest, AdvertisesOnlyTheBehaviorItImplements) {
               capability.encoder_capabilities()[0].codec());
 }
 
+TEST(ReferenceBackendTest,
+     CapabilityAndProcessorRejectTheSameNonIdentityFormat) {
+    const std::shared_ptr<eavp::MediaBackendProvider> provider =
+        eavp::create_reference_backend(eavp::ReferenceBackendOptions());
+    ASSERT_TRUE(provider.get() != NULL);
+    eavp::Result<eavp::ProviderCapability> probe = provider->probe();
+    ASSERT_TRUE(probe.ok());
+
+    const eavp::VideoProcessorConfig config =
+        backend_contract_detail::make_non_identity_reference_processor_config();
+    const eavp::VideoProcessorRequest request(
+        config, std::vector<eavp::VideoProcessingOperation>(), 1U, 1U, false,
+        automatic_selection(), no_preferences());
+    EXPECT_FALSE(probe.value().supports(request));
+
+    eavp::Result<std::unique_ptr<eavp::VideoProcessor> > created =
+        provider->create_video_processor();
+    ASSERT_TRUE(created.ok());
+    EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch,
+              created.value()->configure(config).code());
+}
+
 TEST(ReferenceBackendTest, ProcessorBackpressurePreservesSharedInputAndResetClearsQueue) {
     eavp::ReferenceBackendOptions options;
     options.queue_capacity = 1U;
@@ -1147,7 +1231,6 @@ TEST(ReferenceBackendTest, ProcessorBackpressurePreservesSharedInputAndResetClea
     eavp::Result<std::shared_ptr<const eavp::VideoFrame> > output =
         processor->receive();
     ASSERT_TRUE(output.ok());
-    EXPECT_EQ(first.get(), output.value().get());
 
     eavp::Result<eavp::MappedRegion> input_map =
         first->buffer().map_plane(0U, eavp::MapMode::kReadOnly);
