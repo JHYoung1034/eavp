@@ -912,7 +912,7 @@ ctest --preset linux-release-fetch-deps --output-on-failure
 
 Expected: 所有测试通过，编译器无警告。
 
-- [ ] **Step 7: 运行 ASan/UBSan 验证**
+- [x] **Step 7: 运行 ASan/UBSan 验证**
 
 ```bash
 cmake --preset linux-asan-fetch-deps
@@ -957,6 +957,6 @@ git commit -m "docs: 完成 Media Backend Foundation 0.2 基线"
 - 2026-08-20：先修改 `tests/consumer/main.cpp`，未修改安装规则即执行 `ctest --test-dir build/linux-debug-fetch-deps -R eavp.install_consumer --output-on-failure`，结果 `1/1` 通过。该特征化结果表明既有 `install(DIRECTORY include/eavp/media ...)`、target source 和导出配置已经完整覆盖扩展 consumer；按裁定未人为破坏安装规则制造失败。
 - 2026-08-20：`cmake --preset linux-debug-fetch-deps`、`cmake --build --preset linux-debug-fetch-deps` 和 `ctest --preset linux-debug-fetch-deps --output-on-failure` 均退出 0，CTest 为 `95/95` 通过，包含安装消费。
 - 2026-08-20：`cmake --preset linux-release-fetch-deps`、`cmake --build --preset linux-release-fetch-deps` 和 `ctest --preset linux-release-fetch-deps --output-on-failure` 均退出 0，CTest 为 `95/95` 通过，编译启用 `EAVP_WARNINGS_AS_ERRORS=ON`。
-- 2026-08-20：`cmake --preset linux-asan-fetch-deps` 与 `cmake --build --preset linux-asan-fetch-deps` 退出 0；`ctest --preset linux-asan-fetch-deps --output-on-failure` 为 `93/95` 通过、2 个失败。AddressSanitizer 在 `ReferenceMediaPlatformTest.ProcessesOneHundredFramesAndPublishesSelection` 和 `ReferenceMediaPlatformTest.DeviceLossPublishesStructuredErrorAndExplicitResetRebuildsPipeline` 报告析构期 heap-use-after-free，因此 Step 7 未勾选。
+- 2026-08-20：生命周期回归 RED 为 `ctest --test-dir build/linux-asan-fetch-deps -R 'ReferenceMediaPlatformTest.(ProcessesOneHundredFramesAndPublishesSelection|DeviceLossPublishesStructuredErrorAndExplicitResetRebuildsPipeline)' --output-on-failure`，结果 `0/2`，AddressSanitizer 报告析构期 heap-use-after-free。通过调整 ReferenceMediaPlatform 和 SimulatedPlatform 成员声明顺序，使 pipeline/reconciler 在其借用的服务之前析构；同一聚焦命令转为 `2/2`。随后 `ctest --preset linux-asan-fetch-deps --output-on-failure` 为 `95/95`，无 sanitizer 报告，Step 7 已勾选。
 - 2026-08-20：`command -v aarch64-linux-gnu-gcc` 和 `command -v aarch64-linux-gnu-g++` 均无输出。toolchain 文件明确要求这两个名称；`cmake --preset aarch64-release` 退出 1，CMake 报告两个编译器不在 PATH，未执行 build（记录为退出 125）。未下载依赖、未运行交叉测试，Step 8 保持未勾选。
 - 2026-08-20：`git diff --check` 退出 0。原始占位符命令仅命中 `docs/standards/project-conventions.md` 中解释“不得留下未解释的 `TODO` 或 `TBD`”的规范文字，故按语义排除该解释性术语和计划目录后重新检查，退出 0；未删除有意义规范。

@@ -46,12 +46,15 @@ private:
     StateStore desired_;
     StateStore actual_;
     PipelineCommandHandler command_handler_;
-    std::unique_ptr<MediaPipeline> pipeline_;
-    std::unique_ptr<PipelineReconciler> reconciler_;
+
+    // Pipeline 节点借用以下服务；成员逆序析构时必须先销毁 pipeline/reconciler。
     MetricRegistry metrics_;
     HealthManager health_;
     DeterministicExecutor executor_;
     std::size_t source_budget_;
+
+    std::unique_ptr<MediaPipeline> pipeline_;
+    std::unique_ptr<PipelineReconciler> reconciler_;
     bool initialized_;
 };
 

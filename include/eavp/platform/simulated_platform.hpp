@@ -31,11 +31,14 @@ private:
     StateStore desired_;
     StateStore actual_;
     PipelineCommandHandler command_handler_;
-    MediaPipeline pipeline_;
-    PipelineReconciler reconciler_;
+
+    // Pipeline 节点借用以下服务；成员逆序析构时必须先销毁 pipeline/reconciler。
     MetricRegistry metrics_;
     HealthManager health_;
     DeterministicExecutor executor_;
+
+    MediaPipeline pipeline_;
+    PipelineReconciler reconciler_;
     bool initialized_;
 };
 
