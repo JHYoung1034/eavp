@@ -21,17 +21,25 @@ public:
     BoundedQueue(std::size_t capacity, OverflowPolicy policy)
         : capacity_(capacity), policy_(policy), dropped_count_(0U) {}
 
-    Status push(const std::shared_ptr<const T>& value) {
+    Status preflight_push(const std::shared_ptr<const T>& value) const {
         if (!value) {
             return Status(StatusCode::kInvalidArgument, "queue value must not be null");
         }
         if (capacity_ == 0U) {
             return Status(StatusCode::kInvalidState, "queue capacity must be positive");
         }
+        if (values_.size() == capacity_ && policy_ == OverflowPolicy::kBlock) {
+            return Status(StatusCode::kWouldBlock, "queue is full");
+        }
+        return Status::ok_status();
+    }
+
+    Status push(const std::shared_ptr<const T>& value) {
+        const Status preflight = preflight_push(value);
+        if (!preflight.ok()) {
+            return preflight;
+        }
         if (values_.size() == capacity_) {
-            if (policy_ == OverflowPolicy::kBlock) {
-                return Status(StatusCode::kWouldBlock, "queue is full");
-            }
             if (policy_ == OverflowPolicy::kDropNewest) {
                 ++dropped_count_;
                 return Status::ok_status();
@@ -67,4 +75,3 @@ private:
 }  // namespace eavp
 
 #endif  // EAVP_MEDIA_QUEUE_HPP_
-

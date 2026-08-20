@@ -37,6 +37,7 @@ private:
     std::vector<MediaNode*> ordered_nodes(const std::vector<std::string>& order) const;
     void stop_nodes_reverse(const std::vector<MediaNode*>& nodes);
     Status reset_nodes_reverse(const std::vector<MediaNode*>& nodes);
+    Status tick_running_downstream(std::size_t current_index);
 
     std::string id_;
     PipelineState state_;

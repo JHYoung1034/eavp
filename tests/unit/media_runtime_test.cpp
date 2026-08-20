@@ -78,6 +78,36 @@ TEST(PortTest, ConnectedPortsTransferTheSameImmutablePacket) {
     EXPECT_EQ(packet.get(), received.value().get());
 }
 
+TEST(PortTest, FanOutDoesNotPartiallyPushWhenALaterBlockQueueIsFull) {
+    eavp::OutputPort<eavp::MediaPacket> output("encoded");
+    eavp::InputPort<eavp::MediaPacket> first(
+        "first", 2U, eavp::OverflowPolicy::kBlock);
+    eavp::InputPort<eavp::MediaPacket> second(
+        "second", 1U, eavp::OverflowPolicy::kBlock);
+    ASSERT_TRUE(eavp::connect(output, first).ok());
+    ASSERT_TRUE(eavp::connect(output, second).ok());
+    ASSERT_TRUE(output.send(make_packet(0)).ok());
+    ASSERT_TRUE(first.receive().ok());
+
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock,
+              output.send(make_packet(1)).code());
+    EXPECT_EQ(0U, first.queue_size());
+    EXPECT_EQ(1U, second.queue_size());
+    ASSERT_TRUE(second.receive().ok());
+
+    ASSERT_TRUE(output.send(make_packet(1)).ok());
+    eavp::Result<std::shared_ptr<const eavp::MediaPacket> > first_packet =
+        first.receive();
+    eavp::Result<std::shared_ptr<const eavp::MediaPacket> > second_packet =
+        second.receive();
+    ASSERT_TRUE(first_packet.ok());
+    ASSERT_TRUE(second_packet.ok());
+    EXPECT_EQ(1, first_packet.value()->pts());
+    EXPECT_EQ(1, second_packet.value()->pts());
+    EXPECT_EQ(eavp::StatusCode::kNotFound, first.receive().status().code());
+    EXPECT_EQ(eavp::StatusCode::kNotFound, second.receive().status().code());
+}
+
 TEST(GraphTest, RejectsAnEdgeThatWouldCreateACycle) {
     eavp::MediaGraph graph;
     ASSERT_TRUE(graph.add_node("source").ok());
@@ -203,6 +233,225 @@ private:
     int reset_calls_;
     std::vector<std::string>* events_;
 };
+
+class BackpressuredDrainSource : public eavp::MediaNode {
+public:
+    BackpressuredDrainSource()
+        : eavp::MediaNode("source"), output_("packet_output") {
+        backlog_.push_back(make_packet(1));
+        backlog_.push_back(make_packet(2));
+    }
+
+    eavp::OutputPort<eavp::MediaPacket>& output() { return output_; }
+
+protected:
+    eavp::Status on_stop() override {
+        if (backlog_.empty()) {
+            return eavp::Status(eavp::StatusCode::kEndOfStream);
+        }
+        const eavp::Status status = output_.send(backlog_.front());
+        if (status.ok()) {
+            backlog_.erase(backlog_.begin());
+            return eavp::Status(eavp::StatusCode::kWouldBlock);
+        }
+        return status;
+    }
+
+private:
+    eavp::OutputPort<eavp::MediaPacket> output_;
+    std::vector<std::shared_ptr<const eavp::MediaPacket> > backlog_;
+};
+
+class BackpressuredDrainForward : public eavp::MediaNode {
+public:
+    BackpressuredDrainForward()
+        : eavp::MediaNode("forward"),
+          input_("packet_input", 1U, eavp::OverflowPolicy::kBlock),
+          output_("packet_output") {}
+
+    eavp::InputPort<eavp::MediaPacket>& input() { return input_; }
+    eavp::OutputPort<eavp::MediaPacket>& output() { return output_; }
+
+protected:
+    eavp::Status transfer_one() {
+        if (pending_) {
+            const eavp::Status status = output_.send(pending_);
+            if (!status.ok()) {
+                return status;
+            }
+            pending_.reset();
+        }
+        eavp::Result<std::shared_ptr<const eavp::MediaPacket> > packet =
+            input_.receive();
+        if (!packet.ok()) {
+            return packet.status().code() == eavp::StatusCode::kNotFound
+                       ? eavp::Status::ok_status()
+                       : packet.status();
+        }
+        pending_ = packet.take_value();
+        const eavp::Status status = output_.send(pending_);
+        if (status.ok()) {
+            pending_.reset();
+        }
+        return status;
+    }
+
+    eavp::Status on_tick() override { return transfer_one(); }
+
+    eavp::Status on_stop() override {
+        const bool had_work = pending_ || input_.queue_size() != 0U;
+        const eavp::Status status = transfer_one();
+        if (!status.ok()) {
+            return status;
+        }
+        return had_work ? eavp::Status(eavp::StatusCode::kWouldBlock)
+                        : eavp::Status(eavp::StatusCode::kEndOfStream);
+    }
+
+private:
+    eavp::InputPort<eavp::MediaPacket> input_;
+    eavp::OutputPort<eavp::MediaPacket> output_;
+    std::shared_ptr<const eavp::MediaPacket> pending_;
+};
+
+class BackpressuredDrainSink : public eavp::MediaNode {
+public:
+    BackpressuredDrainSink()
+        : eavp::MediaNode("sink"),
+          input_("packet_input", 1U, eavp::OverflowPolicy::kBlock) {}
+
+    eavp::InputPort<eavp::MediaPacket>& input() { return input_; }
+    const std::vector<std::int64_t>& received_pts() const {
+        return received_pts_;
+    }
+
+protected:
+    eavp::Status consume_one() {
+        eavp::Result<std::shared_ptr<const eavp::MediaPacket> > packet =
+            input_.receive();
+        if (!packet.ok()) {
+            return packet.status().code() == eavp::StatusCode::kNotFound
+                       ? eavp::Status::ok_status()
+                       : packet.status();
+        }
+        received_pts_.push_back(packet.value()->pts());
+        return eavp::Status::ok_status();
+    }
+
+    eavp::Status on_tick() override { return consume_one(); }
+
+    eavp::Status on_stop() override {
+        if (input_.queue_size() == 0U) {
+            return eavp::Status(eavp::StatusCode::kEndOfStream);
+        }
+        const eavp::Status status = consume_one();
+        return status.ok() ? eavp::Status(eavp::StatusCode::kWouldBlock)
+                           : status;
+    }
+
+private:
+    eavp::InputPort<eavp::MediaPacket> input_;
+    std::vector<std::int64_t> received_pts_;
+};
+
+class AsyncRollbackNode : public eavp::MediaNode {
+public:
+    AsyncRollbackNode(const std::string& id, bool fail_start,
+                      std::vector<std::string>* events)
+        : eavp::MediaNode(id), fail_start_(fail_start), events_(events),
+          resets_(0) {}
+
+    int resets() const { return resets_; }
+
+protected:
+    eavp::Status on_prepare() override {
+        events_->push_back(id() + ":prepare");
+        return eavp::Status::ok_status();
+    }
+
+    eavp::Status on_start() override {
+        events_->push_back(id() + (fail_start_ ? ":start_fail" : ":start"));
+        return fail_start_
+                   ? eavp::Status(eavp::StatusCode::kInternal,
+                                  "original start failure")
+                   : eavp::Status::ok_status();
+    }
+
+    eavp::Status on_stop() override {
+        events_->push_back(id() + ":stop_blocked");
+        return eavp::Status(eavp::StatusCode::kWouldBlock);
+    }
+
+    eavp::Status on_reset() override {
+        ++resets_;
+        events_->push_back(id() + ":reset");
+        return eavp::Status::ok_status();
+    }
+
+private:
+    bool fail_start_;
+    std::vector<std::string>* events_;
+    int resets_;
+};
+
+TEST(PipelineTest, DrainTicksRunningDownstreamThroughTwoBoundedQueues) {
+    eavp::MediaPipeline pipeline("drain-ports");
+    BackpressuredDrainSource* source = new BackpressuredDrainSource();
+    BackpressuredDrainForward* forward = new BackpressuredDrainForward();
+    BackpressuredDrainSink* sink = new BackpressuredDrainSink();
+    ASSERT_TRUE(eavp::connect(source->output(), forward->input()).ok());
+    ASSERT_TRUE(eavp::connect(forward->output(), sink->input()).ok());
+    ASSERT_TRUE(source->output().send(make_packet(0)).ok());
+    ASSERT_TRUE(forward->output().send(make_packet(-1)).ok());
+    ASSERT_TRUE(pipeline.add_node(
+        std::unique_ptr<eavp::MediaNode>(source)).ok());
+    ASSERT_TRUE(pipeline.add_node(
+        std::unique_ptr<eavp::MediaNode>(forward)).ok());
+    ASSERT_TRUE(pipeline.add_node(
+        std::unique_ptr<eavp::MediaNode>(sink)).ok());
+    ASSERT_TRUE(pipeline.connect("source", "forward").ok());
+    ASSERT_TRUE(pipeline.connect("forward", "sink").ok());
+    ASSERT_TRUE(pipeline.start().ok());
+
+    eavp::Status status(eavp::StatusCode::kWouldBlock);
+    for (std::size_t turn = 0U;
+         turn < 16U && status.code() == eavp::StatusCode::kWouldBlock;
+         ++turn) {
+        status = pipeline.stop();
+    }
+
+    ASSERT_TRUE(status.ok());
+    EXPECT_EQ(eavp::PipelineState::kStopped, pipeline.state());
+    const std::vector<std::int64_t> expected{-1, 0, 1, 2};
+    EXPECT_EQ(expected, sink->received_pts());
+}
+
+TEST(PipelineTest, StartFailureResetsNodesWhoseRollbackStopWouldBlock) {
+    std::vector<std::string> events;
+    eavp::MediaPipeline pipeline("rollback");
+    AsyncRollbackNode* source =
+        new AsyncRollbackNode("source", false, &events);
+    AsyncRollbackNode* sink =
+        new AsyncRollbackNode("sink", true, &events);
+    ASSERT_TRUE(pipeline.add_node(
+        std::unique_ptr<eavp::MediaNode>(source)).ok());
+    ASSERT_TRUE(pipeline.add_node(
+        std::unique_ptr<eavp::MediaNode>(sink)).ok());
+    ASSERT_TRUE(pipeline.connect("source", "sink").ok());
+
+    const eavp::Status status = pipeline.start();
+
+    EXPECT_EQ(eavp::StatusCode::kInternal, status.code());
+    EXPECT_EQ("original start failure", status.message());
+    const std::vector<std::string> expected{
+        "source:prepare", "sink:prepare", "source:start", "sink:start_fail",
+        "sink:stop_blocked", "sink:reset", "source:stop_blocked",
+        "source:reset"};
+    EXPECT_EQ(expected, events);
+    EXPECT_EQ(1, source->resets());
+    EXPECT_EQ(1, sink->resets());
+    EXPECT_EQ(eavp::PipelineState::kError, pipeline.state());
+}
 
 TEST(PipelineTest, StopsSubmissionThenContinuesTopologicalDrainAcrossCalls) {
     std::vector<std::string> events;

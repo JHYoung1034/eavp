@@ -114,40 +114,62 @@ Status VideoProcessorNode::on_stop() {
             return status;
         }
 
-        Result<std::shared_ptr<const VideoFrame> > output = processor_->receive();
-        if (output.ok()) {
-            pending_output_ = output.take_value();
-            status = send_pending_output();
-            return status.ok() ? Status(StatusCode::kWouldBlock) : status;
-        }
-        if (!is_temporarily_empty(output.status()) &&
-            output.status().code() != StatusCode::kEndOfStream) {
-            return output.status();
-        }
-        if (output.status().code() == StatusCode::kEndOfStream) {
-            return output.status();
-        }
-
         if (!drain_started_) {
             if (pending_input_) {
                 status = processor_->submit(pending_input_);
-                if (!status.ok()) {
+                if (status.ok()) {
+                    pending_input_.reset();
+                    return Status(StatusCode::kWouldBlock);
+                }
+                if (status.code() != StatusCode::kWouldBlock) {
                     return status;
                 }
-                pending_input_.reset();
-                return Status(StatusCode::kWouldBlock);
+
+                Result<std::shared_ptr<const VideoFrame> > output =
+                    processor_->receive();
+                if (output.ok()) {
+                    pending_output_ = output.take_value();
+                    status = send_pending_output();
+                    return status.ok() ? Status(StatusCode::kWouldBlock)
+                                       : status;
+                }
+                if (output.status().code() == StatusCode::kEndOfStream) {
+                    return Status(
+                        StatusCode::kInvalidState,
+                        "video processor reached EOS with pending input");
+                }
+                return is_temporarily_empty(output.status())
+                           ? Status(StatusCode::kWouldBlock)
+                           : output.status();
             }
             Result<std::shared_ptr<const VideoFrame> > input = input_.receive();
             if (input.ok()) {
-                status = processor_->submit(input.value());
-                if (status.code() == StatusCode::kWouldBlock) {
-                    pending_input_ = input.take_value();
+                pending_input_ = input.take_value();
+                status = processor_->submit(pending_input_);
+                if (status.ok()) {
+                    pending_input_.reset();
+                    return Status(StatusCode::kWouldBlock);
                 }
-                return status.ok() ? Status(StatusCode::kWouldBlock) : status;
+                return status;
             }
             if (input.status().code() != StatusCode::kNotFound) {
                 return input.status();
             }
+
+            Result<std::shared_ptr<const VideoFrame> > output =
+                processor_->receive();
+            if (output.ok()) {
+                pending_output_ = output.take_value();
+                status = send_pending_output();
+                return status.ok() ? Status(StatusCode::kWouldBlock) : status;
+            }
+            if (output.status().code() == StatusCode::kEndOfStream) {
+                return output.status();
+            }
+            if (!is_temporarily_empty(output.status())) {
+                return output.status();
+            }
+
             status = processor_->begin_drain();
             if (!status.ok()) {
                 return status;
@@ -155,7 +177,8 @@ Status VideoProcessorNode::on_stop() {
             drain_started_ = true;
         }
 
-        output = processor_->receive();
+        Result<std::shared_ptr<const VideoFrame> > output =
+            processor_->receive();
         if (!output.ok()) {
             return output.status();
         }
@@ -278,40 +301,61 @@ Status VideoEncoderNode::on_stop() {
             return status;
         }
 
-        Result<std::shared_ptr<const MediaPacket> > output = encoder_->receive();
-        if (output.ok()) {
-            pending_output_ = output.take_value();
-            status = send_pending_output();
-            return status.ok() ? Status(StatusCode::kWouldBlock) : status;
-        }
-        if (!is_temporarily_empty(output.status()) &&
-            output.status().code() != StatusCode::kEndOfStream) {
-            return output.status();
-        }
-        if (output.status().code() == StatusCode::kEndOfStream) {
-            return output.status();
-        }
-
         if (!drain_started_) {
             if (pending_input_) {
                 status = encoder_->submit(pending_input_);
-                if (!status.ok()) {
+                if (status.ok()) {
+                    pending_input_.reset();
+                    return Status(StatusCode::kWouldBlock);
+                }
+                if (status.code() != StatusCode::kWouldBlock) {
                     return status;
                 }
-                pending_input_.reset();
-                return Status(StatusCode::kWouldBlock);
+
+                Result<std::shared_ptr<const MediaPacket> > output =
+                    encoder_->receive();
+                if (output.ok()) {
+                    pending_output_ = output.take_value();
+                    status = send_pending_output();
+                    return status.ok() ? Status(StatusCode::kWouldBlock)
+                                       : status;
+                }
+                if (output.status().code() == StatusCode::kEndOfStream) {
+                    return Status(StatusCode::kInvalidState,
+                                  "video encoder reached EOS with pending input");
+                }
+                return is_temporarily_empty(output.status())
+                           ? Status(StatusCode::kWouldBlock)
+                           : output.status();
             }
             Result<std::shared_ptr<const VideoFrame> > input = input_.receive();
             if (input.ok()) {
-                status = encoder_->submit(input.value());
-                if (status.code() == StatusCode::kWouldBlock) {
-                    pending_input_ = input.take_value();
+                pending_input_ = input.take_value();
+                status = encoder_->submit(pending_input_);
+                if (status.ok()) {
+                    pending_input_.reset();
+                    return Status(StatusCode::kWouldBlock);
                 }
-                return status.ok() ? Status(StatusCode::kWouldBlock) : status;
+                return status;
             }
             if (input.status().code() != StatusCode::kNotFound) {
                 return input.status();
             }
+
+            Result<std::shared_ptr<const MediaPacket> > output =
+                encoder_->receive();
+            if (output.ok()) {
+                pending_output_ = output.take_value();
+                status = send_pending_output();
+                return status.ok() ? Status(StatusCode::kWouldBlock) : status;
+            }
+            if (output.status().code() == StatusCode::kEndOfStream) {
+                return output.status();
+            }
+            if (!is_temporarily_empty(output.status())) {
+                return output.status();
+            }
+
             status = encoder_->begin_drain();
             if (!status.ok()) {
                 return status;
@@ -319,7 +363,8 @@ Status VideoEncoderNode::on_stop() {
             drain_started_ = true;
         }
 
-        output = encoder_->receive();
+        Result<std::shared_ptr<const MediaPacket> > output =
+            encoder_->receive();
         if (!output.ok()) {
             return output.status();
         }

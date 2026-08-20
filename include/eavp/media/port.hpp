@@ -30,6 +30,14 @@ public:
         for (typename std::vector<std::shared_ptr<BoundedQueue<T> > >::iterator it =
                  connections_.begin();
              it != connections_.end(); ++it) {
+            const Status status = (*it)->preflight_push(value);
+            if (!status.ok()) {
+                return status;
+            }
+        }
+        for (typename std::vector<std::shared_ptr<BoundedQueue<T> > >::iterator it =
+                 connections_.begin();
+             it != connections_.end(); ++it) {
             const Status status = (*it)->push(value);
             if (!status.ok()) {
                 return status;

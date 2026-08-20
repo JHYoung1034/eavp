@@ -53,6 +53,7 @@ void MediaPipeline::stop_nodes_reverse(const std::vector<MediaNode*>& nodes) {
     for (std::vector<MediaNode*>::const_reverse_iterator it = nodes.rbegin(); it != nodes.rend();
          ++it) {
         (*it)->stop();
+        (*it)->reset();
     }
 }
 
@@ -66,6 +67,22 @@ Status MediaPipeline::reset_nodes_reverse(const std::vector<MediaNode*>& nodes) 
         }
     }
     return first_failure;
+}
+
+Status MediaPipeline::tick_running_downstream(std::size_t current_index) {
+    for (std::size_t index = current_index + 1U;
+         index < drain_order_.size(); ++index) {
+        if (drain_order_[index]->state() != NodeState::kRunning) {
+            continue;
+        }
+        const Status status = drain_order_[index]->tick();
+        if (!status.ok() && status.code() != StatusCode::kWouldBlock &&
+            status.code() != StatusCode::kNotFound &&
+            status.code() != StatusCode::kEndOfStream) {
+            return status;
+        }
+    }
+    return Status::ok_status();
 }
 
 Status MediaPipeline::start() {
@@ -145,6 +162,13 @@ Status MediaPipeline::stop() {
         const Status status = drain_order_[drain_index_]->stop();
         if (status.code() == StatusCode::kWouldBlock ||
             status.code() == StatusCode::kNotFound) {
+            const Status downstream_status =
+                tick_running_downstream(drain_index_);
+            if (!downstream_status.ok()) {
+                reset_nodes_reverse(drain_order_);
+                state_ = PipelineState::kError;
+                return downstream_status;
+            }
             return Status(StatusCode::kWouldBlock,
                           "pipeline drain requires another executor turn");
         }

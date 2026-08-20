@@ -246,6 +246,27 @@ private:
     eavp::BackendState state_;
 };
 
+class EndOfStreamTestProcessor : public TestProcessor {
+public:
+    explicit EndOfStreamTestProcessor(int* submissions)
+        : submissions_(submissions) {}
+
+    eavp::Status submit(
+        const std::shared_ptr<const eavp::VideoFrame>&) override {
+        ++(*submissions_);
+        return eavp::Status::ok_status();
+    }
+
+    eavp::Result<std::shared_ptr<const eavp::VideoFrame> > receive() override {
+        return eavp::Result<std::shared_ptr<const eavp::VideoFrame> >(
+            eavp::Status(eavp::StatusCode::kEndOfStream,
+                         "test stream ended"));
+    }
+
+private:
+    int* submissions_;
+};
+
 class TestEncoder : public eavp::VideoEncoder {
 public:
     explicit TestEncoder(bool* destroyed = NULL)
@@ -314,10 +335,13 @@ private:
 
 class EndOfStreamTestEncoder : public TestEncoder {
 public:
+    explicit EndOfStreamTestEncoder(int* submissions)
+        : submissions_(submissions) {}
+
     eavp::Status submit(
         const std::shared_ptr<const eavp::VideoFrame>&) override {
-        return eavp::Status(eavp::StatusCode::kInvalidState,
-                            "submit must not follow end of stream");
+        ++(*submissions_);
+        return eavp::Status::ok_status();
     }
 
     eavp::Result<std::shared_ptr<const eavp::MediaPacket> > receive() override {
@@ -325,6 +349,9 @@ public:
             eavp::Status(eavp::StatusCode::kEndOfStream,
                          "test stream ended"));
     }
+
+private:
+    int* submissions_;
 };
 
 class TestBackendProvider : public eavp::MediaBackendProvider {
@@ -1401,8 +1428,9 @@ TEST(BackendNodeTest, EncoderRetainsBlockedOutputWithoutLossOrDuplication) {
 }
 
 TEST(BackendNodeTest, EndOfStreamDoesNotSubmitMoreInputOrEnterError) {
+    int submissions = 0;
     std::unique_ptr<eavp::VideoEncoder> encoder(
-        new EndOfStreamTestEncoder());
+        new EndOfStreamTestEncoder(&submissions));
     eavp::VideoEncoderNode node(
         "encoder", std::move(encoder),
         backend_contract_detail::make_reference_format(),
@@ -1418,6 +1446,36 @@ TEST(BackendNodeTest, EndOfStreamDoesNotSubmitMoreInputOrEnterError) {
 
     EXPECT_EQ(eavp::StatusCode::kEndOfStream, node.tick().code());
     EXPECT_EQ(eavp::NodeState::kRunning, node.state());
+    EXPECT_EQ(0, submissions);
+
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock, node.stop().code());
+    EXPECT_EQ(eavp::NodeState::kDraining, node.state());
+    EXPECT_EQ(1, submissions);
+    ASSERT_TRUE(node.stop().ok());
+    EXPECT_EQ(eavp::NodeState::kStopped, node.state());
+}
+
+TEST(BackendNodeTest, ProcessorAlsoSubmitsQueuedInputBeforeAcceptingEndOfStream) {
+    int submissions = 0;
+    std::unique_ptr<eavp::VideoProcessor> processor(
+        new EndOfStreamTestProcessor(&submissions));
+    eavp::VideoProcessorNode node(
+        "processor", std::move(processor),
+        backend_contract_detail::make_reference_processor_config(), 1U);
+    eavp::OutputPort<eavp::VideoFrame> source("source");
+    eavp::InputPort<eavp::VideoFrame> sink(
+        "sink", 1U, eavp::OverflowPolicy::kBlock);
+    ASSERT_TRUE(eavp::connect(source, node.input()).ok());
+    ASSERT_TRUE(eavp::connect(node.output(), sink).ok());
+    ASSERT_TRUE(node.prepare().ok());
+    ASSERT_TRUE(node.start().ok());
+    ASSERT_TRUE(source.send(make_reference_frame(0)).ok());
+    EXPECT_EQ(eavp::StatusCode::kEndOfStream, node.tick().code());
+
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock, node.stop().code());
+    EXPECT_EQ(1, submissions);
+    ASSERT_TRUE(node.stop().ok());
+    EXPECT_EQ(eavp::NodeState::kStopped, node.state());
 }
 
 }  // namespace
