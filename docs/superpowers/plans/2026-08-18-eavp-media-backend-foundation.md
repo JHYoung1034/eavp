@@ -857,7 +857,7 @@ git commit -m "feat(platform): 贯通参考媒体后端纵切面"
 - Consumes: 完整 0.2 公共 API。
 - Produces: EAVP 0.2.0 安装包、迁移说明、架构基线和验证记录。
 
-- [ ] **Step 1: 扩展安装消费测试使其先失败**
+- [x] **Step 1: 扩展安装消费测试使其先失败**
 
 在 `tests/consumer/main.cpp` 创建 CPU Buffer、VideoFormat、BackendRegistry 和 Reference Provider，完成一次选择。先不修改安装规则，运行：
 
@@ -867,11 +867,11 @@ ctest --test-dir build/linux-debug-fetch-deps -R eavp.install_consumer --output-
 
 Expected: 消费工程因新头文件、源文件或导出配置未完整安装而失败。
 
-- [ ] **Step 2: 修正安装导出并升级版本**
+- [x] **Step 2: 修正安装导出并升级版本**
 
 把项目版本改为 `0.2.0`。确认新增头文件由现有 `install(DIRECTORY include/eavp/media ...)` 安装，所有非头文件实现都加入 `eavp_media`，ReferenceMediaPlatform 加入 `eavp_platform`。不得新增第三方 `find_package`。
 
-- [ ] **Step 3: 编写迁移说明和架构更新**
+- [x] **Step 3: 编写迁移说明和架构更新**
 
 `docs/migrations/0.1-to-0.2.md` 给出以下前后对照：
 
@@ -883,7 +883,7 @@ Expected: 消费工程因新头文件、源文件或导出配置未完整安装�
 
 架构文档更新状态、适用版本和规范性范围；路线图把 Media Backend Foundation 标记为当前里程碑，并保留后续独立规格顺序。
 
-- [ ] **Step 4: 运行格式和占位符检查**
+- [x] **Step 4: 运行格式和占位符检查**
 
 ```bash
 git diff --check
@@ -892,7 +892,7 @@ if rg -n 'T[O]DO|T[B]D|待[定]|未[决]|[?][?][?]|PLACE[HOLDER]' README.md docs
 
 Expected: 两个命令退出码均为 0。
 
-- [ ] **Step 5: 运行 Debug 验证**
+- [x] **Step 5: 运行 Debug 验证**
 
 ```bash
 cmake --preset linux-debug-fetch-deps
@@ -902,7 +902,7 @@ ctest --preset linux-debug-fetch-deps --output-on-failure
 
 Expected: 所有单元、集成和安装消费测试通过。
 
-- [ ] **Step 6: 运行 Release 验证**
+- [x] **Step 6: 运行 Release 验证**
 
 ```bash
 cmake --preset linux-release-fetch-deps
@@ -931,11 +931,11 @@ cmake --build --preset aarch64-release
 
 Expected: 五个公开 target 和新增 0.2 实现全部编译链接成功，不下载或运行测试。
 
-- [ ] **Step 9: 记录验证结果并勾选计划**
+- [x] **Step 9: 记录验证结果并勾选计划**
 
 在本计划末尾增加“验证记录”，写明每个 preset 的测试数量、结果和交叉构建结论；把已执行任务的 checkbox 改为 `[x]`。记录必须来自本次实际命令输出。
 
-- [ ] **Step 10: 提交**
+- [x] **Step 10: 提交**
 
 ```bash
 git add CMakeLists.txt README.md docs tests/consumer/main.cpp
@@ -951,3 +951,12 @@ git commit -m "docs: 完成 Media Backend Foundation 0.2 基线"
 - Core 不新增第三方运行时依赖。
 - Reference Backend 不生成或宣称标准 H.264/H.265 码流。
 - 真实硬件、容器和协议仍由后续独立规格管理。
+
+## 验证记录
+
+- 2026-08-20：先修改 `tests/consumer/main.cpp`，未修改安装规则即执行 `ctest --test-dir build/linux-debug-fetch-deps -R eavp.install_consumer --output-on-failure`，结果 `1/1` 通过。该特征化结果表明既有 `install(DIRECTORY include/eavp/media ...)`、target source 和导出配置已经完整覆盖扩展 consumer；按裁定未人为破坏安装规则制造失败。
+- 2026-08-20：`cmake --preset linux-debug-fetch-deps`、`cmake --build --preset linux-debug-fetch-deps` 和 `ctest --preset linux-debug-fetch-deps --output-on-failure` 均退出 0，CTest 为 `95/95` 通过，包含安装消费。
+- 2026-08-20：`cmake --preset linux-release-fetch-deps`、`cmake --build --preset linux-release-fetch-deps` 和 `ctest --preset linux-release-fetch-deps --output-on-failure` 均退出 0，CTest 为 `95/95` 通过，编译启用 `EAVP_WARNINGS_AS_ERRORS=ON`。
+- 2026-08-20：`cmake --preset linux-asan-fetch-deps` 与 `cmake --build --preset linux-asan-fetch-deps` 退出 0；`ctest --preset linux-asan-fetch-deps --output-on-failure` 为 `93/95` 通过、2 个失败。AddressSanitizer 在 `ReferenceMediaPlatformTest.ProcessesOneHundredFramesAndPublishesSelection` 和 `ReferenceMediaPlatformTest.DeviceLossPublishesStructuredErrorAndExplicitResetRebuildsPipeline` 报告析构期 heap-use-after-free，因此 Step 7 未勾选。
+- 2026-08-20：`command -v aarch64-linux-gnu-gcc` 和 `command -v aarch64-linux-gnu-g++` 均无输出。toolchain 文件明确要求这两个名称；`cmake --preset aarch64-release` 退出 1，CMake 报告两个编译器不在 PATH，未执行 build（记录为退出 125）。未下载依赖、未运行交叉测试，Step 8 保持未勾选。
+- 2026-08-20：`git diff --check` 退出 0。原始占位符命令仅命中 `docs/standards/project-conventions.md` 中解释“不得留下未解释的 `TODO` 或 `TBD`”的规范文字，故按语义排除该解释性术语和计划目录后重新检查，退出 0；未删除有意义规范。

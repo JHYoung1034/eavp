@@ -1,7 +1,7 @@
 # 构建、安装与移植
 
-> 状态：已接受  
-> 适用版本：EAVP Core 0.1  
+> 状态：已接受\
+> 适用版本：EAVP 0.2.0\
 > 规范性范围：支持的构建入口与工具链
 
 最低要求为 CMake 3.21、Ninja 1.10 和支持 C++11 的编译器。仓库级 `CMakePresets.json` 可提交，开发者私有的 `CMakeUserPresets.json` 不得提交。
@@ -35,6 +35,6 @@ Debug、Release 和 Sanitizer 默认预设不联网。构建机没有系统 Goog
 安装后消费方使用：
 
 ```cmake
-find_package(EAVP 0.1 CONFIG REQUIRED)
+find_package(EAVP 0.2 CONFIG REQUIRED)
 target_link_libraries(product PRIVATE EAVP::platform)
 ```
