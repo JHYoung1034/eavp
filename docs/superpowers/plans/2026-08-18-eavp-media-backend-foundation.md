@@ -922,7 +922,7 @@ ctest --preset linux-asan-fetch-deps --output-on-failure
 
 Expected: 所有测试通过，无 sanitizer 报告、文件描述符或映射生命周期错误。
 
-- [ ] **Step 8: 运行三套 ARM 交叉构建**
+- [x] **Step 8: 运行三套 ARM 交叉构建**
 
 ```bash
 cmake --preset rockchip-armhf-release
@@ -966,3 +966,4 @@ git commit -m "docs: 完成 Media Backend Foundation 0.2 基线"
 - 2026-08-20：`git diff --check` 退出 0。原始占位符命令仅命中 `docs/standards/project-conventions.md` 中解释“不得留下未解释的 `TODO` 或 `TBD`”的规范文字，故按语义排除该解释性术语和计划目录后重新检查，退出 0；未删除有意义规范。
 - 2026-08-21：先执行 `cmake --preset rockchip-armhf-release` 与 `cmake --preset hisiv600-release`，两者均以“`No such preset`”退出 1，确认两个 ARM32 验证入口在实现前缺失。新增预设及 toolchain 后，Rockchip 的 `arm-linux-gnueabihf-gcc/g++` 为 8.3.0，海思 v600 的 `arm-hisiv600-linux-gcc/g++` 为 4.9.4；各自 `cmake --preset` 与 `cmake --build --preset` 均退出 0，实际 `backend_registry.cpp.o` 分别报告 `ELF32` 与 `Machine: ARM`。三套原生 `linux-debug-fetch-deps`、`linux-release-fetch-deps`、`linux-asan-fetch-deps` 的 configure/build/CTest 均退出 0、各为 `95/95`（包含安装 consumer）。
 - 2026-08-21：当前 PATH 可解析 aarch64 编译器，`aarch64-linux-gnu-gcc/g++` 均为 GCC 16.1.0；但 `cmake --preset aarch64-release` 退出 1，编译器调用的 `as` 报告 `unrecognized option '-EL'`。按环境指示将 `/home/yjh/work/toolchain/usr/bin` 前置 PATH 后重试，错误未变；未执行 build（退出 125），没有 aarch64 `.o` 可作 `Machine: AArch64` 检查。Step 8 保持未勾选，不能将三套 ARM 交叉构建宣称为全部通过。
+- 2026-08-21：环境改用兼容的系统 `aarch64-linux-gnu-gcc/g++` 13.3.0 后，先执行 `cmake --fresh --preset aarch64-release` 清除旧 GCC 16.1.0 的 CMake 缓存，再执行普通 `cmake --preset aarch64-release` 和 `cmake --build --preset aarch64-release`，均退出 0、完成 22 个构建步骤。`aarch64-linux-gnu-readelf -h build/aarch64-release/src/CMakeFiles/eavp_media.dir/media/backend_registry.cpp.o` 报告 `ELF64` 与 `Machine: AArch64`。随后 Rockchip 与海思 v600 的 configure/build 均退出 0，实际对象仍分别报告 `ELF32` 与 `Machine: ARM`；三套 ARM 交叉构建均已通过，Step 8 勾选。
