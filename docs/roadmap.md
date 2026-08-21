@@ -6,7 +6,7 @@
 
 1. **Core 0.1（已完成）**：纯软件核心、状态收敛、可观测模拟纵切面。
 2. **Media Backend Foundation 0.2（当前）**：显式 Buffer/Format、Capability、Provider 选择和 Reference Backend；Reference payload 不是标准码流。
-3. **0.3 Linux Native**：V4L2 与首个实际可用的原生硬件 Provider；具备 Intel GPU 时优先 oneVPL。
+3. **0.3 Linux Native**：0.3a 实现 V4L2 CPU Frame 采集；0.3b 使用开发机可选 FFmpeg/libx264/libx265 Backend 验证标准编码数据流，不作为 ARM 产品依赖。
 4. **0.4 Container**：自研 MPEG-TS、H.264/H.265 bitstream 转换和 FileSink。
 5. **0.5 WebRTC**：优先实现 WebRTC 媒体传输与 WHIP，密码能力由 CryptoProvider 提供。
 6. **0.6 RTMP/FLV**：自研 FLV、AMF 和 RTMP/E-RTMP。
