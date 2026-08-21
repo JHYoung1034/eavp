@@ -1,5 +1,7 @@
 #include "eavp/control/state_store.hpp"
 
+#include <new>
+
 namespace eavp {
 
 namespace {
@@ -98,18 +100,46 @@ Status StateStore::set(const std::string& key, const StateValue& value) {
     if (key.empty() || key[0] != '/') {
         return Status(StatusCode::kInvalidArgument, "state key must be an absolute path");
     }
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::map<std::string, StateValue>::iterator existing = values_.find(key);
-    if (existing != values_.end() && existing->second == value) {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::map<std::string, StateValue>::iterator existing = values_.find(key);
+        if (existing != values_.end() && existing->second == value) {
+            return Status::ok_status();
+        }
+        if (existing == values_.end()) {
+            values_.insert(std::make_pair(key, value));
+        } else {
+            existing->second = value;
+        }
+        ++version_;
         return Status::ok_status();
+    } catch (const std::bad_alloc&) {
+        return Status(StatusCode::kResourceExhausted);
+    } catch (...) {
+        return Status(StatusCode::kInternal);
     }
-    if (existing == values_.end()) {
-        values_.insert(std::make_pair(key, value));
-    } else {
-        existing->second = value;
+}
+
+Status StateStore::erase(const std::string& key) {
+    if (key.empty() || key[0] != '/') {
+        return Status(StatusCode::kInvalidArgument,
+                      "state key must be an absolute path");
     }
-    ++version_;
-    return Status::ok_status();
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const std::map<std::string, StateValue>::iterator existing =
+            values_.find(key);
+        if (existing == values_.end()) {
+            return Status::ok_status();
+        }
+        values_.erase(existing);
+        ++version_;
+        return Status::ok_status();
+    } catch (const std::bad_alloc&) {
+        return Status(StatusCode::kResourceExhausted);
+    } catch (...) {
+        return Status(StatusCode::kInternal);
+    }
 }
 
 std::uint64_t StateStore::version() const {
@@ -123,4 +153,3 @@ StateSnapshot StateStore::snapshot() const {
 }
 
 }  // namespace eavp
-

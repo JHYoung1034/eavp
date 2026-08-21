@@ -1,5 +1,6 @@
 #include "eavp/media/pipeline.hpp"
 
+#include <new>
 #include <utility>
 
 namespace eavp {
@@ -7,7 +8,16 @@ namespace eavp {
 MediaPipeline::MediaPipeline(const std::string& id)
     : id_(id), state_(PipelineState::kCreated), drain_index_(0U) {}
 
-MediaPipeline::~MediaPipeline() { stop(); }
+MediaPipeline::~MediaPipeline() {
+    try {
+        const Status status = stop();
+        if (!status.ok()) {
+            cancel();
+        }
+    } catch (...) {
+        cancel();
+    }
+}
 
 const std::string& MediaPipeline::id() const { return id_; }
 PipelineState MediaPipeline::state() const { return state_; }
@@ -61,9 +71,42 @@ Status MediaPipeline::reset_nodes_reverse(const std::vector<MediaNode*>& nodes) 
     Status first_failure = Status::ok_status();
     for (std::vector<MediaNode*>::const_reverse_iterator it = nodes.rbegin();
          it != nodes.rend(); ++it) {
-        const Status status = (*it)->reset();
-        if (first_failure.ok() && !status.ok()) {
-            first_failure = status;
+        try {
+            const Status status = (*it)->reset();
+            if (first_failure.ok() && !status.ok()) {
+                first_failure = status;
+            }
+        } catch (const std::bad_alloc&) {
+            if (first_failure.ok()) {
+                first_failure = Status(StatusCode::kResourceExhausted);
+            }
+        } catch (...) {
+            if (first_failure.ok()) {
+                first_failure = Status(StatusCode::kInternal);
+            }
+        }
+    }
+    return first_failure;
+}
+
+Status MediaPipeline::reset_owned_nodes_reverse() noexcept {
+    Status first_failure = Status::ok_status();
+    for (std::vector<std::unique_ptr<MediaNode> >::reverse_iterator it =
+             nodes_.rbegin();
+         it != nodes_.rend(); ++it) {
+        try {
+            const Status status = (*it)->reset();
+            if (first_failure.ok() && !status.ok()) {
+                first_failure = status;
+            }
+        } catch (const std::bad_alloc&) {
+            if (first_failure.ok()) {
+                first_failure = Status(StatusCode::kResourceExhausted);
+            }
+        } catch (...) {
+            if (first_failure.ok()) {
+                first_failure = Status(StatusCode::kInternal);
+            }
         }
     }
     return first_failure;
@@ -108,6 +151,7 @@ Status MediaPipeline::start() {
         return Status(StatusCode::kInvalidState, "pipeline has no nodes");
     }
     const std::vector<MediaNode*> order = ordered_nodes(order_result.value());
+    drain_order_ = order;
 
     std::vector<MediaNode*> prepared;
     for (std::vector<MediaNode*>::const_iterator it = order.begin(); it != order.end(); ++it) {
@@ -141,13 +185,15 @@ Status MediaPipeline::stop() {
         return Status::ok_status();
     }
     if (state_ != PipelineState::kDraining) {
-        const Result<std::vector<std::string> > order_result =
-            graph_.topological_order();
-        if (!order_result.ok()) {
-            state_ = PipelineState::kError;
-            return order_result.status();
+        if (drain_order_.empty()) {
+            const Result<std::vector<std::string> > order_result =
+                graph_.topological_order();
+            if (!order_result.ok()) {
+                state_ = PipelineState::kError;
+                return order_result.status();
+            }
+            drain_order_ = ordered_nodes(order_result.value());
         }
-        drain_order_ = ordered_nodes(order_result.value());
         drain_index_ = 0U;
         if (state_ == PipelineState::kError) {
             const Status reset_status = reset_nodes_reverse(drain_order_);
@@ -181,6 +227,23 @@ Status MediaPipeline::stop() {
     }
 
     const Status reset_status = reset_nodes_reverse(drain_order_);
+    if (!reset_status.ok()) {
+        state_ = PipelineState::kError;
+        return reset_status;
+    }
+    state_ = PipelineState::kStopped;
+    drain_order_.clear();
+    drain_index_ = 0U;
+    return Status::ok_status();
+}
+
+Status MediaPipeline::cancel() noexcept {
+    if (state_ == PipelineState::kStopped) {
+        return Status::ok_status();
+    }
+    const Status reset_status =
+        drain_order_.empty() ? reset_owned_nodes_reverse()
+                             : reset_nodes_reverse(drain_order_);
     if (!reset_status.ok()) {
         state_ = PipelineState::kError;
         return reset_status;

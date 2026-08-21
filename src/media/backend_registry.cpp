@@ -17,6 +17,10 @@ Status allocation_failure() {
     return Status(StatusCode::kResourceExhausted);
 }
 
+Status internal_failure() {
+    return Status(StatusCode::kInternal);
+}
+
 std::string rejection_message(const std::string& provider_id,
                               const Status& status) {
     return provider_id + ": " +
@@ -102,6 +106,8 @@ Status BackendRegistry::register_provider(
             std::shared_ptr<const MediaBackendProvider>(provider)));
     } catch (const std::bad_alloc&) {
         return allocation_failure();
+    } catch (...) {
+        return internal_failure();
     }
     return Status::ok_status();
 }
@@ -184,6 +190,8 @@ Result<ProcessorSelection> BackendRegistry::select_video_processor(
             candidates[0].provider, negotiation.take_value()));
     } catch (const std::bad_alloc&) {
         return Result<ProcessorSelection>(allocation_failure());
+    } catch (...) {
+        return Result<ProcessorSelection>(internal_failure());
     }
 }
 
@@ -260,6 +268,8 @@ Result<EncoderSelection> BackendRegistry::select_video_encoder(
             candidates[0].provider, negotiation.take_value()));
     } catch (const std::bad_alloc&) {
         return Result<EncoderSelection>(allocation_failure());
+    } catch (...) {
+        return Result<EncoderSelection>(internal_failure());
     }
 }
 

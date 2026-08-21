@@ -15,6 +15,21 @@ bool is_rate_control_mode(RateControlMode rate_control) {
            rate_control == RateControlMode::kConstantQuality;
 }
 
+bool profile_matches_codec(CodecId codec, CodecProfile profile) {
+    if (profile == CodecProfile::kUnknown) {
+        return true;
+    }
+    if (codec == CodecId::kH264) {
+        return profile == CodecProfile::kH264Baseline ||
+               profile == CodecProfile::kH264Main ||
+               profile == CodecProfile::kH264High;
+    }
+    if (codec == CodecId::kH265) {
+        return profile == CodecProfile::kH265Main;
+    }
+    return false;
+}
+
 bool is_rotation_degrees(int rotation_degrees) {
     return rotation_degrees == 0 || rotation_degrees == 90 || rotation_degrees == 180 ||
            rotation_degrees == 270;
@@ -64,7 +79,8 @@ Result<VideoEncoderConfig> VideoEncoderConfig::create(
             Status(StatusCode::kInvalidArgument, "video encoder dimensions and timing must be positive"));
     }
     if (target_bitrate <= 0 || max_bitrate < target_bitrate || gop_length <= 0 || b_frames < 0 ||
-        level_idc < 0 || !is_rate_control_mode(rate_control)) {
+        level_idc < 0 || !is_rate_control_mode(rate_control) ||
+        !profile_matches_codec(codec, profile)) {
         return Result<VideoEncoderConfig>(
             Status(StatusCode::kInvalidArgument, "video encoder configuration is invalid"));
     }

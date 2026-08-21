@@ -166,11 +166,12 @@ Status SimulatedPlatform::reconcile_once() {
     }
     const Status status = reconciler_.reconcile_once();
     if (!status.ok()) {
-        health_.report("pipeline", HealthStatus::kError, status.message());
-        return status;
+        const Status health_status =
+            health_.report("pipeline", HealthStatus::kError, status.message());
+        return health_status.ok() ? status : health_status;
     }
-    health_.report("pipeline", HealthStatus::kOk, "desired state converged");
-    return Status::ok_status();
+    return health_.report("pipeline", HealthStatus::kOk,
+                          "desired state converged");
 }
 
 Status SimulatedPlatform::tick(std::size_t count) {
@@ -179,11 +180,11 @@ Status SimulatedPlatform::tick(std::size_t count) {
     }
     const Status status = executor_.run(&pipeline_, count);
     if (!status.ok()) {
-        health_.report("pipeline", HealthStatus::kError, status.message());
-        return status;
+        const Status health_status =
+            health_.report("pipeline", HealthStatus::kError, status.message());
+        return health_status.ok() ? status : health_status;
     }
-    health_.report("pipeline", HealthStatus::kOk, "running");
-    return Status::ok_status();
+    return health_.report("pipeline", HealthStatus::kOk, "running");
 }
 
 Result<StateSnapshot> SimulatedPlatform::query(const PipelineStateQuery& query) const {

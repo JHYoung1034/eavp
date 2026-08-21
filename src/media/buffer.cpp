@@ -40,6 +40,15 @@ bool is_within(std::size_t offset, std::size_t size, std::size_t capacity) {
     return offset <= capacity && size <= capacity - offset;
 }
 
+std::size_t greatest_common_divisor(std::size_t left, std::size_t right) {
+    while (right != 0U) {
+        const std::size_t remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    return left;
+}
+
 Status validate_planes(const std::shared_ptr<BufferStorage>& storage,
                        const std::vector<PlaneLayout>& planes) {
     if (!storage) {
@@ -47,6 +56,10 @@ Status validate_planes(const std::shared_ptr<BufferStorage>& storage,
     }
     if (planes.empty()) {
         return Status(StatusCode::kInvalidArgument, "buffer must contain at least one plane");
+    }
+    if (storage->address_alignment() == 0U) {
+        return Status(StatusCode::kInvalidArgument,
+                      "buffer storage address alignment must be positive");
     }
 
     const std::size_t capacity = storage->capacity();
@@ -71,6 +84,27 @@ Status validate_planes(const std::shared_ptr<BufferStorage>& storage,
 }
 
 }  // namespace
+
+Result<std::string> memory_domain_name(MemoryDomain memory_domain) noexcept {
+    try {
+        switch (memory_domain) {
+            case MemoryDomain::kCpu:
+                return Result<std::string>(std::string("cpu"));
+            case MemoryDomain::kMmap:
+                return Result<std::string>(std::string("mmap"));
+            case MemoryDomain::kDmaBuf:
+                return Result<std::string>(std::string("dmabuf"));
+            case MemoryDomain::kDeviceOpaque:
+                return Result<std::string>(std::string("device_opaque"));
+        }
+        return Result<std::string>(Status(
+            StatusCode::kInvalidArgument, "memory domain has no stable state name"));
+    } catch (const std::bad_alloc&) {
+        return Result<std::string>(Status(StatusCode::kResourceExhausted));
+    } catch (...) {
+        return Result<std::string>(Status(StatusCode::kInternal));
+    }
+}
 
 NativeBufferHandle::NativeBufferHandle(int file_descriptor) : file_descriptor_(file_descriptor) {}
 
@@ -100,15 +134,16 @@ void NativeBufferHandle::close() {
 }
 
 MappedRegion::MappedRegion(const std::shared_ptr<BufferStorage>& storage, std::uint8_t* data,
-                           std::size_t size)
-    : storage_(storage), data_(data), size_(size) {}
+                           std::size_t size, MapMode mode)
+    : storage_(storage), data_(data), size_(size), mode_(mode) {}
 
 MappedRegion::~MappedRegion() {
     unmap();
 }
 
 MappedRegion::MappedRegion(MappedRegion&& other) noexcept
-    : storage_(std::move(other.storage_)), data_(other.data_), size_(other.size_) {
+    : storage_(std::move(other.storage_)), data_(other.data_), size_(other.size_),
+      mode_(other.mode_) {
     other.data_ = NULL;
     other.size_ = 0U;
 }
@@ -119,6 +154,7 @@ MappedRegion& MappedRegion::operator=(MappedRegion&& other) noexcept {
         storage_ = std::move(other.storage_);
         data_ = other.data_;
         size_ = other.size_;
+        mode_ = other.mode_;
         other.data_ = NULL;
         other.size_ = 0U;
     }
@@ -186,7 +222,7 @@ Result<MappedRegion> Buffer::map_plane(std::size_t plane_index, MapMode mode) co
             Status(StatusCode::kInvalidArgument, "mapped storage cannot cover requested plane"));
     }
     std::uint8_t* plane_data = mapped_data == NULL ? NULL : mapped_data + plane.offset;
-    return Result<MappedRegion>(MappedRegion(storage_, plane_data, plane.size));
+    return Result<MappedRegion>(MappedRegion(storage_, plane_data, plane.size, mode));
 }
 
 Result<NativeBufferHandle> Buffer::export_dmabuf() const {
@@ -221,6 +257,24 @@ Result<Buffer> Buffer::slice_plane(std::size_t plane_index, std::size_t offset,
             Status(StatusCode::kResourceExhausted, "failed to create slice metadata"));
     }
     return create(storage_, sliced_planes);
+}
+
+Result<std::size_t> Buffer::plane_address_alignment(
+    std::size_t plane_index) const {
+    if (plane_index >= planes_.size()) {
+        return Result<std::size_t>(
+            Status(StatusCode::kInvalidArgument, "plane index is invalid"));
+    }
+    const std::size_t storage_alignment = storage_->address_alignment();
+    if (storage_alignment == 0U) {
+        return Result<std::size_t>(Status(
+            StatusCode::kInvalidState,
+            "buffer storage has an invalid address alignment guarantee"));
+    }
+    const std::size_t offset = planes_[plane_index].offset;
+    return Result<std::size_t>(offset == 0U
+                                   ? storage_alignment
+                                   : greatest_common_divisor(storage_alignment, offset));
 }
 
 }  // namespace eavp

@@ -59,6 +59,7 @@ public:
     StateStore();
 
     Status set(const std::string& key, const StateValue& value);
+    Status erase(const std::string& key);
     std::uint64_t version() const;
     StateSnapshot snapshot() const;
 
@@ -71,4 +72,3 @@ private:
 }  // namespace eavp
 
 #endif  // EAVP_CONTROL_STATE_STORE_HPP_
-

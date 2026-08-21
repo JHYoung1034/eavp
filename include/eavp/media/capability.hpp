@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "eavp/base/result.hpp"
+#include "eavp/media/frame.hpp"
 #include "eavp/media/video_codec.hpp"
 
 namespace eavp {
@@ -99,6 +100,10 @@ private:
     MemoryDomain memory_domain_;
     std::vector<PlaneLayoutConstraint> plane_constraints_;
 };
+
+// Provider 在 submit 边界复用此校验，不能把 selection request 的数字当作实际 Buffer 证据。
+Status validate_frame_plane_alignment(
+    const VideoFrame& frame, const FormatMemoryDomain& required_format);
 
 class SelectionConstraints {
 public:

@@ -141,6 +141,19 @@ TEST(BufferTest, CpuPlaneMappingSharesStorageAndUnmapsOnScopeExit) {
     EXPECT_EQ(eavp::MemoryDomain::kCpu, copy.memory_domain());
 }
 
+TEST(BufferTest, CpuStorageAllowsReentrantMappingsOfTheSamePlane) {
+    eavp::Buffer buffer = eavp::Buffer::allocate(8U).take_value();
+    eavp::MappedRegion writable =
+        buffer.map_plane(0U, eavp::MapMode::kReadWrite).take_value();
+    eavp::MappedRegion readable =
+        buffer.map_plane(0U, eavp::MapMode::kReadOnly).take_value();
+
+    writable.mutable_data()[2] = 0x7cU;
+
+    EXPECT_EQ(0x7cU, readable.data()[2]);
+    EXPECT_EQ(static_cast<std::uint8_t*>(NULL), readable.mutable_data());
+}
+
 TEST(BufferTest, RejectsPlaneBeyondStorageAndReportsUnmappableDeviceMemory) {
     std::shared_ptr<eavp::BufferStorage> storage(new UnmappableStorage(64U));
     std::vector<eavp::PlaneLayout> invalid;
@@ -191,6 +204,23 @@ TEST(BufferTest, MovingMappedRegionUnmapsStorageOnlyOnce) {
             buffer.map_plane(0U, eavp::MapMode::kReadOnly).take_value();
         eavp::MappedRegion moved(std::move(mapped));
         EXPECT_EQ(8U, moved.size());
+    }
+    EXPECT_EQ(1, storage->unmap_count());
+}
+
+TEST(BufferTest, ReadOnlyMappingDoesNotExposeMutableDataAndUnmapsOnce) {
+    std::shared_ptr<CountingMappingStorage> storage(new CountingMappingStorage());
+    const std::vector<eavp::PlaneLayout> planes{
+        eavp::PlaneLayout(0U, 8U, 8U)};
+    eavp::Buffer buffer = eavp::Buffer::create(storage, planes).take_value();
+
+    {
+        eavp::MappedRegion mapped =
+            buffer.map_plane(0U, eavp::MapMode::kReadOnly).take_value();
+        EXPECT_NE(static_cast<const std::uint8_t*>(NULL), mapped.data());
+        EXPECT_EQ(static_cast<std::uint8_t*>(NULL), mapped.mutable_data());
+        eavp::MappedRegion moved(std::move(mapped));
+        EXPECT_EQ(static_cast<std::uint8_t*>(NULL), moved.mutable_data());
     }
     EXPECT_EQ(1, storage->unmap_count());
 }
@@ -353,6 +383,35 @@ TEST(VideoFormatTest, RejectsOddChromaDimensions) {
                   .code());
 }
 
+TEST(VideoFormatTest, StableStateNamesCoverSupportedEnumsAndRejectUnknownValues) {
+    EXPECT_EQ("rgb24",
+              eavp::pixel_format_name(eavp::PixelFormat::kRgb24)
+                  .value());
+    EXPECT_EQ("nv12",
+              eavp::pixel_format_name(eavp::PixelFormat::kNv12).value());
+    EXPECT_EQ("yuv420p",
+              eavp::pixel_format_name(eavp::PixelFormat::kYuv420p).value());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::pixel_format_name(eavp::PixelFormat::kUnknown)
+                  .status().code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::pixel_format_name(static_cast<eavp::PixelFormat>(999))
+                  .status().code());
+
+    EXPECT_EQ("cpu",
+              eavp::memory_domain_name(eavp::MemoryDomain::kCpu).value());
+    EXPECT_EQ("mmap",
+              eavp::memory_domain_name(eavp::MemoryDomain::kMmap).value());
+    EXPECT_EQ("dmabuf",
+              eavp::memory_domain_name(eavp::MemoryDomain::kDmaBuf).value());
+    EXPECT_EQ("device_opaque",
+              eavp::memory_domain_name(eavp::MemoryDomain::kDeviceOpaque)
+                  .value());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::memory_domain_name(static_cast<eavp::MemoryDomain>(999))
+                  .status().code());
+}
+
 TEST(VideoFormatTest, ValidatesYuv420pAndRejectsPlaneSizeOverflow) {
     std::vector<eavp::PlaneLayout> yuv420p_planes;
     yuv420p_planes.push_back(eavp::PlaneLayout(0U, 128U, 16U));
@@ -370,6 +429,37 @@ TEST(VideoFormatTest, ValidatesYuv420pAndRejectsPlaneSizeOverflow) {
                                          eavp::MemoryDomain::kCpu, overflowing_planes)
                   .status()
                   .code());
+}
+
+TEST(VideoFormatTest, RejectsOverlappingAndOverflowingPlaneRanges) {
+    const std::vector<eavp::PlaneLayout> overlapping_nv12{
+        eavp::PlaneLayout(0U, 128U, 16U),
+        eavp::PlaneLayout(64U, 64U, 16U)};
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::VideoFormat::create(eavp::PixelFormat::kNv12, 16, 8,
+                                         eavp::MemoryDomain::kCpu,
+                                         overlapping_nv12)
+                  .status().code());
+
+    const std::vector<eavp::PlaneLayout> overlapping_yuv420p{
+        eavp::PlaneLayout(0U, 128U, 16U),
+        eavp::PlaneLayout(128U, 32U, 8U),
+        eavp::PlaneLayout(144U, 32U, 8U)};
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::VideoFormat::create(eavp::PixelFormat::kYuv420p, 16, 8,
+                                         eavp::MemoryDomain::kCpu,
+                                         overlapping_yuv420p)
+                  .status().code());
+
+    const std::vector<eavp::PlaneLayout> overflowing_nv12{
+        eavp::PlaneLayout(std::numeric_limits<std::size_t>::max() - 63U,
+                          128U, 16U),
+        eavp::PlaneLayout(0U, 64U, 16U)};
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::VideoFormat::create(eavp::PixelFormat::kNv12, 16, 8,
+                                         eavp::MemoryDomain::kCpu,
+                                         overflowing_nv12)
+                  .status().code());
 }
 
 TEST(FrameTest, VideoFrameRequiresBufferFormatDomainAndPlaneLayoutMatch) {
@@ -466,6 +556,33 @@ TEST(VideoEncoderConfigTest, ValidatesTimeBaseAndFrameRate) {
                   eavp::RateControlMode::kCbr, eavp::CodecProfile::kH264Main, 40, true)
                   .status()
                   .code());
+}
+
+TEST(VideoEncoderConfigTest, RejectsInvalidAndCrossCodecProfiles) {
+    const eavp::TimeBase time_base = eavp::TimeBase::create(1, 90000).take_value();
+    const eavp::CodecProfile invalid_profile =
+        static_cast<eavp::CodecProfile>(999);
+
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::VideoEncoderConfig::create(
+                  eavp::CodecId::kH264, 16, 16, 30, 1, time_base, 1000, 1000,
+                  30, 0, eavp::RateControlMode::kCbr, invalid_profile, 40,
+                  false).status().code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::VideoEncoderConfig::create(
+                  eavp::CodecId::kH264, 16, 16, 30, 1, time_base, 1000, 1000,
+                  30, 0, eavp::RateControlMode::kCbr,
+                  eavp::CodecProfile::kH265Main, 40, false).status().code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::VideoEncoderConfig::create(
+                  eavp::CodecId::kH265, 16, 16, 30, 1, time_base, 1000, 1000,
+                  30, 0, eavp::RateControlMode::kCbr,
+                  eavp::CodecProfile::kH264High, 40, false).status().code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::VideoEncoderConfig::create(
+                  eavp::CodecId::kReference, 16, 16, 30, 1, time_base, 1, 1,
+                  1, 0, eavp::RateControlMode::kConstantQuality,
+                  eavp::CodecProfile::kH264Baseline, 0, true).status().code());
 }
 
 TEST(FrameTest, AudioFramesValidateShapeAndShareBuffer) {

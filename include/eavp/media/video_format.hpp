@@ -14,6 +14,8 @@ enum class PixelFormat {
     kRgb24,
 };
 
+Result<std::string> pixel_format_name(PixelFormat pixel_format) noexcept;
+
 enum class ColorRange {
     kUnknown,
     kLimited,

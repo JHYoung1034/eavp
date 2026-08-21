@@ -257,16 +257,28 @@ std::string ReferenceMediaPlatform::state_key(const char* suffix) const {
 }
 
 Status ReferenceMediaPlatform::publish_selection(
-    const VideoFormat&, const std::string& provider_id) {
+    const VideoFormat& format, const std::string& provider_id) {
+    Result<std::string> pixel_format =
+        pixel_format_name(format.pixel_format());
+    if (!pixel_format.ok()) {
+        return pixel_format.status();
+    }
+    Result<std::string> memory_domain =
+        memory_domain_name(format.memory_domain());
+    if (!memory_domain.ok()) {
+        return memory_domain.status();
+    }
     Status status = actual_.set(state_key("/provider"), StateValue(provider_id));
     if (!status.ok()) {
         return status;
     }
-    status = actual_.set(state_key("/pixel_format"), StateValue("rgb24"));
+    status = actual_.set(state_key("/pixel_format"),
+                         StateValue(pixel_format.value()));
     if (!status.ok()) {
         return status;
     }
-    return actual_.set(state_key("/memory_domain"), StateValue("cpu"));
+    return actual_.set(state_key("/memory_domain"),
+                       StateValue(memory_domain.value()));
 }
 
 Status ReferenceMediaPlatform::build_pipeline() {
@@ -408,8 +420,9 @@ Status ReferenceMediaPlatform::initialize() {
     }
     status = build_pipeline();
     if (!status.ok()) {
-        health_.report("pipeline", HealthStatus::kError, status.message());
-        return status;
+        const Status health_status =
+            health_.report("pipeline", HealthStatus::kError, status.message());
+        return health_status.ok() ? status : health_status;
     }
     initialized_ = true;
     return health_.report("pipeline", HealthStatus::kOk, "initialized");
@@ -434,16 +447,21 @@ Status ReferenceMediaPlatform::reconcile_once() {
     }
     const Status status = reconciler_->reconcile_once();
     if (status.code() == StatusCode::kWouldBlock) {
-        health_.report("pipeline", HealthStatus::kOk, "pipeline is draining");
-        return status;
+        const Status health_status = health_.report(
+            "pipeline", HealthStatus::kOk, "pipeline is draining");
+        return health_status.ok() ? status : health_status;
     }
     if (!status.ok()) {
-        health_.report("pipeline", HealthStatus::kError, status.message());
-        return status;
+        const Status health_status =
+            health_.report("pipeline", HealthStatus::kError, status.message());
+        return health_status.ok() ? status : health_status;
     }
-    health_.report("pipeline", HealthStatus::kOk,
-                   "desired state converged");
-    return Status::ok_status();
+    const Status clear_status = clear_runtime_errors();
+    if (!clear_status.ok()) {
+        return clear_status;
+    }
+    return health_.report("pipeline", HealthStatus::kOk,
+                          "desired state converged");
 }
 
 std::uint64_t ReferenceMediaPlatform::encoded_count() const {
@@ -454,14 +472,66 @@ std::uint64_t ReferenceMediaPlatform::encoded_count() const {
 
 Status ReferenceMediaPlatform::publish_runtime_failure(
     const Status& failure) {
-    actual_.set(state_key(), StateValue("error"));
-    actual_.set(state_key("/error/provider"),
-                StateValue(failure.provider_id()));
-    actual_.set(state_key("/error/operation"),
-                StateValue(failure.operation()));
-    actual_.set(state_key("/error/message"), StateValue(failure.message()));
-    health_.report("pipeline", HealthStatus::kError, failure.message());
-    return failure;
+    try {
+        Status status = actual_.set(state_key(), StateValue("error"));
+        if (!status.ok()) {
+            return status;
+        }
+        status = actual_.set(state_key("/error"),
+                             StateValue(failure.message()));
+        if (!status.ok()) {
+            return status;
+        }
+        status = actual_.set(state_key("/error/provider"),
+                             StateValue(failure.provider_id()));
+        if (!status.ok()) {
+            return status;
+        }
+        status = actual_.set(state_key("/error/operation"),
+                             StateValue(failure.operation()));
+        if (!status.ok()) {
+            return status;
+        }
+        status = actual_.set(state_key("/error/message"),
+                             StateValue(failure.message()));
+        if (!status.ok()) {
+            return status;
+        }
+        status = health_.report("pipeline", HealthStatus::kError,
+                                failure.message());
+        return status.ok() ? failure : status;
+    } catch (const std::bad_alloc&) {
+        return allocation_failure();
+    } catch (...) {
+        return unexpected_failure();
+    }
+}
+
+Status ReferenceMediaPlatform::clear_runtime_errors() {
+    try {
+        Status first_failure = Status::ok_status();
+        Status status = actual_.erase(state_key("/error"));
+        if (first_failure.ok() && !status.ok()) {
+            first_failure = status;
+        }
+        status = actual_.erase(state_key("/error/provider"));
+        if (first_failure.ok() && !status.ok()) {
+            first_failure = status;
+        }
+        status = actual_.erase(state_key("/error/operation"));
+        if (first_failure.ok() && !status.ok()) {
+            first_failure = status;
+        }
+        status = actual_.erase(state_key("/error/message"));
+        if (first_failure.ok() && !status.ok()) {
+            first_failure = status;
+        }
+        return first_failure;
+    } catch (const std::bad_alloc&) {
+        return allocation_failure();
+    } catch (...) {
+        return unexpected_failure();
+    }
 }
 
 Status ReferenceMediaPlatform::tick(std::size_t count) {
@@ -508,8 +578,11 @@ Status ReferenceMediaPlatform::tick(std::size_t count) {
         return Status(StatusCode::kWouldBlock,
                       "pipeline did not produce the requested frame count");
     }
-    health_.report("pipeline", HealthStatus::kOk, "running");
-    return Status::ok_status();
+    const Status clear_status = clear_runtime_errors();
+    if (!clear_status.ok()) {
+        return clear_status;
+    }
+    return health_.report("pipeline", HealthStatus::kOk, "running");
 }
 
 Status ReferenceMediaPlatform::reset_pipeline() {
@@ -518,21 +591,33 @@ Status ReferenceMediaPlatform::reset_pipeline() {
         return Status(StatusCode::kInvalidState,
                       "only an errored pipeline can be reset");
     }
-    pipeline_->stop();
+    Status status = pipeline_->stop();
+    if (status.code() == StatusCode::kWouldBlock ||
+        status.code() == StatusCode::kNotFound) {
+        status = pipeline_->cancel();
+    }
+    if (!status.ok()) {
+        return status;
+    }
     reconciler_.reset();
     pipeline_.reset();
     source_budget_ = 0U;
-    Status status = build_pipeline();
+    status = build_pipeline();
     if (!status.ok()) {
-        health_.report("pipeline", HealthStatus::kError, status.message());
-        return status;
+        const Status health_status =
+            health_.report("pipeline", HealthStatus::kError, status.message());
+        return health_status.ok() ? status : health_status;
     }
     status = reconciler_->reconcile_once();
     if (!status.ok()) {
         return publish_runtime_failure(status);
     }
-    health_.report("pipeline", HealthStatus::kOk, "pipeline rebuilt");
-    return Status::ok_status();
+    status = clear_runtime_errors();
+    if (!status.ok()) {
+        return status;
+    }
+    return health_.report("pipeline", HealthStatus::kOk,
+                          "pipeline rebuilt");
 }
 
 Result<StateSnapshot> ReferenceMediaPlatform::query(

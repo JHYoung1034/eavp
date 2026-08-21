@@ -10,7 +10,7 @@
 
 ## 媒体对象
 
-`Buffer` 使用 `shared_ptr` 共享底层 Storage，切片只改变视图范围。访问字节必须通过 `map_plane()` 取得有生命周期约束的 `MappedRegion`，不得假定单一连续 plane。`VideoFormat` 显式声明像素格式、尺寸、内存域和每个 `PlaneLayout`；VideoFrame 的 Buffer plane 必须与该格式一致。VideoFrame、AudioFrame 和 MediaPacket 是值对象，复制它们不会复制媒体字节。MediaPacket 由 `create()` 建立，并声明 Codec、EncodedStreamFormat 和 codec 配置。时间基准分母必须大于零。
+`Buffer` 使用 `shared_ptr` 共享底层 Storage，切片只改变视图范围。访问字节必须通过 `map_plane()` 取得有生命周期约束的 `MappedRegion`，不得假定单一连续 plane；只读映射不提供可写指针。Storage 声明起始地址的分配器保证，Buffer 结合 plane offset 暴露每个 plane 的有效对齐，Provider 在 submit 时以共享校验入口核对实际 Frame，不能把 selection request 的数字当作实际 Buffer 证据。`VideoFormat` 显式声明像素格式、尺寸、内存域和每个 `PlaneLayout`；VideoFrame 的 Buffer plane 必须与该格式一致。VideoFrame、AudioFrame 和 MediaPacket 是值对象，复制它们不会复制媒体字节。MediaPacket 由 `create()` 建立，并声明 Codec、EncodedStreamFormat 和 codec 配置。时间基准分母必须大于零。
 
 ## 后端边界
 

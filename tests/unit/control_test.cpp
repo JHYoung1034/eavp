@@ -28,6 +28,22 @@ TEST(StateStoreTest, DesiredAndActualStoresHaveIndependentVersionedSnapshots) {
     EXPECT_EQ(2U, desired.version());
 }
 
+TEST(StateStoreTest, EraseIsIdempotentAndVersionsOnlyAnExistingRemoval) {
+    eavp::StateStore store;
+    ASSERT_TRUE(store.set("/pipelines/live0/error", eavp::StateValue("old")).ok());
+    ASSERT_EQ(1U, store.version());
+
+    ASSERT_TRUE(store.erase("/pipelines/live0/error").ok());
+    EXPECT_EQ(2U, store.version());
+    EXPECT_EQ(eavp::StatusCode::kNotFound,
+              store.snapshot().get("/pipelines/live0/error").status().code());
+
+    ASSERT_TRUE(store.erase("/pipelines/live0/error").ok());
+    EXPECT_EQ(2U, store.version());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              store.erase("relative/error").code());
+}
+
 class CountingNode : public eavp::MediaNode {
 public:
     CountingNode(const std::string& id, bool fail_start)
@@ -44,6 +60,23 @@ protected:
 
 private:
     bool fail_start_;
+    int starts_;
+};
+
+class RecoveringNode : public eavp::MediaNode {
+public:
+    RecoveringNode() : eavp::MediaNode("source"), starts_(0) {}
+
+protected:
+    eavp::Status on_start() override {
+        ++starts_;
+        return starts_ == 1
+                   ? eavp::Status(eavp::StatusCode::kInternal,
+                                  "first start failed")
+                   : eavp::Status::ok_status();
+    }
+
+private:
     int starts_;
 };
 
@@ -101,6 +134,28 @@ TEST(ControlTest, FailedReconcileKeepsDesiredAndPublishesActualError) {
                                            .value()
                                            .as_string()
                                            .value());
+}
+
+TEST(ControlTest, SuccessfulRecoveryRemovesThePreviousGenericError) {
+    eavp::StateStore desired;
+    eavp::StateStore actual;
+    eavp::PipelineCommandHandler commands(&desired);
+    eavp::MediaPipeline pipeline("live0");
+    ASSERT_TRUE(pipeline.add_node(std::unique_ptr<eavp::MediaNode>(
+        new RecoveringNode())).ok());
+    eavp::PipelineReconciler reconciler(&pipeline, &desired, &actual);
+    ASSERT_TRUE(commands.handle(
+        eavp::StartPipelineCommand("cmd-1", "test", "live0")).ok());
+    ASSERT_EQ(eavp::StatusCode::kInternal, reconciler.reconcile_once().code());
+    ASSERT_TRUE(actual.snapshot().get("/pipelines/live0/error").ok());
+    ASSERT_TRUE(pipeline.stop().ok());
+
+    ASSERT_TRUE(reconciler.reconcile_once().ok());
+
+    EXPECT_EQ("running", actual.snapshot().get("/pipelines/live0/state")
+                             .value().as_string().value());
+    EXPECT_EQ(eavp::StatusCode::kNotFound,
+              actual.snapshot().get("/pipelines/live0/error").status().code());
 }
 
 }  // namespace

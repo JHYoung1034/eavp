@@ -12,12 +12,22 @@ namespace {
 
 const char kReferenceProviderId[] = "reference";
 
-Status invalid_state(const char*) {
-    return Status(StatusCode::kInvalidState);
+Status diagnostic_failure(StatusCode code, const char* description) noexcept {
+    try {
+        return Status(code, description);
+    } catch (const std::bad_alloc&) {
+        return Status(StatusCode::kResourceExhausted);
+    } catch (...) {
+        return Status(StatusCode::kInternal);
+    }
 }
 
-Status capability_mismatch(const char*) {
-    return Status(StatusCode::kCapabilityMismatch);
+Status invalid_state(const char* description) noexcept {
+    return diagnostic_failure(StatusCode::kInvalidState, description);
+}
+
+Status capability_mismatch(const char* description) noexcept {
+    return diagnostic_failure(StatusCode::kCapabilityMismatch, description);
 }
 
 Status would_block() {
@@ -103,6 +113,24 @@ std::vector<FormatMemoryDomain> reference_formats() {
     return formats;
 }
 
+Status validate_reference_alignment(const VideoFrame& frame) noexcept {
+    try {
+        const std::vector<FormatMemoryDomain> formats = reference_formats();
+        for (std::size_t index = 0U; index < formats.size(); ++index) {
+            if (formats[index].pixel_format() == frame.format().pixel_format() &&
+                formats[index].memory_domain() == frame.format().memory_domain()) {
+                return validate_frame_plane_alignment(frame, formats[index]);
+            }
+        }
+        return capability_mismatch(
+            "reference backend has no alignment contract for the submitted frame");
+    } catch (const std::bad_alloc&) {
+        return allocation_failure();
+    } catch (...) {
+        return internal_failure();
+    }
+}
+
 ProviderCapability make_reference_capability() {
     const DimensionRange width(1, 4096, 1, 1);
     const DimensionRange height(1, 4096, 1, 1);
@@ -179,6 +207,10 @@ public:
         if (!same_format(frame->format(), config_->input_format)) {
             return capability_mismatch(
                 "reference processor input frame format does not match configuration");
+        }
+        const Status alignment = validate_reference_alignment(*frame);
+        if (!alignment.ok()) {
+            return alignment;
         }
         if (options_.device_lost_after_submissions != 0U &&
             successful_submissions_ >=
@@ -329,6 +361,10 @@ public:
         if (!same_format(frame->format(), *input_format_)) {
             return capability_mismatch(
                 "reference encoder input frame format does not match configuration");
+        }
+        const Status alignment = validate_reference_alignment(*frame);
+        if (!alignment.ok()) {
+            return alignment;
         }
         if (options_.device_lost_after_submissions != 0U &&
             successful_submissions_ >=

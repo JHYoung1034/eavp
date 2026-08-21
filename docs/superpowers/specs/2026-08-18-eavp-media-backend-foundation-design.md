@@ -304,7 +304,7 @@ Reference Pipeline 连续处理 100 个 VideoFrame，验证：
 
 ### 12.4 构建验证
 
-Debug、Release、ASan/UBSan、安装消费工程和通用 aarch64 交叉构建继续作为完成条件。Core 构建不得查找或下载 FFmpeg、oneVPL、MPP、RGA、海思 SDK 或 OpenSSL。
+Debug、Release、ASan/UBSan、安装消费工程，以及 Rockchip ARMHF、HiSilicon v600 ARM32 和通用 aarch64 三套交叉构建继续作为完成条件。每套交叉构建必须 clean configure/build，并对真实目标文件执行对象架构检查：两套 ARM32 为 `Machine: ARM`，aarch64 为 `Machine: AArch64`。ARM32 门禁只证明平台无关 Core/Reference Backend 可由对应工具链生成和链接，不代表 MPP/RGA 或 `HI_MPI` 已接入或通过功能验证。Core 构建不得查找或下载 FFmpeg、oneVPL、MPP、RGA、海思 SDK 或 OpenSSL。
 
 ## 13. 后续模块边界
 
@@ -346,7 +346,7 @@ Rockchip MPP/RGA 与海思 `HI_MPI` 分别使用独立硬件规格。取得目�
 - Reference Processor/Encoder 支持背压、延迟输出、drain、reset 和设备丢失。
 - Reference Pipeline 处理 100 帧，Packet 数量、状态、Metrics 和 Health 与预期一致。
 - 设备丢失不触发运行中静默后端切换；Desired 保留，Actual 进入 Error。
-- Debug、Release、ASan/UBSan、安装消费和 aarch64 交叉构建全部通过。
+- Debug、Release、ASan/UBSan 和安装消费全部通过；Rockchip ARMHF、HiSilicon v600 ARM32 与通用 aarch64 均完成 clean 交叉构建，真实对象分别通过 `Machine: ARM`、`Machine: ARM` 与 `Machine: AArch64` 检查。ARM32 结果不得表述为 MPP/RGA 或 `HI_MPI` 功能验证。
 - 所有新增说明性文档以简体中文为主，不包含未解释的占位内容。
 
 ## 16. 兼容性与迁移

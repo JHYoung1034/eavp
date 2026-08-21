@@ -394,6 +394,94 @@ private:
     int resets_;
 };
 
+class PermanentlyBlockedNode : public eavp::MediaNode {
+public:
+    PermanentlyBlockedNode(int* stop_calls, int* reset_calls,
+                           int* destruction_calls, bool fail_reset = false)
+        : eavp::MediaNode("permanently-blocked"), stop_calls_(stop_calls),
+          reset_calls_(reset_calls), destruction_calls_(destruction_calls),
+          fail_reset_(fail_reset) {}
+
+    ~PermanentlyBlockedNode() { ++(*destruction_calls_); }
+
+protected:
+    eavp::Status on_stop() override {
+        ++(*stop_calls_);
+        return eavp::Status(eavp::StatusCode::kWouldBlock,
+                            "node remains blocked forever");
+    }
+
+    eavp::Status on_reset() override {
+        ++(*reset_calls_);
+        return fail_reset_
+                   ? eavp::Status(eavp::StatusCode::kInternal,
+                                  "forced reset failed")
+                   : eavp::Status::ok_status();
+    }
+
+private:
+    int* stop_calls_;
+    int* reset_calls_;
+    int* destruction_calls_;
+    bool fail_reset_;
+};
+
+TEST(PipelineTest, ExplicitCancelResetsPermanentlyBlockedDrain) {
+    int stop_calls = 0;
+    int reset_calls = 0;
+    int destruction_calls = 0;
+    eavp::MediaPipeline pipeline("cancel");
+    ASSERT_TRUE(pipeline.add_node(std::unique_ptr<eavp::MediaNode>(
+        new PermanentlyBlockedNode(&stop_calls, &reset_calls,
+                                   &destruction_calls))).ok());
+    ASSERT_TRUE(pipeline.start().ok());
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock, pipeline.stop().code());
+
+    EXPECT_TRUE(pipeline.cancel().ok());
+
+    EXPECT_EQ(eavp::PipelineState::kStopped, pipeline.state());
+    EXPECT_EQ(1, stop_calls);
+    EXPECT_EQ(1, reset_calls);
+    EXPECT_EQ(0, destruction_calls);
+}
+
+TEST(PipelineTest, DestructorForceResetsAfterOneBlockedStopAttempt) {
+    int stop_calls = 0;
+    int reset_calls = 0;
+    int destruction_calls = 0;
+    {
+        eavp::MediaPipeline pipeline("destructor-cancel");
+        ASSERT_TRUE(pipeline.add_node(std::unique_ptr<eavp::MediaNode>(
+            new PermanentlyBlockedNode(&stop_calls, &reset_calls,
+                                       &destruction_calls))).ok());
+        ASSERT_TRUE(pipeline.start().ok());
+    }
+
+    EXPECT_EQ(1, stop_calls);
+    EXPECT_EQ(1, reset_calls);
+    EXPECT_EQ(1, destruction_calls);
+}
+
+TEST(PipelineTest, FailedForcedResetKeepsPipelineAndNodeInError) {
+    int stop_calls = 0;
+    int reset_calls = 0;
+    int destruction_calls = 0;
+    eavp::MediaPipeline pipeline("cancel-failure");
+    ASSERT_TRUE(pipeline.add_node(std::unique_ptr<eavp::MediaNode>(
+        new PermanentlyBlockedNode(&stop_calls, &reset_calls,
+                                   &destruction_calls, true))).ok());
+    ASSERT_TRUE(pipeline.start().ok());
+    ASSERT_EQ(eavp::StatusCode::kWouldBlock, pipeline.stop().code());
+
+    const eavp::Status status = pipeline.cancel();
+
+    EXPECT_EQ(eavp::StatusCode::kInternal, status.code());
+    EXPECT_EQ(eavp::PipelineState::kError, pipeline.state());
+    EXPECT_EQ(0, destruction_calls);
+    EXPECT_EQ(1, stop_calls);
+    EXPECT_EQ(1, reset_calls);
+}
+
 TEST(PipelineTest, DrainTicksRunningDownstreamThroughTwoBoundedQueues) {
     eavp::MediaPipeline pipeline("drain-ports");
     BackpressuredDrainSource* source = new BackpressuredDrainSource();

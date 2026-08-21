@@ -31,12 +31,14 @@ public:
     Status connect(const std::string& source, const std::string& sink);
     Status start();
     Status stop();
+    Status cancel() noexcept;
     Status tick();
 
 private:
     std::vector<MediaNode*> ordered_nodes(const std::vector<std::string>& order) const;
     void stop_nodes_reverse(const std::vector<MediaNode*>& nodes);
     Status reset_nodes_reverse(const std::vector<MediaNode*>& nodes);
+    Status reset_owned_nodes_reverse() noexcept;
     Status tick_running_downstream(std::size_t current_index);
 
     std::string id_;

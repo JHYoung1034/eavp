@@ -57,6 +57,8 @@ TEST(ResultTest, MovesUniqueValueOutOfTheResult) {
     std::unique_ptr<int> value = result.take_value();
     ASSERT_TRUE(value.get() != NULL);
     EXPECT_EQ(42, *value);
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(eavp::StatusCode::kInvalidState, result.status().code());
 }
 
 TEST(ResultTest, MovingResultInvalidatesTheSource) {

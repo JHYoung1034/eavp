@@ -35,10 +35,36 @@ Status validate_plane(const PlaneLayout& plane, std::size_t minimum_stride, std:
     return Status::ok_status();
 }
 
+Status validate_plane_ranges(const std::vector<PlaneLayout>& planes) {
+    for (std::size_t index = 0U; index < planes.size(); ++index) {
+        const PlaneLayout& plane = planes[index];
+        if (plane.offset > std::numeric_limits<std::size_t>::max() - plane.size) {
+            return invalid_format("video plane range overflows");
+        }
+        const std::size_t plane_end = plane.offset + plane.size;
+        for (std::size_t previous = 0U; previous < index; ++previous) {
+            const PlaneLayout& other = planes[previous];
+            if (other.offset >
+                std::numeric_limits<std::size_t>::max() - other.size) {
+                return invalid_format("video plane range overflows");
+            }
+            const std::size_t other_end = other.offset + other.size;
+            if (plane.offset < other_end && other.offset < plane_end) {
+                return invalid_format("video planes must not overlap");
+            }
+        }
+    }
+    return Status::ok_status();
+}
+
 Status validate_format(PixelFormat pixel_format, int width, int height,
                        const std::vector<PlaneLayout>& planes) {
     if (width <= 0 || height <= 0) {
         return invalid_format("video format dimensions must be positive");
+    }
+    const Status range_status = validate_plane_ranges(planes);
+    if (!range_status.ok()) {
+        return range_status;
     }
     const std::size_t pixel_width = static_cast<std::size_t>(width);
     const std::size_t pixel_height = static_cast<std::size_t>(height);
@@ -93,6 +119,27 @@ Status validate_format(PixelFormat pixel_format, int width, int height,
 }
 
 }  // namespace
+
+Result<std::string> pixel_format_name(PixelFormat pixel_format) noexcept {
+    try {
+        switch (pixel_format) {
+            case PixelFormat::kNv12:
+                return Result<std::string>(std::string("nv12"));
+            case PixelFormat::kYuv420p:
+                return Result<std::string>(std::string("yuv420p"));
+            case PixelFormat::kRgb24:
+                return Result<std::string>(std::string("rgb24"));
+            case PixelFormat::kUnknown:
+                break;
+        }
+        return Result<std::string>(Status(
+            StatusCode::kInvalidArgument, "pixel format has no stable state name"));
+    } catch (const std::bad_alloc&) {
+        return Result<std::string>(Status(StatusCode::kResourceExhausted));
+    } catch (...) {
+        return Result<std::string>(Status(StatusCode::kInternal));
+    }
+}
 
 Result<VideoFormat> VideoFormat::create(PixelFormat pixel_format, int width, int height,
                                         MemoryDomain memory_domain,

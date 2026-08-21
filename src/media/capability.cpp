@@ -406,6 +406,33 @@ bool FormatMemoryDomain::valid() const {
     return true;
 }
 
+Status validate_frame_plane_alignment(
+    const VideoFrame& frame, const FormatMemoryDomain& required_format) {
+    if (!required_format.valid()) {
+        return mismatch("provider has invalid frame plane alignment constraints");
+    }
+    if (frame.format().pixel_format() != required_format.pixel_format() ||
+        frame.format().memory_domain() != required_format.memory_domain() ||
+        frame.buffer().plane_count() !=
+            required_format.plane_constraints().size()) {
+        return mismatch("submitted frame format does not match alignment constraints");
+    }
+    for (std::size_t index = 0U;
+         index < required_format.plane_constraints().size(); ++index) {
+        const Result<std::size_t> alignment =
+            frame.buffer().plane_address_alignment(index);
+        if (!alignment.ok()) {
+            return alignment.status();
+        }
+        const std::size_t required_alignment =
+            required_format.plane_constraints()[index].address_alignment();
+        if (alignment.value() % required_alignment != 0U) {
+            return mismatch("submitted frame plane address alignment is unsupported");
+        }
+    }
+    return Status::ok_status();
+}
+
 Status VideoProcessorCapability::match(
     const VideoProcessorRequest& request) const {
     if (!input_width_.valid() || !input_height_.valid() ||

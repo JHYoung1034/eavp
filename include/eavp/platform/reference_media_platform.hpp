@@ -38,6 +38,7 @@ private:
     Status publish_selection(const VideoFormat& format,
                              const std::string& provider_id);
     Status publish_runtime_failure(const Status& failure);
+    Status clear_runtime_errors();
     std::string state_key(const char* suffix = "/state") const;
     std::uint64_t encoded_count() const;
 

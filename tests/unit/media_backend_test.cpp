@@ -3,6 +3,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -404,6 +405,49 @@ public:
     }
 };
 
+class ThrowingProbeProvider : public TestBackendProvider {
+public:
+    explicit ThrowingProbeProvider(bool throw_on_first_probe)
+        : TestBackendProvider("exception.probe", true,
+                              eavp::ProviderKind::kSoftware, true),
+          throw_on_first_probe_(throw_on_first_probe), probe_count_(0) {}
+
+    eavp::Result<eavp::ProviderCapability> probe() const {
+        ++probe_count_;
+        if (throw_on_first_probe_ || probe_count_ > 1) {
+            throw std::runtime_error("provider probe escaped");
+        }
+        return TestBackendProvider::probe();
+    }
+
+private:
+    bool throw_on_first_probe_;
+    mutable int probe_count_;
+};
+
+class AlignmentStorage : public eavp::BufferStorage {
+public:
+    explicit AlignmentStorage(std::size_t address_alignment)
+        : address_alignment_(address_alignment), provider_id_("alignment.test") {}
+
+    eavp::MemoryDomain memory_domain() const { return eavp::MemoryDomain::kDmaBuf; }
+    std::size_t capacity() const { return 384U; }
+    std::size_t address_alignment() const { return address_alignment_; }
+    const std::string& provider_id() const { return provider_id_; }
+    eavp::Status map(eavp::MapMode, std::uint8_t**, std::size_t*) {
+        return eavp::Status(eavp::StatusCode::kUnsupported);
+    }
+    eavp::Status unmap() { return eavp::Status::ok_status(); }
+    eavp::Result<eavp::NativeBufferHandle> export_dmabuf() const {
+        return eavp::Result<eavp::NativeBufferHandle>(
+            eavp::Status(eavp::StatusCode::kUnsupported));
+    }
+
+private:
+    std::size_t address_alignment_;
+    std::string provider_id_;
+};
+
 std::shared_ptr<eavp::MediaBackendProvider> make_test_provider(
     const std::string& provider_id, bool available,
     eavp::ProviderKind kind = eavp::ProviderKind::kSoftware,
@@ -479,7 +523,7 @@ TEST(CapabilityTest, RejectsUnsupportedCodecProfileLevelAndRateControlCombinatio
 
     EXPECT_FALSE(capability.supports(make_encoder_request(
         1920, 1080, eavp::MemoryDomain::kDmaBuf, false,
-        eavp::CodecProfile::kH265Main)));
+        eavp::CodecProfile::kH264High)));
     EXPECT_FALSE(capability.supports(make_encoder_request(
         1920, 1080, eavp::MemoryDomain::kDmaBuf, false,
         eavp::CodecProfile::kH264Main, 41)));
@@ -540,62 +584,48 @@ TEST(CapabilityTest, RequiredZeroCopyValidatesPlaneExtentStrideOffsetAndAddress)
         64U, true, automatic_selection(), no_preferences())));
 }
 
-TEST(CapabilityTest, RejectsOverlappingAlignedPlaneRangesForRequiredZeroCopy) {
-    const std::size_t y_size = 1920U * 1088U;
-    const std::vector<eavp::PlaneLayout> overlapping_planes{
-        eavp::PlaneLayout(0U, y_size, 1920U),
-        eavp::PlaneLayout(64U, 1920U * 544U, 1920U)};
-    const eavp::Result<eavp::VideoFormat> format =
-        eavp::VideoFormat::create(eavp::PixelFormat::kNv12, 1920, 1080,
-                                  eavp::MemoryDomain::kDmaBuf,
-                                  overlapping_planes);
-    ASSERT_TRUE(format.ok());
+TEST(CapabilityTest,
+     FrameAlignmentUsesStorageGuaranteeAndPlaneOffsetInsteadOfRequestNumber) {
+    const std::vector<eavp::PlaneLayout> planes{
+        eavp::PlaneLayout(0U, 256U, 16U),
+        eavp::PlaneLayout(256U, 128U, 16U)};
+    const eavp::VideoFormat format = eavp::VideoFormat::create(
+        eavp::PixelFormat::kNv12, 16, 16, eavp::MemoryDomain::kDmaBuf,
+        planes).take_value();
+    const eavp::TimeBase time_base = eavp::TimeBase::create(1, 30).take_value();
+    const eavp::FormatMemoryDomain required(
+        eavp::PixelFormat::kNv12, eavp::MemoryDomain::kDmaBuf,
+        nv12_layout_constraints(16U));
+
+    const std::shared_ptr<eavp::BufferStorage> aligned_storage(
+        new AlignmentStorage(64U));
+    const eavp::Buffer aligned_buffer =
+        eavp::Buffer::create(aligned_storage, planes).take_value();
+    const eavp::VideoFrame aligned_frame = eavp::VideoFrame::create(
+        aligned_buffer, format, 0, time_base).take_value();
+    EXPECT_TRUE(eavp::validate_frame_plane_alignment(aligned_frame, required).ok());
+    EXPECT_EQ(64U, aligned_buffer.plane_address_alignment(0U).value());
+    EXPECT_EQ(64U, aligned_buffer.plane_address_alignment(1U).value());
+
+    const eavp::Buffer sliced =
+        aligned_buffer.slice_plane(0U, 16U, 16U).take_value();
+    EXPECT_EQ(16U, sliced.plane_address_alignment(0U).value());
+
+    const std::shared_ptr<eavp::BufferStorage> weak_storage(
+        new AlignmentStorage(16U));
+    const eavp::Buffer weak_buffer =
+        eavp::Buffer::create(weak_storage, planes).take_value();
+    const eavp::VideoFrame weak_frame = eavp::VideoFrame::create(
+        weak_buffer, format, 0, time_base).take_value();
+    EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch,
+              eavp::validate_frame_plane_alignment(weak_frame, required).code());
+
     const eavp::VideoEncoderRequest request(
-        format.value(),
-        make_h264_config(1920, 1080, eavp::CodecProfile::kH264Main), 64U,
+        format, make_h264_config(16, 16, eavp::CodecProfile::kH264Main), 64U,
         true, automatic_selection(), no_preferences());
-
-    EXPECT_FALSE(make_h264_capability_for_test(true).supports(request));
-}
-
-TEST(CapabilityTest, RejectsPlaneRangeWhoseOffsetAndSizeOverflow) {
-    const std::size_t y_size = 1920U * 1088U;
-    const std::size_t overflowing_offset =
-        std::numeric_limits<std::size_t>::max() - 63U;
-    const std::vector<eavp::PlaneLayout> overflowing_planes{
-        eavp::PlaneLayout(0U, y_size, 1920U),
-        eavp::PlaneLayout(overflowing_offset, 1920U * 544U, 1920U)};
-    const eavp::Result<eavp::VideoFormat> format =
-        eavp::VideoFormat::create(eavp::PixelFormat::kNv12, 1920, 1080,
-                                  eavp::MemoryDomain::kDmaBuf,
-                                  overflowing_planes);
-    ASSERT_TRUE(format.ok());
-    const eavp::VideoEncoderRequest request(
-        format.value(),
-        make_h264_config(1920, 1080, eavp::CodecProfile::kH264Main), 64U,
-        true, automatic_selection(), no_preferences());
-
-    EXPECT_FALSE(make_h264_capability_for_test(true).supports(request));
-
-    const eavp::VideoEncoderRequest conversion_request(
-        format.value(),
-        make_h264_config(1920, 1080, eavp::CodecProfile::kH264Main), 64U,
-        false, automatic_selection(), no_preferences());
-    const eavp::Result<eavp::VideoEncoderNegotiation> negotiation =
-        make_provider("overflow.safe", eavp::ProviderKind::kHardware, true)
-            .negotiate(conversion_request);
-    ASSERT_TRUE(negotiation.ok());
-    EXPECT_TRUE(negotiation.value().requires_explicit_conversion);
-    const std::vector<eavp::PlaneLayout>& actual_planes =
-        negotiation.value().actual_format.planes();
-    ASSERT_EQ(2U, actual_planes.size());
-    ASSERT_LE(actual_planes[0].offset,
-              std::numeric_limits<std::size_t>::max() - actual_planes[0].size);
-    ASSERT_LE(actual_planes[1].offset,
-              std::numeric_limits<std::size_t>::max() - actual_planes[1].size);
-    ASSERT_LE(actual_planes[0].offset, actual_planes[1].offset);
-    EXPECT_LE(actual_planes[0].size,
-              actual_planes[1].offset - actual_planes[0].offset);
+    EXPECT_TRUE(make_h264_capability_for_test(true).supports(request));
+    EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch,
+              eavp::validate_frame_plane_alignment(weak_frame, required).code());
 }
 
 TEST(CapabilityTest, NegotiationReportsExplicitPlaneLayoutConversion) {
@@ -969,6 +999,38 @@ TEST(BackendRegistryTest, ConvertsProbeAllocationFailureToResourceExhausted) {
     EXPECT_TRUE(status.message().empty());
 }
 
+TEST(BackendRegistryTest, ConvertsOrdinaryProbeExceptionDuringRegistrationToInternal) {
+    eavp::BackendRegistry registry;
+    const std::shared_ptr<eavp::MediaBackendProvider> provider(
+        new ThrowingProbeProvider(true));
+
+    const eavp::Status status = registry.register_provider(provider);
+
+    EXPECT_EQ(eavp::StatusCode::kInternal, status.code());
+    EXPECT_TRUE(status.message().empty());
+}
+
+TEST(BackendRegistryTest, ConvertsOrdinaryProbeExceptionDuringSelectionToInternal) {
+    eavp::BackendRegistry encoder_registry;
+    ASSERT_TRUE(encoder_registry.register_provider(
+        std::shared_ptr<eavp::MediaBackendProvider>(
+            new ThrowingProbeProvider(false))).ok());
+    ASSERT_TRUE(encoder_registry.freeze().ok());
+    EXPECT_EQ(eavp::StatusCode::kInternal,
+              encoder_registry.select_video_encoder(
+                  make_encoder_request_with_preferences(no_preferences()))
+                  .status().code());
+
+    eavp::BackendRegistry processor_registry;
+    ASSERT_TRUE(processor_registry.register_provider(
+        std::shared_ptr<eavp::MediaBackendProvider>(
+            new ThrowingProbeProvider(false))).ok());
+    ASSERT_TRUE(processor_registry.freeze().ok());
+    EXPECT_EQ(eavp::StatusCode::kInternal,
+              processor_registry.select_video_processor(make_processor_request())
+                  .status().code());
+}
+
 TEST(BackendRegistryTest, SelectionIsIndependentOfRegistrationOrder) {
     eavp::BackendRegistry forward;
     ASSERT_TRUE(
@@ -1241,6 +1303,20 @@ TEST(ReferenceBackendTest, AdvertisesOnlyTheBehaviorItImplements) {
     ASSERT_EQ(1U, capability.encoder_capabilities().size());
     EXPECT_EQ(eavp::CodecId::kReference,
               capability.encoder_capabilities()[0].codec());
+}
+
+TEST(ReferenceBackendTest, InvalidStateKeepsTheOperationDescription) {
+    const std::shared_ptr<eavp::MediaBackendProvider> provider =
+        eavp::create_reference_backend(eavp::ReferenceBackendOptions());
+    ASSERT_TRUE(provider.get() != NULL);
+    eavp::Result<std::unique_ptr<eavp::VideoEncoder> > created =
+        provider->create_video_encoder();
+    ASSERT_TRUE(created.ok());
+
+    const eavp::Status status = created.value()->begin_drain();
+
+    EXPECT_EQ(eavp::StatusCode::kInvalidState, status.code());
+    EXPECT_NE(std::string::npos, status.message().find("drain"));
 }
 
 TEST(ReferenceBackendTest,

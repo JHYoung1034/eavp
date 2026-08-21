@@ -15,8 +15,14 @@ std::string PipelineReconciler::error_key() const {
 }
 
 Status PipelineReconciler::publish_failure(const Status& failure) {
-    actual_->set(state_key(), StateValue("error"));
-    actual_->set(error_key(), StateValue(failure.message()));
+    Status status = actual_->set(state_key(), StateValue("error"));
+    if (!status.ok()) {
+        return status;
+    }
+    status = actual_->set(error_key(), StateValue(failure.message()));
+    if (!status.ok()) {
+        return status;
+    }
     return failure;
 }
 
@@ -37,7 +43,7 @@ Status PipelineReconciler::reconcile_once() {
     if (actual_value.ok()) {
         const Result<std::string> actual_state = actual_value.value().as_string();
         if (actual_state.ok() && actual_state.value() == desired_state.value()) {
-            return Status::ok_status();
+            return actual_->erase(error_key());
         }
     }
 
@@ -51,10 +57,15 @@ Status PipelineReconciler::reconcile_once() {
     }
     if (!result.ok()) {
         if (result.code() == StatusCode::kWouldBlock) {
-            actual_->set(state_key(), StateValue("draining"));
-            return result;
+            const Status publish =
+                actual_->set(state_key(), StateValue("draining"));
+            return publish.ok() ? result : publish;
         }
         return publish_failure(result);
+    }
+    const Status clear = actual_->erase(error_key());
+    if (!clear.ok()) {
+        return clear;
     }
     return actual_->set(state_key(), StateValue(desired_state.value()));
 }

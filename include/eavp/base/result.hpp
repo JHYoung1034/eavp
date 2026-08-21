@@ -52,7 +52,10 @@ public:
 
     T take_value() {
         assert(ok());
-        return std::move(*value_);
+        T value(std::move(*value_));
+        value_.reset();
+        status_ = Status(StatusCode::kInvalidState);
+        return value;
     }
 
 private:

@@ -55,6 +55,9 @@ TEST(ReferenceMediaPlatformTest,
     EXPECT_EQ("submit",
               queried.value().get("/pipelines/reference0/error/operation")
                   .value().as_string().value());
+    EXPECT_EQ("reference backend injected device loss",
+              queried.value().get("/pipelines/reference0/error")
+                  .value().as_string().value());
     EXPECT_EQ(eavp::HealthStatus::kError, platform.health().aggregate());
     EXPECT_EQ(2U, platform.metrics()
                       .counter("media.backend.instances.created").value());
@@ -66,6 +69,17 @@ TEST(ReferenceMediaPlatformTest,
     ASSERT_TRUE(queried.ok());
     EXPECT_EQ("running", queried.value().get("/pipelines/reference0/state")
                              .value().as_string().value());
+    EXPECT_EQ(eavp::StatusCode::kNotFound,
+              queried.value().get("/pipelines/reference0/error").status().code());
+    EXPECT_EQ(eavp::StatusCode::kNotFound,
+              queried.value().get("/pipelines/reference0/error/provider")
+                  .status().code());
+    EXPECT_EQ(eavp::StatusCode::kNotFound,
+              queried.value().get("/pipelines/reference0/error/operation")
+                  .status().code());
+    EXPECT_EQ(eavp::StatusCode::kNotFound,
+              queried.value().get("/pipelines/reference0/error/message")
+                  .status().code());
     EXPECT_EQ(4U, platform.metrics()
                       .counter("media.backend.instances.created").value());
     ASSERT_TRUE(platform.tick(2U).ok());

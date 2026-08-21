@@ -23,6 +23,8 @@ enum class MapMode {
     kReadWrite,
 };
 
+Result<std::string> memory_domain_name(MemoryDomain memory_domain) noexcept;
+
 struct PlaneLayout {
     PlaneLayout(std::size_t offset_value, std::size_t size_value, std::size_t stride_value)
         : offset(offset_value), size(size_value), stride(stride_value) {}
@@ -56,6 +58,8 @@ public:
 
     virtual MemoryDomain memory_domain() const = 0;
     virtual std::size_t capacity() const = 0;
+    // 返回存储起始地址由分配器保证的最小对齐；plane 的实际保证还需计入 offset。
+    virtual std::size_t address_alignment() const { return 1U; }
     virtual const std::string& provider_id() const = 0;
     virtual Status map(MapMode mode, std::uint8_t** data, std::size_t* size) = 0;
     virtual Status unmap() = 0;
@@ -72,19 +76,22 @@ public:
     MappedRegion& operator=(const MappedRegion&) = delete;
 
     const std::uint8_t* data() const { return data_; }
-    std::uint8_t* mutable_data() { return data_; }
+    std::uint8_t* mutable_data() {
+        return mode_ == MapMode::kReadWrite ? data_ : NULL;
+    }
     std::size_t size() const { return size_; }
 
 private:
     friend class Buffer;
 
     MappedRegion(const std::shared_ptr<BufferStorage>& storage, std::uint8_t* data,
-                 std::size_t size);
+                 std::size_t size, MapMode mode);
     void unmap();
 
     std::shared_ptr<BufferStorage> storage_;
     std::uint8_t* data_;
     std::size_t size_;
+    MapMode mode_;
 };
 
 class Buffer {
@@ -98,6 +105,7 @@ public:
     Result<Buffer> slice(std::size_t offset, std::size_t length) const;
     Result<Buffer> slice_plane(std::size_t plane_index, std::size_t offset,
                                std::size_t length) const;
+    Result<std::size_t> plane_address_alignment(std::size_t plane_index) const;
 
     MemoryDomain memory_domain() const { return storage_->memory_domain(); }
     std::size_t plane_count() const { return planes_.size(); }
