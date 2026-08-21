@@ -922,14 +922,18 @@ ctest --preset linux-asan-fetch-deps --output-on-failure
 
 Expected: 所有测试通过，无 sanitizer 报告、文件描述符或映射生命周期错误。
 
-- [ ] **Step 8: 运行 aarch64 交叉构建**
+- [ ] **Step 8: 运行三套 ARM 交叉构建**
 
 ```bash
+cmake --preset rockchip-armhf-release
+cmake --build --preset rockchip-armhf-release
+cmake --preset hisiv600-release
+cmake --build --preset hisiv600-release
 cmake --preset aarch64-release
 cmake --build --preset aarch64-release
 ```
 
-Expected: 五个公开 target 和新增 0.2 实现全部编译链接成功，不下载或运行测试。
+Expected: 三套预设均使用对应交叉编译器完成五个公开 target 和 0.2 实现的编译链接，不下载或运行测试；ARM32 对象为 `Machine: ARM`，aarch64 对象为 `Machine: AArch64`。只有三套实际通过后才勾选本步骤。
 
 - [x] **Step 9: 记录验证结果并勾选计划**
 
@@ -960,3 +964,5 @@ git commit -m "docs: 完成 Media Backend Foundation 0.2 基线"
 - 2026-08-20：生命周期回归 RED 为 `ctest --test-dir build/linux-asan-fetch-deps -R 'ReferenceMediaPlatformTest.(ProcessesOneHundredFramesAndPublishesSelection|DeviceLossPublishesStructuredErrorAndExplicitResetRebuildsPipeline)' --output-on-failure`，结果 `0/2`，AddressSanitizer 报告析构期 heap-use-after-free。通过调整 ReferenceMediaPlatform 和 SimulatedPlatform 成员声明顺序，使 pipeline/reconciler 在其借用的服务之前析构；同一聚焦命令转为 `2/2`。随后 `ctest --preset linux-asan-fetch-deps --output-on-failure` 为 `95/95`，无 sanitizer 报告，Step 7 已勾选。
 - 2026-08-20：`command -v aarch64-linux-gnu-gcc` 和 `command -v aarch64-linux-gnu-g++` 均无输出。toolchain 文件明确要求这两个名称；`cmake --preset aarch64-release` 退出 1，CMake 报告两个编译器不在 PATH，未执行 build（记录为退出 125）。未下载依赖、未运行交叉测试，Step 8 保持未勾选。
 - 2026-08-20：`git diff --check` 退出 0。原始占位符命令仅命中 `docs/standards/project-conventions.md` 中解释“不得留下未解释的 `TODO` 或 `TBD`”的规范文字，故按语义排除该解释性术语和计划目录后重新检查，退出 0；未删除有意义规范。
+- 2026-08-21：先执行 `cmake --preset rockchip-armhf-release` 与 `cmake --preset hisiv600-release`，两者均以“`No such preset`”退出 1，确认两个 ARM32 验证入口在实现前缺失。新增预设及 toolchain 后，Rockchip 的 `arm-linux-gnueabihf-gcc/g++` 为 8.3.0，海思 v600 的 `arm-hisiv600-linux-gcc/g++` 为 4.9.4；各自 `cmake --preset` 与 `cmake --build --preset` 均退出 0，实际 `backend_registry.cpp.o` 分别报告 `ELF32` 与 `Machine: ARM`。三套原生 `linux-debug-fetch-deps`、`linux-release-fetch-deps`、`linux-asan-fetch-deps` 的 configure/build/CTest 均退出 0、各为 `95/95`（包含安装 consumer）。
+- 2026-08-21：当前 PATH 可解析 aarch64 编译器，`aarch64-linux-gnu-gcc/g++` 均为 GCC 16.1.0；但 `cmake --preset aarch64-release` 退出 1，编译器调用的 `as` 报告 `unrecognized option '-EL'`。按环境指示将 `/home/yjh/work/toolchain/usr/bin` 前置 PATH 后重试，错误未变；未执行 build（退出 125），没有 aarch64 `.o` 可作 `Machine: AArch64` 检查。Step 8 保持未勾选，不能将三套 ARM 交叉构建宣称为全部通过。

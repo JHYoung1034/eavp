@@ -9,7 +9,7 @@ EAVP（Embedded Audio/Video Platform）是面向 Embedded Linux 音视频设备�
 - Provider Capability、冻结后的确定性 BackendRegistry，以及仅用于测试和集成验证的 Reference Backend。
 - Command/Query、Desired/Actual StateStore 与幂等 Reconciler。
 - Counter、Gauge、Health，以及单进程模拟媒体纵切面。
-- Linux x86_64 原生构建和通用 aarch64 交叉编译配置。
+- Linux x86_64 原生构建，以及通用 aarch64、Rockchip ARM32 和海思 v600 ARM32 的交叉编译验证配置。
 
 Reference Backend 产生的是内部确定性 `kReference` payload，不是标准 H.264/H.265 码流。真实 V4L2、ALSA、FFmpeg、硬件编解码、容器和网络协议、RPC、Web API 与 Service Mode 均不属于 0.2.0。
 
@@ -32,6 +32,8 @@ ctest --preset linux-debug-fetch-deps
 Release 和 Sanitizer 环境没有系统 GoogleTest 时，分别使用 `linux-release-fetch-deps` 和 `linux-asan-fetch-deps`。
 
 安装和消费示例见 `docs/architecture/build-and-portability.md`。
+
+ARM 交叉构建仅验证 Core 和 Reference Backend 可被对应编译器生成和链接；不代表 Rockchip MPP/RGA 或海思 HI_MPI 已接入或完成验证。
 
 ## 文档
 

@@ -78,6 +78,28 @@
         "EAVP_BUILD_EXAMPLES": "OFF",
         "EAVP_FETCH_TEST_DEPS": "OFF"
       }
+    },
+    {
+      "name": "rockchip-armhf-release",
+      "inherits": "linux-base",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/arm-linux-gnueabihf.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "EAVP_BUILD_TESTS": "OFF",
+        "EAVP_BUILD_EXAMPLES": "OFF",
+        "EAVP_FETCH_TEST_DEPS": "OFF"
+      }
+    },
+    {
+      "name": "hisiv600-release",
+      "inherits": "linux-base",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/arm-hisiv600-linux.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "EAVP_BUILD_TESTS": "OFF",
+        "EAVP_BUILD_EXAMPLES": "OFF",
+        "EAVP_FETCH_TEST_DEPS": "OFF"
+      }
     }
   ],
   "buildPresets": [
@@ -87,7 +109,9 @@
     { "name": "linux-release-fetch-deps", "configurePreset": "linux-release-fetch-deps" },
     { "name": "linux-asan", "configurePreset": "linux-asan" },
     { "name": "linux-asan-fetch-deps", "configurePreset": "linux-asan-fetch-deps" },
-    { "name": "aarch64-release", "configurePreset": "aarch64-release" }
+    { "name": "aarch64-release", "configurePreset": "aarch64-release" },
+    { "name": "rockchip-armhf-release", "configurePreset": "rockchip-armhf-release" },
+    { "name": "hisiv600-release", "configurePreset": "hisiv600-release" }
   ],
   "testPresets": [
     {
