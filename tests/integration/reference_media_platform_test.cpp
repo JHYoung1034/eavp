@@ -96,6 +96,34 @@ TEST(ReferenceMediaPlatformTest, ResetIsRejectedUnlessPipelineIsInError) {
 }
 
 TEST(ReferenceMediaPlatformTest,
+     ResetPreservesErroredPipelineAfterFirstTeardownFailure) {
+    eavp::ReferenceBackendOptions options;
+    options.device_lost_after_submissions = 1U;
+    options.encoder_reset_would_block_once = true;
+    eavp::ReferenceMediaPlatform platform(options);
+    ASSERT_TRUE(platform.initialize().ok());
+    ASSERT_TRUE(platform.dispatch(eavp::StartPipelineCommand(
+        "start-reset-failure", "integration", "reference0")).ok());
+    ASSERT_TRUE(platform.reconcile_once().ok());
+    ASSERT_EQ(eavp::StatusCode::kDeviceLost, platform.tick(2U).code());
+    const std::uint64_t instances_before_reset =
+        platform.metrics().counter("media.backend.instances.created").value();
+
+    const eavp::Status reset_status = platform.reset_pipeline();
+
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock, reset_status.code());
+    eavp::Result<eavp::StateSnapshot> queried =
+        platform.query(eavp::PipelineStateQuery("reference0"));
+    ASSERT_TRUE(queried.ok());
+    EXPECT_EQ("error", queried.value().get("/pipelines/reference0/state")
+                           .value().as_string().value());
+    EXPECT_EQ(instances_before_reset,
+              platform.metrics()
+                  .counter("media.backend.instances.created").value());
+    EXPECT_EQ(eavp::HealthStatus::kError, platform.health().aggregate());
+}
+
+TEST(ReferenceMediaPlatformTest,
      DrainBackpressureRemainsHealthyUntilRepeatedReconcileStopsPipeline) {
     eavp::ReferenceBackendOptions options;
     options.output_delay = 1U;

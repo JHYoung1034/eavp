@@ -592,10 +592,6 @@ Status ReferenceMediaPlatform::reset_pipeline() {
                       "only an errored pipeline can be reset");
     }
     Status status = pipeline_->stop();
-    if (status.code() == StatusCode::kWouldBlock ||
-        status.code() == StatusCode::kNotFound) {
-        status = pipeline_->cancel();
-    }
     if (!status.ok()) {
         return status;
     }

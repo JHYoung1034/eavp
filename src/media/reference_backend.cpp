@@ -318,6 +318,7 @@ public:
     explicit ReferenceEncoder(const ReferenceBackendOptions& options)
         : options_(options),
           state_(BackendState::kCreated),
+          reset_would_blocked_(false),
           successful_submissions_(0U) {}
 
     BackendState state() const { return state_; }
@@ -460,6 +461,12 @@ public:
         if (!affinity.ok()) {
             return affinity;
         }
+        if (options_.encoder_reset_would_block_once &&
+            !reset_would_blocked_) {
+            reset_would_blocked_ = true;
+            return Status(StatusCode::kWouldBlock,
+                          "reference encoder injected reset backpressure");
+        }
         queue_.clear();
         input_format_.reset();
         config_.reset();
@@ -530,6 +537,7 @@ private:
 
     ReferenceBackendOptions options_;
     BackendState state_;
+    bool reset_would_blocked_;
     std::size_t successful_submissions_;
     std::unique_ptr<VideoFormat> input_format_;
     std::unique_ptr<VideoEncoderConfig> config_;
