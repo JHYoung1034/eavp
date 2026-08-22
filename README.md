@@ -39,6 +39,8 @@ ARM 交叉构建仅验证 Core 和 Reference Backend 可被对应编译器生成
 
 - `embedded_av_product_platform_architecture.md`：平台长期愿景。
 - `docs/superpowers/specs/2026-08-18-eavp-media-backend-foundation-design.md`：Media Backend Foundation 0.2 规范。
+- `docs/superpowers/specs/2026-08-21-eavp-linux-v4l2-capture-design.md`：Linux V4L2 Capture 0.3a 设计规格。
+- `docs/superpowers/specs/2026-08-22-eavp-linux-alsa-capture-design.md`：Linux ALSA Capture 0.3b 设计规格。
 - `docs/migrations/0.1-to-0.2.md`：从 0.1 到 0.2 的 API 迁移说明。
 - `docs/architecture/README.md`：规范性架构文档索引。
 - `docs/roadmap.md`：后续产品化路线。

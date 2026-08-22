@@ -11,9 +11,11 @@
 EAVP 0.2 已建立 Buffer、VideoFrame、类型化 Port、Pipeline、Capability、Backend Registry 和 Reference Backend。开发机上的 Intel GPU 只用于验证架构和数据流，不是嵌入式 ARM 产品的兼容目标。为让每个交付都可独立验收，0.3 Linux Native 拆分为：
 
 - **0.3a**：V4L2 单平面 MMAP 采集，输出平台拥有的 CPU VideoFrame；
-- **0.3b**：开发机可选 FFmpeg 软件编码 Backend，以 libx264/libx265 验证标准 H.264/H.265 数据流。
+- **0.3b**：ALSA 非阻塞 PCM 采集，输出平台拥有的 CPU AudioFrame；
+- **0.3c**：开发机可选 FFmpeg 软件编码 Backend，以 libx264、libx265、FFmpeg AAC encoder 和 libopus 验证 H.264、H.265、AAC 与 Opus 数据流；
+- **0.3d**：V4L2 与 ALSA 同时采集，测量共同单调时钟域下的偏差和漂移。
 
-0.3b 不要求兼容旧 Intel GPU，也不把 oneVPL、VA-API 或 FFmpeg 带入 ARM 生产依赖。开发机已具备 FFmpeg 6.1.1、`libavcodec 60.31.102` 和 `libavutil 58.29.100`；系统 libavcodec 已启用 libx264 与 libx265，后端可统一通过 libavcodec API 选择软件编码器。
+0.3c 不要求兼容旧 Intel GPU，也不把 oneVPL、VA-API 或 FFmpeg 带入 ARM 生产依赖。开发机已具备 FFmpeg 6.1.1、`libavcodec 60.31.102` 和 `libavutil 58.29.100`；系统 libavcodec 已启用 libx264 与 libx265，后端可统一通过 libavcodec API 选择软件编码器。
 
 ## 2. 目标
 
@@ -110,7 +112,7 @@ EAVP::platform
         └── EAVP::base
 ```
 
-`media` 不包含 `<linux/videodev2.h>`，不依赖 platform。0.3b 的开发机验证实现使用独立可选 build-tree target `EAVP::backend_ffmpeg -> EAVP::media`，不反向进入 Core，不安装或导出。
+`media` 不包含 `<linux/videodev2.h>`，不依赖 platform。0.3c 的开发机验证实现使用独立可选 build-tree target `EAVP::backend_ffmpeg -> EAVP::media`，不反向进入 Core，不安装或导出。
 
 ## 5. 格式与内存契约
 
@@ -289,9 +291,9 @@ Fake V4L2System 必须覆盖：
 8. 文档以简体中文为主，无未解释的占位标记；
 9. 不宣称 DMABUF 零拷贝、FFmpeg 编码 Backend、oneVPL、VA-API、MPP/RGA 或 `HI_MPI` 已实现。
 
-## 13. 0.3b 开发机 FFmpeg 软件编码验证
+## 13. 0.3c 开发机 FFmpeg 软件编码验证
 
-0.3b 按独立规格实现，不属于 0.3a 交付范围。保留的数据流为：
+0.3c 按独立规格实现，不属于 0.3a 交付范围。保留的数据流为：
 
 ```text
 V4L2 YUV420P CPU Frame
@@ -299,27 +301,34 @@ V4L2 YUV420P CPU Frame
   -> libavcodec
   -> libx264 H.264 或 libx265 H.265
   -> Annex-B MediaPacket
+
+ALSA interleaved CPU AudioFrame
+  -> frame aggregation / sample format conversion
+  -> FFmpeg AAC encoder 或 libopus
+  -> AAC 或 Opus MediaPacket
 ```
 
 ### 13.1 Target 与依赖
 
 - 新增 `EAVP_ENABLE_FFMPEG_BACKEND=OFF`，默认关闭；
-- 新增 build-tree alias `EAVP::backend_ffmpeg`，只依赖 `EAVP::media`、libavcodec 与 libavutil；
+- 新增 build-tree alias `EAVP::backend_ffmpeg`，只依赖 `EAVP::media` 与所需的 libavcodec、libavutil；音频转换确有需要时可增加只属于该可选 Backend 的 libswresample；
 - 不直接包含 x264/x265 头文件，通过 `avcodec_find_encoder_by_name("libx264")` 和 `avcodec_find_encoder_by_name("libx265")` 选择实现；
-- 不依赖 libswscale，首期仅接收 CPU YUV420P/NV12；
+- 不依赖 libswscale，视频首期仅接收 CPU YUV420P/NV12；
 - target 不安装、不导出，三套 ARM preset 强制关闭；
 - Rockchip MPP/RGA 与海思 `HI_MPI` 继续使用各自独立 Provider 和硬件规格。
 
 ### 13.2 Encoder 契约
 
-FFmpeg Provider 实现现有 `MediaBackendProvider` 和 `VideoEncoder`，不扩展 Core 公共接口：
+FFmpeg Provider 的视频路径实现现有 `MediaBackendProvider` 和 `VideoEncoder`；音频路径按 0.3c 独立规格增加平台无关 `AudioEncoder`、Capability 和 Registry selection：
 
 - H.264 使用 libx264，H.265 使用 libx265；编码器不存在时 probe 不声明相应 Capability；
+- AAC 使用 FFmpeg AAC encoder，Opus 使用 libopus；不可用时 probe 不声明相应 Capability；
 - submit 将 EAVP CPU Frame 逐 plane、逐行复制到 `AVFrame`，不宣称零拷贝；
 - `avcodec_send_frame` 的 `AVERROR(EAGAIN)` 映射为 `kWouldBlock`，输入不得被视为已消费；
 - receive 使用 `avcodec_receive_packet`，EAGAIN 映射为 `kWouldBlock`，EOF 映射为稳定 `kEndOfStream`；
 - begin_drain 在空 Frame 被接受前允许因 EAGAIN 返回 `kWouldBlock` 并在后续调用重试；一旦接受则标记 Draining，不再重复提交，随后持续 receive 直到 EOF；
 - H.264/H.265 输出分别标记为 `CodecId::kH264/kH265` 与 `EncodedStreamFormat::kAnnexB`，保留 PTS/DTS；
+- AAC/Opus Packet 的 stream format、codec config、frame aggregation、PTS/DTS/duration 由 0.3c 独立规格冻结；原始 AudioFrame 不增加 DTS；
 - reset 释放 AVPacket、AVFrame、AVCodecContext，并回到 Created；
 - 后端不创建 EAVP 私有线程；确定性测试把 FFmpeg codec thread count 固定为 1。
 
@@ -327,7 +336,7 @@ FFmpeg Provider 实现现有 `MediaBackendProvider` 和 `VideoEncoder`，不扩�
 
 FFmpeg 错误转换为 enriched Status：`provider_id="ffmpeg"`、operation 为具体 libavcodec API、native code 为负 `AVERROR`，消息由 `av_strerror` 生成；异常不得跨公共边界。
 
-0.3b 的确定性测试使用合成 YUV420P/NV12 Frame，分别编码 H.264/H.265，再通过 libavcodec decoder 在进程内验证码流可解码、帧数、尺寸和 PTS。真实纵切面复用 V4L2 Source，验证 `V4L2 -> FFmpeg Encoder -> Annex-B Packet`；不引入正式 FileSink 或容器模块。
+0.3c 的确定性测试使用合成 YUV420P/NV12 Frame 和 PCM AudioFrame，分别编码 H.264/H.265/AAC/Opus，再通过 libavcodec decoder 在进程内验证码流可解码、帧数、格式和时间戳。真实纵切面复用 V4L2 与 ALSA Source；不引入正式 FileSink、容器模块或音视频复用。
 
 FFmpeg Backend 只验证平台架构、Backend 契约和标准码流数据流，不代表 ARM 产品将携带 FFmpeg。嵌入式部署仍优先使用 SoC 厂商媒体接口。
 

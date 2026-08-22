@@ -1,12 +1,12 @@
 # EAVP 产品化路线图
 
-> 状态：当前里程碑为 Media Backend Foundation 0.2\
+> 状态：稳定基线为 Media Backend Foundation 0.2，当前处于 0.3 Linux Native 设计阶段\
 > 适用版本：0.2.0 之后\
 > 规范性范围：里程碑顺序，不冻结接口
 
 1. **Core 0.1（已完成）**：纯软件核心、状态收敛、可观测模拟纵切面。
-2. **Media Backend Foundation 0.2（当前）**：显式 Buffer/Format、Capability、Provider 选择和 Reference Backend；Reference payload 不是标准码流。
-3. **0.3 Linux Native**：0.3a 实现 V4L2 CPU Frame 采集；0.3b 使用开发机可选 FFmpeg/libx264/libx265 Backend 验证标准编码数据流，不作为 ARM 产品依赖。
+2. **Media Backend Foundation 0.2（稳定基线）**：显式 Buffer/Format、Capability、Provider 选择和 Reference Backend；Reference payload 不是标准码流。
+3. **0.3 Linux Native**：0.3a 实现 V4L2 CPU VideoFrame 采集；0.3b 实现 ALSA CPU AudioFrame 采集；0.3c 使用开发机可选 FFmpeg Backend 验证 libx264 H.264、libx265 H.265、AAC 和 libopus Opus 编码，不作为 ARM 产品依赖；0.3d 同时采集音视频，在共同单调时钟域内测量偏差和漂移，首期不自动校正。
 4. **0.4 Container**：自研 MPEG-TS、H.264/H.265 bitstream 转换和 FileSink。
 5. **0.5 WebRTC**：优先实现 WebRTC 媒体传输与 WHIP，密码能力由 CryptoProvider 提供。
 6. **0.6 RTMP/FLV**：自研 FLV、AMF 和 RTMP/E-RTMP。
