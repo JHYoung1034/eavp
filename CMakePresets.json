@@ -23,7 +23,8 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "EAVP_BUILD_TESTS": "ON",
         "EAVP_BUILD_EXAMPLES": "ON",
-        "EAVP_FETCH_TEST_DEPS": "OFF"
+        "EAVP_FETCH_TEST_DEPS": "OFF",
+        "EAVP_ENABLE_ALSA": "ON"
       }
     },
     {
@@ -40,7 +41,8 @@
         "CMAKE_BUILD_TYPE": "Release",
         "EAVP_BUILD_TESTS": "ON",
         "EAVP_BUILD_EXAMPLES": "ON",
-        "EAVP_FETCH_TEST_DEPS": "OFF"
+        "EAVP_FETCH_TEST_DEPS": "OFF",
+        "EAVP_ENABLE_ALSA": "ON"
       }
     },
     {
@@ -58,7 +60,8 @@
         "EAVP_BUILD_TESTS": "ON",
         "EAVP_BUILD_EXAMPLES": "ON",
         "EAVP_FETCH_TEST_DEPS": "OFF",
-        "EAVP_ENABLE_SANITIZERS": "ON"
+        "EAVP_ENABLE_SANITIZERS": "ON",
+        "EAVP_ENABLE_ALSA": "ON"
       }
     },
     {
@@ -76,7 +79,8 @@
         "CMAKE_BUILD_TYPE": "Release",
         "EAVP_BUILD_TESTS": "OFF",
         "EAVP_BUILD_EXAMPLES": "OFF",
-        "EAVP_FETCH_TEST_DEPS": "OFF"
+        "EAVP_FETCH_TEST_DEPS": "OFF",
+        "EAVP_ENABLE_ALSA": "OFF"
       }
     },
     {
@@ -87,7 +91,8 @@
         "CMAKE_BUILD_TYPE": "Release",
         "EAVP_BUILD_TESTS": "OFF",
         "EAVP_BUILD_EXAMPLES": "OFF",
-        "EAVP_FETCH_TEST_DEPS": "OFF"
+        "EAVP_FETCH_TEST_DEPS": "OFF",
+        "EAVP_ENABLE_ALSA": "OFF"
       }
     },
     {
@@ -98,7 +103,8 @@
         "CMAKE_BUILD_TYPE": "Release",
         "EAVP_BUILD_TESTS": "OFF",
         "EAVP_BUILD_EXAMPLES": "OFF",
-        "EAVP_FETCH_TEST_DEPS": "OFF"
+        "EAVP_FETCH_TEST_DEPS": "OFF",
+        "EAVP_ENABLE_ALSA": "OFF"
       }
     }
   ],

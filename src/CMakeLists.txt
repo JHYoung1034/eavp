@@ -101,11 +101,17 @@ add_library(eavp_platform STATIC
     platform/simulated_platform.cpp
 )
 add_library(EAVP::platform ALIAS eavp_platform)
+if(EAVP_ENABLE_ALSA)
+    target_sources(eavp_platform PRIVATE platform/linux/alsa_capture.cpp)
+endif()
 target_link_libraries(
     eavp_platform
     PUBLIC EAVP::control EAVP::management
     PRIVATE $<BUILD_INTERFACE:eavp_project_options>
 )
+if(EAVP_ENABLE_ALSA)
+    target_link_libraries(eavp_platform PUBLIC ALSA::ALSA)
+endif()
 target_include_directories(
     eavp_platform
     PUBLIC
