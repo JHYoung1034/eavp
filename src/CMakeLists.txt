@@ -17,6 +17,8 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/eavp/base
         OPTIONAL)
 
 add_library(eavp_media STATIC
+    media/audio_format.cpp
+    media/audio_frame.cpp
     media/backend_node.cpp
     media/backend_registry.cpp
     media/buffer.cpp

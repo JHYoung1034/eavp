@@ -5,17 +5,11 @@
 #include <new>
 
 #include "eavp/base/time.hpp"
+#include "eavp/media/audio_format.hpp"
 #include "eavp/media/buffer.hpp"
 #include "eavp/media/video_format.hpp"
 
 namespace eavp {
-
-enum class SampleFormat {
-    kUnknown,
-    kSigned16,
-    kSigned32,
-    kFloat32,
-};
 
 class VideoFrame {
 public:
@@ -72,43 +66,33 @@ private:
 
 class AudioFrame {
 public:
-    static Result<AudioFrame> create(const Buffer& buffer, SampleFormat format, int sample_rate,
-                                     int channels, int samples, std::int64_t pts,
-                                     const TimeBase& time_base) {
-        if (sample_rate <= 0 || channels <= 0 || samples <= 0) {
-            return Result<AudioFrame>(
-                Status(StatusCode::kInvalidArgument, "audio frame shape must be positive"));
-        }
-        return Result<AudioFrame>(
-            AudioFrame(buffer, format, sample_rate, channels, samples, pts, time_base));
-    }
+    static Result<AudioFrame> create(const Buffer& buffer, const AudioFormat& format,
+                                     int samples_per_channel, std::int64_t pts,
+                                     const TimeBase& time_base, bool discontinuity);
 
     const Buffer& buffer() const { return buffer_; }
-    SampleFormat format() const { return format_; }
-    int sample_rate() const { return sample_rate_; }
-    int channels() const { return channels_; }
-    int samples() const { return samples_; }
+    const AudioFormat& format() const { return format_; }
+    int samples_per_channel() const { return samples_per_channel_; }
     std::int64_t pts() const { return pts_; }
     const TimeBase& time_base() const { return time_base_; }
+    bool discontinuity() const { return discontinuity_; }
 
 private:
-    AudioFrame(const Buffer& buffer, SampleFormat format, int sample_rate, int channels,
-               int samples, std::int64_t pts, const TimeBase& time_base)
+    AudioFrame(const Buffer& buffer, const AudioFormat& format, int samples_per_channel,
+               std::int64_t pts, const TimeBase& time_base, bool discontinuity)
         : buffer_(buffer),
           format_(format),
-          sample_rate_(sample_rate),
-          channels_(channels),
-          samples_(samples),
+          samples_per_channel_(samples_per_channel),
           pts_(pts),
-          time_base_(time_base) {}
+          time_base_(time_base),
+          discontinuity_(discontinuity) {}
 
     Buffer buffer_;
-    SampleFormat format_;
-    int sample_rate_;
-    int channels_;
-    int samples_;
+    AudioFormat format_;
+    int samples_per_channel_;
     std::int64_t pts_;
     TimeBase time_base_;
+    bool discontinuity_;
 };
 
 }  // namespace eavp
