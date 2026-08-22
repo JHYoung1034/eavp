@@ -3,6 +3,8 @@
 #include <cerrno>
 #include <limits>
 #include <memory>
+#include <new>
+#include <stdexcept>
 
 #include "eavp/management/health.hpp"
 #include "eavp/management/metrics.hpp"
@@ -25,11 +27,12 @@ eavp::AudioFormat make_test_audio_format() {
 class NodeFixture {
 public:
     NodeFixture(std::unique_ptr<eavp::detail::AlsaSystem> system,
-                const eavp::AlsaCaptureConfig& config, std::size_t capacity = 4U)
+                const eavp::AlsaCaptureConfig& config, std::size_t capacity = 4U,
+                eavp::detail::AlsaObserver* observer = NULL)
         : metrics(), health(), input("audio_input", capacity,
                                      eavp::OverflowPolicy::kBlock), node() {
         node = eavp::detail::AlsaSourceNodeTestPeer::create(
-            "mic0", config, &metrics, &health, std::move(system)).take_value();
+            "mic0", config, &metrics, &health, std::move(system), observer).take_value();
         EXPECT_TRUE(eavp::connect(node->output(), input).ok());
     }
 
@@ -52,6 +55,44 @@ public:
     eavp::HealthManager health;
     eavp::InputPort<eavp::AudioFrame> input;
     std::unique_ptr<eavp::AlsaSourceNode> node;
+};
+
+class FailingAlsaObserver : public eavp::detail::AlsaObserver {
+public:
+    FailingAlsaObserver() : fail_next_report(false) {}
+
+    eavp::Status on_negotiated(int, int) override { return consume_failure(); }
+    eavp::Status on_partial(int) override { return consume_failure(); }
+    eavp::Status on_would_block() override { return consume_failure(); }
+    eavp::Status on_frame(const eavp::AudioFrame&) override { return consume_failure(); }
+    eavp::Status on_timestamp_fallback() override { return consume_failure(); }
+    eavp::Status on_recovery(bool) override { return consume_failure(); }
+    eavp::Status on_fatal(const eavp::Status&) override { return consume_failure(); }
+
+    bool fail_next_report;
+
+private:
+    eavp::Status consume_failure() {
+        if (!fail_next_report) return eavp::Status::ok_status();
+        fail_next_report = false;
+        return eavp::Status(eavp::StatusCode::kResourceExhausted,
+                            "observer failed");
+    }
+};
+
+class ThrowingAlsaObserver : public FailingAlsaObserver {
+public:
+    enum Failure { kBadAlloc, kUnexpected };
+
+    explicit ThrowingAlsaObserver(Failure failure) : failure_(failure) {}
+
+    eavp::Status on_would_block() override {
+        if (failure_ == kBadAlloc) throw std::bad_alloc();
+        throw std::runtime_error("observer threw");
+    }
+
+private:
+    Failure failure_;
 };
 
 TEST(AlsaCaptureConfigTest, AcceptsTheApprovedTenMillisecondShape) {
@@ -178,6 +219,165 @@ TEST(AlsaSourceNodeTest, XrunDropsPartialAndMarksExactlyOneFrame) {
     EXPECT_FALSE(fixture.take_frame()->discontinuity());
     EXPECT_EQ(1, source.prepare_after_xrun_calls());
     EXPECT_EQ(1, source.start_after_xrun_calls());
+}
+
+TEST(AlsaSourceNodeTest, PublishesFrameAndRecoveryObservability) {
+    eavp_test::ScriptedAlsa source;
+    source.read_frames.push_back(240);
+    source.read_errors.push_back(-EPIPE);
+    source.append_complete_frames(1);
+    NodeFixture fixture(source.take_system(), eavp_test::make_alsa_config(), 2U);
+    ASSERT_TRUE(fixture.start());
+    ASSERT_TRUE(fixture.tick_until_frames(1));
+
+    EXPECT_EQ(1U, fixture.metrics.counter("alsa_capture.mic0.frames").value());
+    EXPECT_EQ(480U, fixture.metrics.counter("alsa_capture.mic0.samples").value());
+    EXPECT_EQ(1920U, fixture.metrics.counter("alsa_capture.mic0.bytes").value());
+    EXPECT_EQ(1U, fixture.metrics.counter("alsa_capture.mic0.short_reads").value());
+    EXPECT_EQ(1U, fixture.metrics.counter("alsa_capture.mic0.xruns").value());
+    EXPECT_EQ(1U, fixture.metrics.counter("alsa_capture.mic0.recoveries").value());
+    EXPECT_EQ(1U, fixture.metrics.counter("alsa_capture.mic0.discontinuities").value());
+    EXPECT_DOUBLE_EQ(0.0,
+                     fixture.metrics.gauge("alsa_capture.mic0.partial_samples").value());
+    EXPECT_EQ(eavp::HealthStatus::kDegraded,
+              fixture.health.component("alsa_capture/mic0").value().status);
+}
+
+TEST(AlsaSourceNodeTest, PublishesNormalHealthAndNegotiatedGauges) {
+    eavp_test::ScriptedAlsa source;
+    NodeFixture fixture(source.take_system(), eavp_test::make_alsa_config());
+
+    ASSERT_TRUE(fixture.start());
+    EXPECT_EQ(eavp::HealthStatus::kOk,
+              fixture.health.component("alsa_capture/mic0").value().status);
+    EXPECT_DOUBLE_EQ(480.0,
+                     fixture.metrics.gauge("alsa_capture.mic0.actual_period_frames")
+                         .value());
+    EXPECT_DOUBLE_EQ(1920.0,
+                     fixture.metrics.gauge("alsa_capture.mic0.actual_buffer_frames")
+                         .value());
+}
+
+TEST(AlsaSourceNodeTest, PublishesTimestampFallbackAndPartialSamples) {
+    eavp_test::ScriptedAlsa source;
+    source.force_timestamp_fallback();
+    source.read_frames.push_back(240);
+    NodeFixture fixture(source.take_system(), eavp_test::make_alsa_config());
+    ASSERT_TRUE(fixture.start());
+
+    ASSERT_TRUE(fixture.tick_once_running().ok());
+    EXPECT_EQ(1U,
+              fixture.metrics.counter("alsa_capture.mic0.timestamp_fallbacks").value());
+    EXPECT_DOUBLE_EQ(240.0,
+                     fixture.metrics.gauge("alsa_capture.mic0.partial_samples").value());
+    EXPECT_EQ(eavp::HealthStatus::kDegraded,
+              fixture.health.component("alsa_capture/mic0").value().status);
+}
+
+TEST(AlsaSourceNodeTest, PublishesSuspendRecoveryOnce) {
+    eavp_test::ScriptedAlsa source;
+    source.read_errors.push_back(-ESTRPIPE);
+    source.resume_results.push_back(0);
+    source.append_complete_frames(1);
+    NodeFixture fixture(source.take_system(), eavp_test::make_alsa_config());
+    ASSERT_TRUE(fixture.start());
+    ASSERT_TRUE(fixture.tick_until_frames(1));
+
+    EXPECT_EQ(1U, fixture.metrics.counter("alsa_capture.mic0.suspends").value());
+    EXPECT_EQ(1U, fixture.metrics.counter("alsa_capture.mic0.recoveries").value());
+    EXPECT_EQ(1U, fixture.metrics.counter("alsa_capture.mic0.discontinuities").value());
+    EXPECT_EQ(2U, fixture.metrics.counter("alsa_capture.mic0.would_block").value());
+    EXPECT_EQ(eavp::HealthStatus::kDegraded,
+              fixture.health.component("alsa_capture/mic0").value().status);
+}
+
+TEST(AlsaSourceNodeTest, RecoveryClearsPartialSamplesGaugeBeforeTheNextFrame) {
+    eavp_test::ScriptedAlsa source;
+    source.read_frames.push_back(240);
+    source.read_errors.push_back(-EPIPE);
+    NodeFixture fixture(source.take_system(), eavp_test::make_alsa_config());
+    ASSERT_TRUE(fixture.start());
+
+    ASSERT_TRUE(fixture.tick_once_running().ok());
+    EXPECT_DOUBLE_EQ(240.0,
+                     fixture.metrics.gauge("alsa_capture.mic0.partial_samples").value());
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock, fixture.tick_once_running().code());
+    EXPECT_DOUBLE_EQ(0.0,
+                     fixture.metrics.gauge("alsa_capture.mic0.partial_samples").value());
+}
+
+TEST(AlsaSourceNodeTest, ResetRestoresOkHealthAfterRecovery) {
+    eavp_test::ScriptedAlsa source;
+    source.read_errors.push_back(-EPIPE);
+    NodeFixture fixture(source.take_system(), eavp_test::make_alsa_config());
+    ASSERT_TRUE(fixture.start());
+
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock, fixture.tick_once_running().code());
+    ASSERT_EQ(eavp::HealthStatus::kDegraded,
+              fixture.health.component("alsa_capture/mic0").value().status);
+    ASSERT_TRUE(fixture.node->reset().ok());
+    EXPECT_EQ(eavp::HealthStatus::kOk,
+              fixture.health.component("alsa_capture/mic0").value().status);
+}
+
+TEST(AlsaSourceNodeTest, DeviceLostPublishesErrorHealth) {
+    eavp_test::ScriptedAlsa source;
+    source.read_errors.push_back(-ENODEV);
+    NodeFixture fixture(source.take_system(), eavp_test::make_alsa_config());
+    ASSERT_TRUE(fixture.start());
+
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, fixture.tick_once_running().code());
+    EXPECT_EQ(eavp::HealthStatus::kError,
+              fixture.health.component("alsa_capture/mic0").value().status);
+}
+
+TEST(AlsaSourceNodeTest, MediaFailureWinsOverObserverFailure) {
+    eavp_test::ScriptedAlsa source;
+    source.read_errors.push_back(-ENODEV);
+    FailingAlsaObserver observer;
+    NodeFixture fixture(source.take_system(), eavp_test::make_alsa_config(), 2U,
+                        &observer);
+    ASSERT_TRUE(fixture.start());
+    observer.fail_next_report = true;
+
+    const eavp::Status status = fixture.tick_once_running();
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, status.code());
+    EXPECT_EQ("alsa", status.provider_id());
+}
+
+TEST(AlsaSourceNodeTest, PropagatesObserverFailureWithoutMediaFailure) {
+    eavp_test::ScriptedAlsa source;
+    source.append_complete_frames(1);
+    FailingAlsaObserver observer;
+    NodeFixture fixture(source.take_system(), eavp_test::make_alsa_config(), 2U,
+                        &observer);
+    ASSERT_TRUE(fixture.start());
+    observer.fail_next_report = true;
+
+    EXPECT_EQ(eavp::StatusCode::kResourceExhausted,
+              fixture.tick_once_running().code());
+}
+
+TEST(AlsaSourceNodeTest, MapsObserverExceptionsAtTheNodeBoundary) {
+    eavp_test::ScriptedAlsa bad_alloc_source;
+    bad_alloc_source.read_frames.push_back(0);
+    ThrowingAlsaObserver bad_alloc_observer(ThrowingAlsaObserver::kBadAlloc);
+    NodeFixture bad_alloc_fixture(bad_alloc_source.take_system(),
+                                 eavp_test::make_alsa_config(), 2U,
+                                 &bad_alloc_observer);
+    ASSERT_TRUE(bad_alloc_fixture.start());
+    EXPECT_EQ(eavp::StatusCode::kResourceExhausted,
+              bad_alloc_fixture.tick_once_running().code());
+
+    eavp_test::ScriptedAlsa unexpected_source;
+    unexpected_source.read_frames.push_back(0);
+    ThrowingAlsaObserver unexpected_observer(ThrowingAlsaObserver::kUnexpected);
+    NodeFixture unexpected_fixture(unexpected_source.take_system(),
+                                  eavp_test::make_alsa_config(), 2U,
+                                  &unexpected_observer);
+    ASSERT_TRUE(unexpected_fixture.start());
+    EXPECT_EQ(eavp::StatusCode::kInternal,
+              unexpected_fixture.tick_once_running().code());
 }
 
 TEST(AlsaSourceNodeTest, SuspendRecoveryResumesBeforeSamplingANewAnchor) {

@@ -44,6 +44,7 @@ public:
                   has_htimestamp(false), htimestamp_us(0), htimestamp_available(0U),
                   has_initial_anchor(false), initial_anchor_us(0),
                   has_recovery_anchor(false), recovery_anchor_us(0),
+                  force_timestamp_fallback(false),
                   scratch(8192U, 0U) {}
 
         int read_calls;
@@ -60,6 +61,7 @@ public:
         std::int64_t initial_anchor_us;
         bool has_recovery_anchor;
         std::int64_t recovery_anchor_us;
+        bool force_timestamp_fallback;
         std::vector<std::uint8_t> scratch;
     };
 
@@ -110,6 +112,7 @@ public:
         state_->has_recovery_anchor = true;
         state_->recovery_anchor_us = anchor_us;
     }
+    void force_timestamp_fallback() { state_->force_timestamp_fallback = true; }
     std::uint8_t* bytes() { return state_->scratch.data(); }
     int observed_read_calls() const { return state_->read_calls; }
     int prepare_after_xrun_calls() const { return state_->prepared_after_start; }
@@ -165,6 +168,7 @@ public:
     }
     int pcm_htimestamp(snd_pcm_t* pcm, snd_pcm_uframes_t* available,
                        snd_htimestamp_t* timestamp) override {
+        if (state_->force_timestamp_fallback) return -EIO;
         if (!state_->has_htimestamp && !state_->has_initial_anchor) {
             return FakeAlsaApi::pcm_htimestamp(pcm, available, timestamp);
         }
