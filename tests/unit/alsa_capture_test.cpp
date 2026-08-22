@@ -95,6 +95,21 @@ private:
     Failure failure_;
 };
 
+class TimestampFallbackWouldBlockObserver : public FailingAlsaObserver {
+public:
+    TimestampFallbackWouldBlockObserver() : block_fallback(true) {}
+
+    eavp::Status on_timestamp_fallback() override {
+        if (!block_fallback) return eavp::Status::ok_status();
+        block_fallback = false;
+        return eavp::Status(eavp::StatusCode::kWouldBlock,
+                            "observer would block");
+    }
+
+private:
+    bool block_fallback;
+};
+
 TEST(AlsaCaptureConfigTest, AcceptsTheApprovedTenMillisecondShape) {
     const eavp::AudioFormat format = eavp::AudioFormat::create(
         eavp::SampleFormat::kSigned16LittleEndian, 48000,
@@ -272,6 +287,45 @@ TEST(AlsaSourceNodeTest, PublishesTimestampFallbackAndPartialSamples) {
                      fixture.metrics.gauge("alsa_capture.mic0.partial_samples").value());
     EXPECT_EQ(eavp::HealthStatus::kDegraded,
               fixture.health.component("alsa_capture/mic0").value().status);
+}
+
+TEST(AlsaSourceNodeTest, TimestampFallbackObserverWouldBlockRetainsTheReadSamples) {
+    eavp_test::ScriptedAlsa source;
+    source.force_timestamp_fallback();
+    source.read_frames.push_back(240);
+    source.read_frames.push_back(240);
+    TimestampFallbackWouldBlockObserver observer;
+    NodeFixture fixture(source.take_system(), eavp_test::make_alsa_config(), 2U,
+                        &observer);
+    ASSERT_TRUE(fixture.start());
+
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock, fixture.tick_once_running().code());
+    EXPECT_EQ(1, source.observed_read_calls());
+    ASSERT_TRUE(fixture.tick_once_running().ok());
+    EXPECT_EQ(2, source.observed_read_calls());
+    ASSERT_EQ(1U, fixture.input.queue_size());
+    const std::shared_ptr<const eavp::AudioFrame> frame = fixture.take_frame();
+    const eavp::MappedRegion bytes = frame->buffer().map_plane(
+        0U, eavp::MapMode::kReadOnly).take_value();
+    EXPECT_EQ(0U, bytes.data()[0U]);
+    EXPECT_EQ(192U, bytes.data()[960U]);
+}
+
+TEST(AlsaSourceNodeTest, TimestampFallbackObserverWouldBlockRetainsCompleteFrame) {
+    eavp_test::ScriptedAlsa source;
+    source.force_timestamp_fallback();
+    source.read_frames.push_back(480);
+    TimestampFallbackWouldBlockObserver observer;
+    NodeFixture fixture(source.take_system(), eavp_test::make_alsa_config(), 2U,
+                        &observer);
+    ASSERT_TRUE(fixture.start());
+
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock, fixture.tick_once_running().code());
+    EXPECT_EQ(1, source.observed_read_calls());
+    ASSERT_TRUE(fixture.tick_once_running().ok());
+    EXPECT_EQ(1, source.observed_read_calls());
+    ASSERT_EQ(1U, fixture.input.queue_size());
+    EXPECT_EQ(480, fixture.take_frame()->samples_per_channel());
 }
 
 TEST(AlsaSourceNodeTest, PublishesSuspendRecoveryOnce) {

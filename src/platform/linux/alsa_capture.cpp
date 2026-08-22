@@ -509,6 +509,8 @@ Status AlsaSourceNode::on_tick() {
             return impl_->report_would_block(
                 Status(StatusCode::kWouldBlock, "ALSA capture would block"));
         }
+        impl_->partial_samples += read.value().frames_read;
+        bool timestamp_fallback = false;
         if (!impl_->has_anchor) {
             impl_->has_anchor = true;
             impl_->anchor_pts_us = anchor_candidate.value().first_unread_pts_us;
@@ -519,14 +521,16 @@ Status AlsaSourceNode::on_tick() {
                                   "ALSA timestamp fallback counter overflows");
                 }
                 ++impl_->timestamp_fallbacks;
+                timestamp_fallback = true;
+            }
+        }
+        if (impl_->partial_samples < impl_->config.samples_per_frame()) {
+            if (timestamp_fallback) {
                 const Status observer_status = invoke_observer([this]() {
                     return impl_->observer->on_timestamp_fallback();
                 });
                 if (!observer_status.ok()) return observer_status;
             }
-        }
-        impl_->partial_samples += read.value().frames_read;
-        if (impl_->partial_samples < impl_->config.samples_per_frame()) {
             return invoke_observer([this]() {
                 return impl_->observer->on_partial(impl_->partial_samples);
             });
@@ -548,6 +552,12 @@ Status AlsaSourceNode::on_tick() {
         impl_->partial_buffer.reset();
         impl_->partial_samples = 0;
         impl_->discontinuity_pending = false;
+        if (timestamp_fallback) {
+            const Status observer_status = invoke_observer([this]() {
+                return impl_->observer->on_timestamp_fallback();
+            });
+            if (!observer_status.ok()) return observer_status;
+        }
         const Status partial_status = invoke_observer([this]() {
             return impl_->observer->on_partial(0);
         });
