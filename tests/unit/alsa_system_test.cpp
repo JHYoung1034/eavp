@@ -1,4 +1,5 @@
 #include <cerrno>
+#include <limits>
 #include <memory>
 
 #include <gtest/gtest.h>
@@ -83,6 +84,18 @@ TEST(AlsaSystemTest, RejectsNegotiatedRateOrFormatChanges) {
     const eavp::Status format_status = format_system.prepare(make_alsa_config());
     EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch, format_status.code());
     EXPECT_EQ(1, format_observed->close_count);
+}
+
+TEST(AlsaSystemTest, RejectsBufferSmallerThanTwoExtremePeriodsWithoutOverflow) {
+    std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+    FakeAlsaApi* observed = fake.get();
+    observed->reported_period = std::numeric_limits<snd_pcm_uframes_t>::max();
+    observed->negotiated_buffer = std::numeric_limits<snd_pcm_uframes_t>::max();
+    eavp::detail::AlsaSystem system(std::move(fake));
+
+    const eavp::Status status = system.prepare(make_alsa_config());
+    EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch, status.code());
+    EXPECT_EQ(1, observed->close_count);
 }
 
 TEST(AlsaSystemTest, StartAndStopAreIdempotent) {

@@ -47,7 +47,8 @@ public:
           requested_avail_min(0U), negotiated_access(SND_PCM_ACCESS_RW_INTERLEAVED),
           negotiated_format(SND_PCM_FORMAT_S16_LE), negotiated_channels(2U),
           negotiated_rate(48000U), negotiated_period(480U),
-          negotiated_buffer(1920U), accepts_requested_format(true),
+          negotiated_buffer(1920U), reported_period(0U),
+          accepts_requested_format(true),
           successful_open_count(0), close_count(0),
           hw_params_alloc_count(0), hw_params_free_count(0),
           sw_params_alloc_count(0), sw_params_free_count(0), pcm_start_count(0),
@@ -128,7 +129,7 @@ public:
     }
     int hw_params_get_period_size(const snd_pcm_hw_params_t*,
                                   snd_pcm_uframes_t* value, int*) {
-        *value = negotiated_period;
+        *value = reported_period == 0U ? negotiated_period : reported_period;
         return result(kHwParamsGetPeriodSize);
     }
     int hw_params_get_buffer_size(const snd_pcm_hw_params_t*,
@@ -199,6 +200,7 @@ public:
     unsigned int negotiated_rate;
     snd_pcm_uframes_t negotiated_period;
     snd_pcm_uframes_t negotiated_buffer;
+    snd_pcm_uframes_t reported_period;
     bool accepts_requested_format;
     int successful_open_count;
     int close_count;

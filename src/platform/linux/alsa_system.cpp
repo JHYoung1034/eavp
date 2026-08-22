@@ -187,7 +187,7 @@ Status AlsaSystem::prepare(const AlsaCaptureConfig& config) {
     if (actual_access != SND_PCM_ACCESS_RW_INTERLEAVED || actual_format != format ||
         actual_channels != static_cast<unsigned int>(config.format().channels()) ||
         actual_rate != static_cast<unsigned int>(config.format().sample_rate()) ||
-        actual_period == 0U || actual_buffer < 2U * actual_period) {
+        actual_period == 0U || actual_buffer / actual_period < 2U) {
         close_resources();
         return Status(StatusCode::kCapabilityMismatch,
                       "ALSA negotiated parameters do not match the capture contract");
