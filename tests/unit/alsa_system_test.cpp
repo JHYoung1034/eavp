@@ -161,4 +161,205 @@ TEST(AlsaSystemTest, UnsupportedMonotonicTimestampEnablesFallbackWithoutUsingRea
     EXPECT_EQ(0, observed->monotonic_now_count);
 }
 
+TEST(AlsaSystemTest, TimestampConvertsAvailableFramesToFirstUnreadSamplePts) {
+    std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+    FakeAlsaApi* observed = fake.get();
+    observed->htimestamp_value.tv_sec = 2;
+    observed->htimestamp_value.tv_nsec = 0L;
+    observed->htimestamp_available = 480U;
+    observed->monotonic_now_value.tv_sec = 2;
+    eavp::detail::AlsaSystem system(std::move(fake));
+    ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+    ASSERT_TRUE(system.start().ok());
+
+    const eavp::Result<eavp::detail::AlsaAnchor> anchor = system.capture_anchor();
+
+    ASSERT_TRUE(anchor.ok());
+    EXPECT_EQ(1990000, anchor.value().first_unread_pts_us);
+    EXPECT_FALSE(anchor.value().used_fallback);
+    EXPECT_EQ(1, observed->htimestamp_count);
+    EXPECT_EQ(1, observed->monotonic_now_count);
+}
+
+TEST(AlsaSystemTest, TimestampFallsBackToMonotonicClockWhenHtimestampFails) {
+    std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+    FakeAlsaApi* observed = fake.get();
+    observed->htimestamp_result = -EIO;
+    observed->avail_update_result = 480;
+    observed->monotonic_now_value.tv_sec = 3;
+    eavp::detail::AlsaSystem system(std::move(fake));
+    ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+    ASSERT_TRUE(system.start().ok());
+
+    const eavp::Result<eavp::detail::AlsaAnchor> anchor = system.capture_anchor();
+
+    ASSERT_TRUE(anchor.ok());
+    EXPECT_EQ(2990000, anchor.value().first_unread_pts_us);
+    EXPECT_TRUE(anchor.value().used_fallback);
+    EXPECT_EQ(1, observed->avail_update_count);
+}
+
+TEST(AlsaSystemTest, TimestampRejectsInvalidOrClearlyFutureAnchorData) {
+    std::unique_ptr<FakeAlsaApi> invalid_fake(new FakeAlsaApi());
+    invalid_fake->htimestamp_value.tv_sec = 1;
+    invalid_fake->htimestamp_value.tv_nsec = 1000000000L;
+    invalid_fake->avail_update_result = -1;
+    eavp::detail::AlsaSystem invalid_system(std::move(invalid_fake));
+    ASSERT_TRUE(invalid_system.prepare(make_alsa_config()).ok());
+    ASSERT_TRUE(invalid_system.start().ok());
+    EXPECT_FALSE(invalid_system.capture_anchor().ok());
+
+    std::unique_ptr<FakeAlsaApi> future_fake(new FakeAlsaApi());
+    future_fake->htimestamp_value.tv_sec = 3;
+    future_fake->monotonic_now_value.tv_sec = 1;
+    future_fake->avail_update_result = -1;
+    eavp::detail::AlsaSystem future_system(std::move(future_fake));
+    ASSERT_TRUE(future_system.prepare(make_alsa_config()).ok());
+    ASSERT_TRUE(future_system.start().ok());
+    EXPECT_FALSE(future_system.capture_anchor().ok());
+}
+
+TEST(AlsaSystemTest, TimestampAcceptsOneSecondOfMonotonicSchedulingJitter) {
+    std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+    fake->htimestamp_value.tv_sec = 2;
+    fake->monotonic_now_value.tv_sec = 1;
+    eavp::detail::AlsaSystem system(std::move(fake));
+    ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+    ASSERT_TRUE(system.start().ok());
+
+    EXPECT_TRUE(system.capture_anchor().ok());
+}
+
+TEST(AlsaSystemTest, TimestampRejectsOverflowWithoutGeneratingPts) {
+    std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+    fake->htimestamp_value.tv_sec = std::numeric_limits<time_t>::max();
+    fake->htimestamp_value.tv_nsec = 999999999L;
+    fake->avail_update_result = -1;
+    eavp::detail::AlsaSystem system(std::move(fake));
+    ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+    ASSERT_TRUE(system.start().ok());
+
+    EXPECT_FALSE(system.capture_anchor().ok());
+}
+
+TEST(AlsaSystemTest, XrunRecoversOnceAndReturnsTimelineDiscontinuity) {
+    std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+    FakeAlsaApi* observed = fake.get();
+    observed->pcm_read_results.push_back(-EPIPE);
+    eavp::detail::AlsaSystem system(std::move(fake));
+    ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+    ASSERT_TRUE(system.start().ok());
+
+    const eavp::Result<eavp::detail::AlsaReadResult> read =
+        system.read_interleaved(reinterpret_cast<std::uint8_t*>(observed), 480);
+
+    ASSERT_TRUE(read.ok());
+    EXPECT_TRUE(read.value().would_block);
+    EXPECT_TRUE(read.value().timeline_discontinuity);
+    EXPECT_EQ(2, observed->pcm_prepare_count);
+    EXPECT_EQ(2, observed->pcm_start_count);
+}
+
+TEST(AlsaSystemTest, SuspendResumeNeverBlocksExecutor) {
+    std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+    FakeAlsaApi* observed = fake.get();
+    observed->pcm_read_results.push_back(-ESTRPIPE);
+    observed->pcm_resume_results.push_back(-EAGAIN);
+    observed->pcm_resume_results.push_back(0);
+    eavp::detail::AlsaSystem system(std::move(fake));
+    ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+    ASSERT_TRUE(system.start().ok());
+
+    const eavp::Result<eavp::detail::AlsaReadResult> first =
+        system.read_interleaved(reinterpret_cast<std::uint8_t*>(observed), 480);
+    const eavp::Result<eavp::detail::AlsaReadResult> second =
+        system.read_interleaved(reinterpret_cast<std::uint8_t*>(observed), 480);
+
+    ASSERT_TRUE(first.ok());
+    ASSERT_TRUE(second.ok());
+    EXPECT_TRUE(first.value().would_block);
+    EXPECT_TRUE(second.value().would_block);
+    EXPECT_TRUE(first.value().timeline_discontinuity);
+    EXPECT_FALSE(second.value().timeline_discontinuity);
+    EXPECT_EQ(2, observed->pcm_resume_count);
+}
+
+TEST(AlsaSystemTest, SuspendResumeFatalFallsBackToPrepareAndStart) {
+    std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+    FakeAlsaApi* observed = fake.get();
+    observed->pcm_read_results.push_back(-ESTRPIPE);
+    observed->pcm_resume_results.push_back(-EIO);
+    eavp::detail::AlsaSystem system(std::move(fake));
+    ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+    ASSERT_TRUE(system.start().ok());
+
+    const eavp::Result<eavp::detail::AlsaReadResult> read =
+        system.read_interleaved(reinterpret_cast<std::uint8_t*>(observed), 480);
+
+    ASSERT_TRUE(read.ok());
+    EXPECT_TRUE(read.value().would_block);
+    EXPECT_TRUE(read.value().timeline_discontinuity);
+    EXPECT_EQ(2, observed->pcm_prepare_count);
+    EXPECT_EQ(2, observed->pcm_start_count);
+}
+
+TEST(AlsaSystemTest, SuspendResumeDeviceLossDoesNotAttemptFallback) {
+    std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+    FakeAlsaApi* observed = fake.get();
+    observed->pcm_read_results.push_back(-ESTRPIPE);
+    observed->pcm_resume_results.push_back(-ENODEV);
+    eavp::detail::AlsaSystem system(std::move(fake));
+    ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+    ASSERT_TRUE(system.start().ok());
+
+    const eavp::Result<eavp::detail::AlsaReadResult> read =
+        system.read_interleaved(reinterpret_cast<std::uint8_t*>(observed), 480);
+
+    ASSERT_FALSE(read.ok());
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, read.status().code());
+    EXPECT_EQ("snd_pcm_resume", read.status().operation());
+    EXPECT_EQ(-ENODEV, read.status().native_code());
+    EXPECT_EQ(1, observed->pcm_prepare_count);
+    EXPECT_EQ(1, observed->pcm_start_count);
+}
+
+TEST(AlsaSystemTest, RecoveryFailureRetainsNativeOperationAndCode) {
+    std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+    fake->pcm_read_results.push_back(-EPIPE);
+    fake->pcm_prepare_results.push_back(0);
+    fake->pcm_prepare_results.push_back(-EIO);
+    eavp::detail::AlsaSystem system(std::move(fake));
+    ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+    ASSERT_TRUE(system.start().ok());
+
+    const eavp::Result<eavp::detail::AlsaReadResult> read =
+        system.read_interleaved(reinterpret_cast<std::uint8_t*>(&system), 480);
+
+    ASSERT_FALSE(read.ok());
+    EXPECT_EQ(eavp::StatusCode::kIoError, read.status().code());
+    EXPECT_EQ("alsa", read.status().provider_id());
+    EXPECT_EQ("snd_pcm_prepare", read.status().operation());
+    EXPECT_EQ(-EIO, read.status().native_code());
+}
+
+TEST(AlsaSystemTest, DeviceReadFailuresMapToDeviceLostWithoutReopen) {
+    const int codes[] = {-ENODEV, -ENXIO};
+    for (std::size_t index = 0U; index < 2U; ++index) {
+        std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+        FakeAlsaApi* observed = fake.get();
+        observed->pcm_read_results.push_back(codes[index]);
+        eavp::detail::AlsaSystem system(std::move(fake));
+        ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+        ASSERT_TRUE(system.start().ok());
+
+        const eavp::Result<eavp::detail::AlsaReadResult> read =
+            system.read_interleaved(reinterpret_cast<std::uint8_t*>(observed), 480);
+        ASSERT_FALSE(read.ok());
+        EXPECT_EQ(eavp::StatusCode::kDeviceLost, read.status().code());
+        EXPECT_EQ("snd_pcm_readi", read.status().operation());
+        EXPECT_EQ(codes[index], read.status().native_code());
+        EXPECT_EQ(1, observed->successful_open_count);
+    }
+}
+
 }  // namespace

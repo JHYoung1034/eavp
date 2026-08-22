@@ -35,6 +35,15 @@ struct AlsaReadResult {
     bool timeline_discontinuity;
 };
 
+struct AlsaAnchor {
+    AlsaAnchor(std::int64_t first_unread_pts_us_value, bool used_fallback_value)
+        : first_unread_pts_us(first_unread_pts_us_value),
+          used_fallback(used_fallback_value) {}
+
+    std::int64_t first_unread_pts_us;
+    bool used_fallback;
+};
+
 class AlsaSystem {
 public:
     explicit AlsaSystem(std::unique_ptr<AlsaApi> api);
@@ -49,7 +58,9 @@ public:
     Status stop();
     Result<AlsaReadResult> read_interleaved(std::uint8_t* destination,
                                             int requested_frames);
+    Result<AlsaAnchor> capture_anchor();
     const AlsaNegotiatedParameters& negotiated() const { return negotiated_; }
+    bool suspend_recovery_pending() const { return suspended_; }
 
 private:
     enum State {
@@ -66,6 +77,7 @@ private:
     snd_pcm_sw_params_t* sw_params_;
     AlsaNegotiatedParameters negotiated_;
     State state_;
+    bool suspended_;
 };
 
 std::unique_ptr<AlsaApi> create_libasound_api();

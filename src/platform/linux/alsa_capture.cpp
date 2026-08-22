@@ -11,9 +11,33 @@ namespace eavp {
 
 namespace {
 
+const std::int64_t kMicrosecondsPerSecond = 1000000;
+
 Status allocation_failure() {
     return Status(StatusCode::kResourceExhausted,
                   "failed to allocate ALSA capture frame storage");
+}
+
+bool samples_to_us(std::int64_t samples, int sample_rate, std::int64_t* result) {
+    if (result == NULL || samples < 0 || sample_rate <= 0) return false;
+    const std::int64_t rate = static_cast<std::int64_t>(sample_rate);
+    const std::int64_t quotient = samples / rate;
+    const std::int64_t remainder = samples % rate;
+    if (quotient > std::numeric_limits<std::int64_t>::max() /
+                       kMicrosecondsPerSecond) {
+        return false;
+    }
+    const std::int64_t seconds_us = quotient * kMicrosecondsPerSecond;
+    if (remainder > std::numeric_limits<std::int64_t>::max() /
+                        kMicrosecondsPerSecond) {
+        return false;
+    }
+    const std::int64_t remainder_us = (remainder * kMicrosecondsPerSecond) / rate;
+    if (seconds_us > std::numeric_limits<std::int64_t>::max() - remainder_us) {
+        return false;
+    }
+    *result = seconds_us + remainder_us;
+    return true;
 }
 
 }  // namespace
@@ -24,7 +48,8 @@ public:
          HealthManager* health_value, std::unique_ptr<detail::AlsaSystem> system_value)
         : config(config_value), metrics(metrics_value), health(health_value),
           system(std::move(system_value)), output("audio_output"), partial_buffer(),
-          partial_samples(0), pending(), emitted_samples(0) {}
+          partial_samples(0), pending(), emitted_samples(0), has_anchor(false),
+          anchor_pts_us(0), discontinuity_pending(false), timestamp_fallbacks(0) {}
 
     ~Impl() noexcept {
         if (system) {
@@ -62,6 +87,45 @@ public:
         partial_buffer.reset();
         partial_samples = 0;
         emitted_samples = 0;
+        has_anchor = false;
+        anchor_pts_us = 0;
+        discontinuity_pending = false;
+    }
+
+    void reset_timeline_after_discontinuity() {
+        pending.reset();
+        partial_buffer.reset();
+        partial_samples = 0;
+        emitted_samples = 0;
+        has_anchor = false;
+        anchor_pts_us = 0;
+        discontinuity_pending = true;
+    }
+
+    Status frame_pts(std::int64_t* result) const {
+        if (!has_anchor || result == NULL) {
+            return Status(StatusCode::kInvalidState, "ALSA timeline is not anchored");
+        }
+        std::int64_t delta_us = 0;
+        if (!samples_to_us(emitted_samples, config.format().sample_rate(), &delta_us) ||
+            (delta_us > 0 && anchor_pts_us >
+                                std::numeric_limits<std::int64_t>::max() - delta_us)) {
+            return Status(StatusCode::kCorruptData, "ALSA PTS calculation overflows");
+        }
+        *result = anchor_pts_us + delta_us;
+        return Status::ok_status();
+    }
+
+    Status advanced_emitted_samples(std::int64_t* result) const {
+        const std::int64_t frame_samples =
+            static_cast<std::int64_t>(config.samples_per_frame());
+        if (result == NULL || emitted_samples >
+                                  std::numeric_limits<std::int64_t>::max() - frame_samples) {
+            return Status(StatusCode::kCorruptData,
+                          "ALSA emitted sample counter overflows");
+        }
+        *result = emitted_samples + frame_samples;
+        return Status::ok_status();
     }
 
     AlsaCaptureConfig config;
@@ -73,6 +137,10 @@ public:
     int partial_samples;
     std::shared_ptr<const AudioFrame> pending;
     std::int64_t emitted_samples;
+    bool has_anchor;
+    std::int64_t anchor_pts_us;
+    bool discontinuity_pending;
+    std::uint64_t timestamp_fallbacks;
 };
 
 Result<AlsaCaptureConfig> AlsaCaptureConfig::create(const std::string& device_name,
@@ -191,10 +259,14 @@ Status AlsaSourceNode::on_reset() {
 Status AlsaSourceNode::on_tick() {
     try {
         if (impl_->pending) {
+            std::int64_t next_emitted_samples = 0;
+            const Status count_status =
+                impl_->advanced_emitted_samples(&next_emitted_samples);
+            if (!count_status.ok()) return count_status;
             const Status output_status = impl_->output.send(impl_->pending);
             if (!output_status.ok()) return output_status;
             impl_->pending.reset();
-            impl_->emitted_samples += impl_->config.samples_per_frame();
+            impl_->emitted_samples = next_emitted_samples;
             return Status::ok_status();
         }
 
@@ -212,21 +284,55 @@ Status AlsaSourceNode::on_tick() {
         std::uint8_t* destination = region.mutable_data() +
             static_cast<std::size_t>(impl_->partial_samples) *
                 impl_->config.format().bytes_per_pcm_frame();
+        Result<detail::AlsaAnchor> anchor_candidate(
+            Status(StatusCode::kInvalidState, "ALSA timeline already anchored"));
+        if (impl_->system->suspend_recovery_pending()) {
+            const Result<detail::AlsaReadResult> recovery =
+                impl_->system->read_interleaved(destination, missing);
+            if (!recovery.ok()) return recovery.status();
+            if (recovery.value().timeline_discontinuity) {
+                impl_->reset_timeline_after_discontinuity();
+            }
+            return Status(StatusCode::kWouldBlock, "ALSA capture is resuming");
+        }
+        if (!impl_->has_anchor) {
+            anchor_candidate = impl_->system->capture_anchor();
+            if (!anchor_candidate.ok()) return anchor_candidate.status();
+        }
         const Result<detail::AlsaReadResult> read =
             impl_->system->read_interleaved(destination, missing);
         if (!read.ok()) return read.status();
+        if (read.value().timeline_discontinuity) {
+            impl_->reset_timeline_after_discontinuity();
+            return Status(StatusCode::kWouldBlock, "ALSA capture recovered timeline");
+        }
         if (read.value().would_block) {
             return Status(StatusCode::kWouldBlock, "ALSA capture would block");
+        }
+        if (!impl_->has_anchor) {
+            impl_->has_anchor = true;
+            impl_->anchor_pts_us = anchor_candidate.value().first_unread_pts_us;
+            if (anchor_candidate.value().used_fallback) {
+                if (impl_->timestamp_fallbacks ==
+                    std::numeric_limits<std::uint64_t>::max()) {
+                    return Status(StatusCode::kCorruptData,
+                                  "ALSA timestamp fallback counter overflows");
+                }
+                ++impl_->timestamp_fallbacks;
+            }
         }
         impl_->partial_samples += read.value().frames_read;
         if (impl_->partial_samples < impl_->config.samples_per_frame()) {
             return Status::ok_status();
         }
 
+        std::int64_t pts_us = 0;
+        const Status pts_status = impl_->frame_pts(&pts_us);
+        if (!pts_status.ok()) return pts_status;
         const Result<AudioFrame> frame = AudioFrame::create(
             *impl_->partial_buffer, impl_->config.format(),
-            impl_->config.samples_per_frame(), impl_->emitted_samples,
-            TimeBase::create(1, 1000000).value(), false);
+            impl_->config.samples_per_frame(), pts_us,
+            TimeBase::create(1, 1000000).value(), impl_->discontinuity_pending);
         if (!frame.ok()) return frame.status();
         try {
             impl_->pending.reset(new AudioFrame(frame.value()));
@@ -235,10 +341,14 @@ Status AlsaSourceNode::on_tick() {
         }
         impl_->partial_buffer.reset();
         impl_->partial_samples = 0;
+        impl_->discontinuity_pending = false;
+        std::int64_t next_emitted_samples = 0;
+        const Status count_status = impl_->advanced_emitted_samples(&next_emitted_samples);
+        if (!count_status.ok()) return count_status;
         const Status output_status = impl_->output.send(impl_->pending);
         if (!output_status.ok()) return output_status;
         impl_->pending.reset();
-        impl_->emitted_samples += impl_->config.samples_per_frame();
+        impl_->emitted_samples = next_emitted_samples;
         return Status::ok_status();
     } catch (const std::bad_alloc&) {
         return allocation_failure();

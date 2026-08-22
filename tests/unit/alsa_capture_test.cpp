@@ -130,6 +130,79 @@ TEST(AlsaSourceNodeTest, AggregatesShortReadsIntoOneExactFrame) {
     EXPECT_EQ(1920U, frame->buffer().plane_layout(0U).value().size);
 }
 
+TEST(AlsaSourceNodeTest, PtsUsesFirstUnreadAnchorAndCumulativeSamples) {
+    eavp_test::ScriptedAlsa source;
+    source.set_initial_anchor(500000);
+    source.append_complete_frames(3);
+    NodeFixture fixture(source.take_system(), eavp_test::make_alsa_config(), 4U);
+    ASSERT_TRUE(fixture.start());
+    ASSERT_TRUE(fixture.tick_until_frames(3));
+
+    EXPECT_EQ(500000, fixture.take_frame()->pts());
+    EXPECT_EQ(510000, fixture.take_frame()->pts());
+    EXPECT_EQ(520000, fixture.take_frame()->pts());
+}
+
+TEST(AlsaSourceNodeTest, PtsDiscardsWouldBlockAnchorCandidateAndResamplesBeforeRead) {
+    std::unique_ptr<eavp_test::FakeAlsaApi> fake(new eavp_test::FakeAlsaApi());
+    eavp_test::FakeAlsaApi* observed = fake.get();
+    observed->htimestamp_value.tv_sec = 0;
+    observed->htimestamp_value.tv_nsec = 500000000L;
+    observed->pcm_read_results.push_back(0);
+    observed->pcm_read_results.push_back(480);
+    std::unique_ptr<eavp::detail::AlsaSystem> system(
+        new eavp::detail::AlsaSystem(
+            std::unique_ptr<eavp::detail::AlsaApi>(fake.release())));
+    NodeFixture fixture(std::move(system), eavp_test::make_alsa_config(), 1U);
+    ASSERT_TRUE(fixture.start());
+
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock, fixture.tick_once_running().code());
+    ASSERT_TRUE(fixture.tick_once_running().ok());
+    ASSERT_EQ(1U, fixture.input.queue_size());
+    EXPECT_EQ(500000, fixture.take_frame()->pts());
+    EXPECT_EQ(2, observed->htimestamp_count);
+}
+
+TEST(AlsaSourceNodeTest, XrunDropsPartialAndMarksExactlyOneFrame) {
+    eavp_test::ScriptedAlsa source;
+    source.set_initial_anchor(600000);
+    source.set_recovery_anchor(700000);
+    source.read_frames.push_back(240);
+    source.read_errors.push_back(-EPIPE);
+    source.append_complete_frames(2);
+    NodeFixture fixture(source.take_system(), eavp_test::make_alsa_config(), 4U);
+    ASSERT_TRUE(fixture.start());
+    ASSERT_TRUE(fixture.tick_until_frames(2));
+
+    EXPECT_TRUE(fixture.take_frame()->discontinuity());
+    EXPECT_FALSE(fixture.take_frame()->discontinuity());
+    EXPECT_EQ(1, source.prepare_after_xrun_calls());
+    EXPECT_EQ(1, source.start_after_xrun_calls());
+}
+
+TEST(AlsaSourceNodeTest, SuspendRecoveryResumesBeforeSamplingANewAnchor) {
+    std::unique_ptr<eavp_test::FakeAlsaApi> fake(new eavp_test::FakeAlsaApi());
+    eavp_test::FakeAlsaApi* observed = fake.get();
+    observed->pcm_read_results.push_back(-ESTRPIPE);
+    observed->pcm_read_results.push_back(480);
+    observed->pcm_resume_results.push_back(-EAGAIN);
+    observed->pcm_resume_results.push_back(0);
+    std::unique_ptr<eavp::detail::AlsaSystem> system(
+        new eavp::detail::AlsaSystem(
+            std::unique_ptr<eavp::detail::AlsaApi>(fake.release())));
+    NodeFixture fixture(std::move(system), eavp_test::make_alsa_config(), 1U);
+    ASSERT_TRUE(fixture.start());
+
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock, fixture.tick_once_running().code());
+    EXPECT_EQ(1, observed->htimestamp_count);
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock, fixture.tick_once_running().code());
+    EXPECT_EQ(1, observed->htimestamp_count);
+    ASSERT_TRUE(fixture.tick_once_running().ok());
+    EXPECT_EQ(2, observed->htimestamp_count);
+    ASSERT_EQ(1U, fixture.input.queue_size());
+    EXPECT_TRUE(fixture.take_frame()->discontinuity());
+}
+
 TEST(AlsaSourceNodeTest, PendingOutputStopsFurtherDeviceReads) {
     eavp_test::ScriptedAlsa source;
     source.append_complete_frames(3);

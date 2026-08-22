@@ -3,6 +3,7 @@
 
 #include <cerrno>
 #include <ctime>
+#include <deque>
 
 #include "platform/linux/alsa_api.hpp"
 
@@ -51,8 +52,13 @@ public:
           accepts_requested_format(true),
           successful_open_count(0), close_count(0),
           hw_params_alloc_count(0), hw_params_free_count(0),
-          sw_params_alloc_count(0), sw_params_free_count(0), pcm_start_count(0),
-          pcm_drop_count(0), htimestamp_count(0), monotonic_now_count(0) {}
+          sw_params_alloc_count(0), sw_params_free_count(0), pcm_prepare_count(0),
+          pcm_start_count(0), pcm_drop_count(0), pcm_resume_count(0),
+          htimestamp_count(0), avail_update_count(0), monotonic_now_count(0),
+          htimestamp_result(0), htimestamp_available(0U),
+          htimestamp_value(), avail_update_result(0), monotonic_now_result(0),
+          monotonic_now_value(), pcm_prepare_results(), pcm_start_results(),
+          pcm_resume_results(), pcm_read_results() {}
 
     int pcm_open(snd_pcm_t** pcm, const char*, snd_pcm_stream_t stream,
                  int mode) {
@@ -161,25 +167,43 @@ public:
         return result(kSwParamsSetAvailMin);
     }
     int sw_params(snd_pcm_t*, snd_pcm_sw_params_t*) { return result(kSwParams); }
-    int pcm_prepare(snd_pcm_t*) { return result(kPcmPrepare); }
+    int pcm_prepare(snd_pcm_t*) {
+        ++pcm_prepare_count;
+        return scripted_result(pcm_prepare_results, kPcmPrepare);
+    }
     int pcm_start(snd_pcm_t*) {
         ++pcm_start_count;
-        return result(kPcmStart);
+        return scripted_result(pcm_start_results, kPcmStart);
     }
     int pcm_drop(snd_pcm_t*) {
         ++pcm_drop_count;
         return result(kPcmDrop);
     }
-    int pcm_resume(snd_pcm_t*) { return 0; }
-    snd_pcm_sframes_t pcm_readi(snd_pcm_t*, void*, snd_pcm_uframes_t) { return 0; }
-    int pcm_htimestamp(snd_pcm_t*, snd_pcm_uframes_t*, snd_htimestamp_t*) {
-        ++htimestamp_count;
-        return 0;
+    int pcm_resume(snd_pcm_t*) {
+        ++pcm_resume_count;
+        return scripted_result(pcm_resume_results, 0);
     }
-    snd_pcm_sframes_t pcm_avail_update(snd_pcm_t*) { return 0; }
-    int monotonic_now(struct timespec*) {
+    snd_pcm_sframes_t pcm_readi(snd_pcm_t*, void*, snd_pcm_uframes_t) {
+        if (pcm_read_results.empty()) return 0;
+        const snd_pcm_sframes_t value = pcm_read_results.front();
+        pcm_read_results.pop_front();
+        return value;
+    }
+    int pcm_htimestamp(snd_pcm_t*, snd_pcm_uframes_t* available,
+                       snd_htimestamp_t* timestamp) {
+        ++htimestamp_count;
+        *available = htimestamp_available;
+        *timestamp = htimestamp_value;
+        return htimestamp_result;
+    }
+    snd_pcm_sframes_t pcm_avail_update(snd_pcm_t*) {
+        ++avail_update_count;
+        return avail_update_result;
+    }
+    int monotonic_now(struct timespec* value) {
         ++monotonic_now_count;
-        return 0;
+        *value = monotonic_now_value;
+        return monotonic_now_result;
     }
     const char* error_string(int) const { return "fake ALSA failure"; }
 
@@ -208,14 +232,39 @@ public:
     int hw_params_free_count;
     int sw_params_alloc_count;
     int sw_params_free_count;
+    int pcm_prepare_count;
     int pcm_start_count;
     int pcm_drop_count;
+    int pcm_resume_count;
     int htimestamp_count;
+    int avail_update_count;
     int monotonic_now_count;
+    int htimestamp_result;
+    snd_pcm_uframes_t htimestamp_available;
+    snd_htimestamp_t htimestamp_value;
+    snd_pcm_sframes_t avail_update_result;
+    int monotonic_now_result;
+    struct timespec monotonic_now_value;
+    std::deque<int> pcm_prepare_results;
+    std::deque<int> pcm_start_results;
+    std::deque<int> pcm_resume_results;
+    std::deque<snd_pcm_sframes_t> pcm_read_results;
 
 private:
     bool fails(Step step) const { return fail_step == static_cast<int>(step); }
     int result(Step step) const { return fails(step) ? fail_code : 0; }
+    int scripted_result(std::deque<int>& values, Step step) {
+        if (values.empty()) return result(step);
+        const int value = values.front();
+        values.pop_front();
+        return value;
+    }
+    int scripted_result(std::deque<int>& values, int fallback) {
+        if (values.empty()) return fallback;
+        const int value = values.front();
+        values.pop_front();
+        return value;
+    }
 };
 
 }  // namespace eavp_test

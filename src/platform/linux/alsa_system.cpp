@@ -22,6 +22,10 @@ StatusCode system_error_code(int native_code) {
     return StatusCode::kIoError;
 }
 
+bool is_device_lost_error(int native_code) {
+    return native_code == -ENODEV || native_code == -ENXIO;
+}
+
 StatusCode capability_error_code(int native_code) {
     const StatusCode code = system_error_code(native_code);
     return code == StatusCode::kIoError ? StatusCode::kCapabilityMismatch : code;
@@ -30,6 +34,72 @@ StatusCode capability_error_code(int native_code) {
 Status read_failure(snd_pcm_sframes_t native_code, const AlsaApi& api) {
     return alsa_failure(system_error_code(static_cast<int>(native_code)),
                         "snd_pcm_readi", static_cast<int>(native_code), api);
+}
+
+const std::int64_t kMicrosecondsPerSecond = 1000000;
+const std::int64_t kNanosecondsPerSecond = 1000000000;
+const std::int64_t kMaximumFutureTimestampUs = 1000000;
+
+bool timespec_to_us(const struct timespec& value, std::int64_t* result) {
+    if (result == NULL || value.tv_sec < 0 || value.tv_nsec < 0 ||
+        value.tv_nsec >= kNanosecondsPerSecond ||
+        value.tv_sec > std::numeric_limits<std::int64_t>::max() /
+                           kMicrosecondsPerSecond) {
+        return false;
+    }
+    const std::int64_t seconds_us =
+        static_cast<std::int64_t>(value.tv_sec) * kMicrosecondsPerSecond;
+    const std::int64_t nanoseconds_us =
+        static_cast<std::int64_t>(value.tv_nsec) / 1000;
+    if (seconds_us > std::numeric_limits<std::int64_t>::max() - nanoseconds_us) {
+        return false;
+    }
+    *result = seconds_us + nanoseconds_us;
+    return true;
+}
+
+bool frames_to_us(snd_pcm_uframes_t frames, unsigned int sample_rate,
+                  std::int64_t* result) {
+    if (result == NULL || sample_rate == 0U ||
+        frames > static_cast<snd_pcm_uframes_t>(
+                     std::numeric_limits<std::int64_t>::max())) {
+        return false;
+    }
+    const std::int64_t frame_count = static_cast<std::int64_t>(frames);
+    const std::int64_t quotient = frame_count / static_cast<std::int64_t>(sample_rate);
+    const std::int64_t remainder = frame_count % static_cast<std::int64_t>(sample_rate);
+    if (quotient > std::numeric_limits<std::int64_t>::max() /
+                       kMicrosecondsPerSecond) {
+        return false;
+    }
+    const std::int64_t seconds_us = quotient * kMicrosecondsPerSecond;
+    if (remainder > std::numeric_limits<std::int64_t>::max() /
+                        kMicrosecondsPerSecond) {
+        return false;
+    }
+    const std::int64_t remainder_us =
+        (remainder * kMicrosecondsPerSecond) / static_cast<std::int64_t>(sample_rate);
+    if (seconds_us > std::numeric_limits<std::int64_t>::max() - remainder_us) {
+        return false;
+    }
+    *result = seconds_us + remainder_us;
+    return true;
+}
+
+bool first_unread_pts(std::int64_t timestamp_us, snd_pcm_uframes_t available,
+                      unsigned int sample_rate, std::int64_t* result) {
+    std::int64_t available_us = 0;
+    if (!frames_to_us(available, sample_rate, &available_us) ||
+        timestamp_us < available_us) {
+        return false;
+    }
+    *result = timestamp_us - available_us;
+    return true;
+}
+
+Status timestamp_failure() {
+    return Status(StatusCode::kCorruptData,
+                  "ALSA timestamp cannot produce a valid monotonic anchor");
 }
 
 snd_pcm_format_t alsa_format(SampleFormat format, bool* supported) {
@@ -55,7 +125,7 @@ snd_pcm_format_t alsa_format(SampleFormat format, bool* supported) {
 
 AlsaSystem::AlsaSystem(std::unique_ptr<AlsaApi> api)
     : api_(std::move(api)), pcm_(NULL), hw_params_(NULL), sw_params_(NULL),
-      negotiated_(), state_(kCreated) {}
+      negotiated_(), state_(kCreated), suspended_(false) {}
 
 AlsaSystem::~AlsaSystem() noexcept {
     try {
@@ -67,12 +137,13 @@ AlsaSystem::~AlsaSystem() noexcept {
 AlsaSystem::AlsaSystem(AlsaSystem&& other) noexcept
     : api_(std::move(other.api_)), pcm_(other.pcm_), hw_params_(other.hw_params_),
       sw_params_(other.sw_params_), negotiated_(other.negotiated_),
-      state_(other.state_) {
+      state_(other.state_), suspended_(other.suspended_) {
     other.pcm_ = NULL;
     other.hw_params_ = NULL;
     other.sw_params_ = NULL;
     other.negotiated_ = AlsaNegotiatedParameters();
     other.state_ = kCreated;
+    other.suspended_ = false;
 }
 
 AlsaSystem& AlsaSystem::operator=(AlsaSystem&& other) noexcept {
@@ -87,11 +158,13 @@ AlsaSystem& AlsaSystem::operator=(AlsaSystem&& other) noexcept {
         sw_params_ = other.sw_params_;
         negotiated_ = other.negotiated_;
         state_ = other.state_;
+        suspended_ = other.suspended_;
         other.pcm_ = NULL;
         other.hw_params_ = NULL;
         other.sw_params_ = NULL;
         other.negotiated_ = AlsaNegotiatedParameters();
         other.state_ = kCreated;
+        other.suspended_ = false;
     }
     return *this;
 }
@@ -112,6 +185,7 @@ int AlsaSystem::close_resources() {
     }
     negotiated_ = AlsaNegotiatedParameters();
     state_ = kCreated;
+    suspended_ = false;
     return close_result;
 }
 
@@ -313,6 +387,35 @@ Result<AlsaReadResult> AlsaSystem::read_interleaved(std::uint8_t* destination,
             StatusCode::kInvalidArgument, "ALSA read request is invalid"));
     }
 
+    if (suspended_) {
+        const int resume_result = api_->pcm_resume(pcm_);
+        if (resume_result == -EAGAIN) {
+            return Result<AlsaReadResult>(AlsaReadResult(0, true, false));
+        }
+        if (resume_result >= 0) {
+            suspended_ = false;
+            return Result<AlsaReadResult>(AlsaReadResult(0, true, false));
+        }
+        if (is_device_lost_error(resume_result)) {
+            return Result<AlsaReadResult>(alsa_failure(
+                StatusCode::kDeviceLost, "snd_pcm_resume", resume_result, *api_));
+        }
+        const int prepare_result = api_->pcm_prepare(pcm_);
+        if (prepare_result < 0) {
+            return Result<AlsaReadResult>(alsa_failure(
+                system_error_code(prepare_result), "snd_pcm_prepare", prepare_result,
+                *api_));
+        }
+        const int start_result = api_->pcm_start(pcm_);
+        if (start_result < 0) {
+            return Result<AlsaReadResult>(alsa_failure(
+                system_error_code(start_result), "snd_pcm_start", start_result, *api_));
+        }
+        suspended_ = false;
+        state_ = kRunning;
+        return Result<AlsaReadResult>(AlsaReadResult(0, true, false));
+    }
+
     snd_pcm_sframes_t result = 0;
     do {
         result = api_->pcm_readi(
@@ -332,7 +435,95 @@ Result<AlsaReadResult> AlsaSystem::read_interleaved(std::uint8_t* destination,
     if (result == 0 || result == -EAGAIN) {
         return Result<AlsaReadResult>(AlsaReadResult(0, true, false));
     }
+    if (result == -EPIPE) {
+        const int prepare_result = api_->pcm_prepare(pcm_);
+        if (prepare_result < 0) {
+            return Result<AlsaReadResult>(alsa_failure(
+                system_error_code(prepare_result), "snd_pcm_prepare", prepare_result,
+                *api_));
+        }
+        const int start_result = api_->pcm_start(pcm_);
+        if (start_result < 0) {
+            return Result<AlsaReadResult>(alsa_failure(
+                system_error_code(start_result), "snd_pcm_start", start_result, *api_));
+        }
+        state_ = kRunning;
+        return Result<AlsaReadResult>(AlsaReadResult(0, true, true));
+    }
+    if (result == -ESTRPIPE) {
+        suspended_ = true;
+        const int resume_result = api_->pcm_resume(pcm_);
+        if (resume_result == -EAGAIN) {
+            return Result<AlsaReadResult>(AlsaReadResult(0, true, true));
+        }
+        if (resume_result >= 0) {
+            suspended_ = false;
+            return Result<AlsaReadResult>(AlsaReadResult(0, true, true));
+        }
+        if (is_device_lost_error(resume_result)) {
+            return Result<AlsaReadResult>(alsa_failure(
+                StatusCode::kDeviceLost, "snd_pcm_resume", resume_result, *api_));
+        }
+        const int prepare_result = api_->pcm_prepare(pcm_);
+        if (prepare_result < 0) {
+            return Result<AlsaReadResult>(alsa_failure(
+                system_error_code(prepare_result), "snd_pcm_prepare", prepare_result,
+                *api_));
+        }
+        const int start_result = api_->pcm_start(pcm_);
+        if (start_result < 0) {
+            return Result<AlsaReadResult>(alsa_failure(
+                system_error_code(start_result), "snd_pcm_start", start_result, *api_));
+        }
+        suspended_ = false;
+        state_ = kRunning;
+        return Result<AlsaReadResult>(AlsaReadResult(0, true, true));
+    }
     return Result<AlsaReadResult>(read_failure(result, *api_));
+}
+
+Result<AlsaAnchor> AlsaSystem::capture_anchor() {
+    if (state_ != kRunning || pcm_ == NULL || negotiated_.sample_rate == 0U) {
+        return Result<AlsaAnchor>(Status(
+            StatusCode::kInvalidState, "ALSA timestamp request is invalid"));
+    }
+
+    struct timespec now;
+    const int monotonic_now_result = api_->monotonic_now(&now);
+    if (monotonic_now_result < 0) {
+        return Result<AlsaAnchor>(alsa_failure(
+            system_error_code(monotonic_now_result), "clock_gettime(CLOCK_MONOTONIC)",
+            monotonic_now_result, *api_));
+    }
+    std::int64_t now_us = 0;
+    const bool valid_monotonic_now = timespec_to_us(now, &now_us);
+
+    snd_pcm_uframes_t available = 0U;
+    snd_htimestamp_t timestamp;
+    const int htimestamp_result = api_->pcm_htimestamp(pcm_, &available, &timestamp);
+    std::int64_t timestamp_us = 0;
+    std::int64_t anchor_us = 0;
+    if (htimestamp_result >= 0 && valid_monotonic_now &&
+        timespec_to_us(timestamp, &timestamp_us) &&
+        !(timestamp_us > now_us &&
+          timestamp_us - now_us > kMaximumFutureTimestampUs) &&
+        first_unread_pts(timestamp_us, available, negotiated_.sample_rate, &anchor_us)) {
+        return Result<AlsaAnchor>(AlsaAnchor(anchor_us, false));
+    }
+
+    const snd_pcm_sframes_t fallback_available = api_->pcm_avail_update(pcm_);
+    if (fallback_available < 0) {
+        return Result<AlsaAnchor>(alsa_failure(
+            system_error_code(static_cast<int>(fallback_available)),
+            "snd_pcm_avail_update", static_cast<int>(fallback_available), *api_));
+    }
+    if (!valid_monotonic_now ||
+        !first_unread_pts(now_us,
+                          static_cast<snd_pcm_uframes_t>(fallback_available),
+                          negotiated_.sample_rate, &anchor_us)) {
+        return Result<AlsaAnchor>(timestamp_failure());
+    }
+    return Result<AlsaAnchor>(AlsaAnchor(anchor_us, true));
 }
 
 }  // namespace detail
