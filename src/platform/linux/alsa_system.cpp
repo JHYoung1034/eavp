@@ -27,6 +27,11 @@ StatusCode capability_error_code(int native_code) {
     return code == StatusCode::kIoError ? StatusCode::kCapabilityMismatch : code;
 }
 
+Status read_failure(snd_pcm_sframes_t native_code, const AlsaApi& api) {
+    return alsa_failure(system_error_code(static_cast<int>(native_code)),
+                        "snd_pcm_readi", static_cast<int>(native_code), api);
+}
+
 snd_pcm_format_t alsa_format(SampleFormat format, bool* supported) {
     *supported = true;
     switch (format) {
@@ -57,6 +62,38 @@ AlsaSystem::~AlsaSystem() noexcept {
         close_resources();
     } catch (...) {
     }
+}
+
+AlsaSystem::AlsaSystem(AlsaSystem&& other) noexcept
+    : api_(std::move(other.api_)), pcm_(other.pcm_), hw_params_(other.hw_params_),
+      sw_params_(other.sw_params_), negotiated_(other.negotiated_),
+      state_(other.state_) {
+    other.pcm_ = NULL;
+    other.hw_params_ = NULL;
+    other.sw_params_ = NULL;
+    other.negotiated_ = AlsaNegotiatedParameters();
+    other.state_ = kCreated;
+}
+
+AlsaSystem& AlsaSystem::operator=(AlsaSystem&& other) noexcept {
+    if (this != &other) {
+        try {
+            close_resources();
+        } catch (...) {
+        }
+        api_ = std::move(other.api_);
+        pcm_ = other.pcm_;
+        hw_params_ = other.hw_params_;
+        sw_params_ = other.sw_params_;
+        negotiated_ = other.negotiated_;
+        state_ = other.state_;
+        other.pcm_ = NULL;
+        other.hw_params_ = NULL;
+        other.sw_params_ = NULL;
+        other.negotiated_ = AlsaNegotiatedParameters();
+        other.state_ = kCreated;
+    }
+    return *this;
 }
 
 int AlsaSystem::close_resources() {
@@ -266,6 +303,36 @@ Status AlsaSystem::stop() {
                             close_result, *api_);
     }
     return Status::ok_status();
+}
+
+Result<AlsaReadResult> AlsaSystem::read_interleaved(std::uint8_t* destination,
+                                                    int requested_frames) {
+    if (state_ != kRunning || pcm_ == NULL || destination == NULL ||
+        requested_frames <= 0) {
+        return Result<AlsaReadResult>(Status(
+            StatusCode::kInvalidArgument, "ALSA read request is invalid"));
+    }
+
+    snd_pcm_sframes_t result = 0;
+    do {
+        result = api_->pcm_readi(
+            pcm_, destination, static_cast<snd_pcm_uframes_t>(requested_frames));
+    } while (result == -EINTR);
+
+    if (result > 0) {
+        if (result > requested_frames ||
+            result > std::numeric_limits<int>::max()) {
+            return Result<AlsaReadResult>(Status(
+                StatusCode::kCorruptData,
+                "ALSA read returned an invalid frame count"));
+        }
+        return Result<AlsaReadResult>(AlsaReadResult(
+            static_cast<int>(result), false, false));
+    }
+    if (result == 0 || result == -EAGAIN) {
+        return Result<AlsaReadResult>(AlsaReadResult(0, true, false));
+    }
+    return Result<AlsaReadResult>(read_failure(result, *api_));
 }
 
 }  // namespace detail

@@ -1,8 +1,10 @@
 #ifndef EAVP_PLATFORM_LINUX_ALSA_SYSTEM_HPP_
 #define EAVP_PLATFORM_LINUX_ALSA_SYSTEM_HPP_
 
+#include <cstdint>
 #include <memory>
 
+#include "eavp/base/result.hpp"
 #include "eavp/base/status.hpp"
 #include "eavp/platform/linux/alsa_capture.hpp"
 #include "platform/linux/alsa_api.hpp"
@@ -22,14 +24,31 @@ struct AlsaNegotiatedParameters {
     bool monotonic_timestamp;
 };
 
+struct AlsaReadResult {
+    AlsaReadResult(int frames_read_value, bool would_block_value,
+                   bool timeline_discontinuity_value)
+        : frames_read(frames_read_value), would_block(would_block_value),
+          timeline_discontinuity(timeline_discontinuity_value) {}
+
+    int frames_read;
+    bool would_block;
+    bool timeline_discontinuity;
+};
+
 class AlsaSystem {
 public:
     explicit AlsaSystem(std::unique_ptr<AlsaApi> api);
     ~AlsaSystem() noexcept;
+    AlsaSystem(AlsaSystem&& other) noexcept;
+    AlsaSystem& operator=(AlsaSystem&& other) noexcept;
+    AlsaSystem(const AlsaSystem&) = delete;
+    AlsaSystem& operator=(const AlsaSystem&) = delete;
 
     Status prepare(const AlsaCaptureConfig& config);
     Status start();
     Status stop();
+    Result<AlsaReadResult> read_interleaved(std::uint8_t* destination,
+                                            int requested_frames);
     const AlsaNegotiatedParameters& negotiated() const { return negotiated_; }
 
 private:

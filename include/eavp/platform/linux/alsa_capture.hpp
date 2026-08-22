@@ -1,12 +1,23 @@
 #ifndef EAVP_PLATFORM_LINUX_ALSA_CAPTURE_HPP_
 #define EAVP_PLATFORM_LINUX_ALSA_CAPTURE_HPP_
 
+#include <memory>
 #include <string>
 
 #include "eavp/base/result.hpp"
 #include "eavp/media/audio_format.hpp"
+#include "eavp/media/frame.hpp"
+#include "eavp/media/node.hpp"
+#include "eavp/media/port.hpp"
 
 namespace eavp {
+
+class MetricRegistry;
+class HealthManager;
+
+namespace detail {
+class AlsaSourceNodeTestPeer;
+}
 
 class AlsaCaptureConfig {
 public:
@@ -33,6 +44,32 @@ private:
     int samples_per_frame_;
     int period_size_hint_;
     int buffer_periods_;
+};
+
+class AlsaSourceNode : public MediaNode {
+public:
+    static Result<std::unique_ptr<AlsaSourceNode> > create(
+        const std::string& id, const AlsaCaptureConfig& config,
+        MetricRegistry* metrics, HealthManager* health);
+    ~AlsaSourceNode() noexcept;
+
+    OutputPort<AudioFrame>& output();
+
+protected:
+    Status on_prepare() override;
+    Status on_start() override;
+    Status on_stop() override;
+    Status on_reset() override;
+    Status on_tick() override;
+
+private:
+    class Impl;
+
+    AlsaSourceNode(const std::string& id, std::unique_ptr<Impl> impl);
+
+    std::unique_ptr<Impl> impl_;
+
+    friend class detail::AlsaSourceNodeTestPeer;
 };
 
 }  // namespace eavp
