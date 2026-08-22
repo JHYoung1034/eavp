@@ -97,13 +97,11 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/eavp/management
         OPTIONAL)
 
 add_library(eavp_platform STATIC
+    platform/linux/alsa_capture.cpp
     platform/reference_media_platform.cpp
     platform/simulated_platform.cpp
 )
 add_library(EAVP::platform ALIAS eavp_platform)
-if(EAVP_ENABLE_ALSA)
-    target_sources(eavp_platform PRIVATE platform/linux/alsa_capture.cpp)
-endif()
 target_link_libraries(
     eavp_platform
     PUBLIC EAVP::control EAVP::management
