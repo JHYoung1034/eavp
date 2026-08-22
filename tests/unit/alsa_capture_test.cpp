@@ -197,6 +197,8 @@ TEST(AlsaSourceNodeTest, SuspendRecoveryResumesBeforeSamplingANewAnchor) {
     EXPECT_EQ(1, observed->htimestamp_count);
     EXPECT_EQ(eavp::StatusCode::kWouldBlock, fixture.tick_once_running().code());
     EXPECT_EQ(1, observed->htimestamp_count);
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock, fixture.tick_once_running().code());
+    EXPECT_EQ(1, observed->htimestamp_count);
     ASSERT_TRUE(fixture.tick_once_running().ok());
     EXPECT_EQ(2, observed->htimestamp_count);
     ASSERT_EQ(1U, fixture.input.queue_size());

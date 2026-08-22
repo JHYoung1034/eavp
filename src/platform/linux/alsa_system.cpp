@@ -452,31 +452,6 @@ Result<AlsaReadResult> AlsaSystem::read_interleaved(std::uint8_t* destination,
     }
     if (result == -ESTRPIPE) {
         suspended_ = true;
-        const int resume_result = api_->pcm_resume(pcm_);
-        if (resume_result == -EAGAIN) {
-            return Result<AlsaReadResult>(AlsaReadResult(0, true, true));
-        }
-        if (resume_result >= 0) {
-            suspended_ = false;
-            return Result<AlsaReadResult>(AlsaReadResult(0, true, true));
-        }
-        if (is_device_lost_error(resume_result)) {
-            return Result<AlsaReadResult>(alsa_failure(
-                StatusCode::kDeviceLost, "snd_pcm_resume", resume_result, *api_));
-        }
-        const int prepare_result = api_->pcm_prepare(pcm_);
-        if (prepare_result < 0) {
-            return Result<AlsaReadResult>(alsa_failure(
-                system_error_code(prepare_result), "snd_pcm_prepare", prepare_result,
-                *api_));
-        }
-        const int start_result = api_->pcm_start(pcm_);
-        if (start_result < 0) {
-            return Result<AlsaReadResult>(alsa_failure(
-                system_error_code(start_result), "snd_pcm_start", start_result, *api_));
-        }
-        suspended_ = false;
-        state_ = kRunning;
         return Result<AlsaReadResult>(AlsaReadResult(0, true, true));
     }
     return Result<AlsaReadResult>(read_failure(result, *api_));
@@ -498,17 +473,21 @@ Result<AlsaAnchor> AlsaSystem::capture_anchor() {
     std::int64_t now_us = 0;
     const bool valid_monotonic_now = timespec_to_us(now, &now_us);
 
-    snd_pcm_uframes_t available = 0U;
-    snd_htimestamp_t timestamp;
-    const int htimestamp_result = api_->pcm_htimestamp(pcm_, &available, &timestamp);
     std::int64_t timestamp_us = 0;
     std::int64_t anchor_us = 0;
-    if (htimestamp_result >= 0 && valid_monotonic_now &&
-        timespec_to_us(timestamp, &timestamp_us) &&
-        !(timestamp_us > now_us &&
-          timestamp_us - now_us > kMaximumFutureTimestampUs) &&
-        first_unread_pts(timestamp_us, available, negotiated_.sample_rate, &anchor_us)) {
-        return Result<AlsaAnchor>(AlsaAnchor(anchor_us, false));
+    if (negotiated_.monotonic_timestamp) {
+        snd_pcm_uframes_t available = 0U;
+        snd_htimestamp_t timestamp;
+        const int htimestamp_result =
+            api_->pcm_htimestamp(pcm_, &available, &timestamp);
+        if (htimestamp_result >= 0 && valid_monotonic_now &&
+            timespec_to_us(timestamp, &timestamp_us) &&
+            !(timestamp_us > now_us &&
+              timestamp_us - now_us > kMaximumFutureTimestampUs) &&
+            first_unread_pts(timestamp_us, available, negotiated_.sample_rate,
+                             &anchor_us)) {
+            return Result<AlsaAnchor>(AlsaAnchor(anchor_us, false));
+        }
     }
 
     const snd_pcm_sframes_t fallback_available = api_->pcm_avail_update(pcm_);

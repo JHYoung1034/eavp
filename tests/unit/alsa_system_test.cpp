@@ -148,17 +148,26 @@ TEST(AlsaSystemTest, MapsMissingDeviceAndCapabilityMismatch) {
     EXPECT_EQ(-EINVAL, capability.native_code());
 }
 
-TEST(AlsaSystemTest, UnsupportedMonotonicTimestampEnablesFallbackWithoutUsingRealtime) {
+TEST(AlsaSystemTest, UnsupportedMonotonicTimestampUsesMonotonicAvailFallback) {
     std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
     FakeAlsaApi* observed = fake.get();
     observed->fail_step = FakeAlsaApi::kSwParamsSetTstampType;
     observed->fail_code = -EINVAL;
+    observed->htimestamp_value.tv_sec = 9;
+    observed->avail_update_result = 480;
+    observed->monotonic_now_value.tv_sec = 3;
     eavp::detail::AlsaSystem system(std::move(fake));
 
     ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+    ASSERT_TRUE(system.start().ok());
     EXPECT_FALSE(system.negotiated().monotonic_timestamp);
+    const eavp::Result<eavp::detail::AlsaAnchor> anchor = system.capture_anchor();
+    ASSERT_TRUE(anchor.ok());
+    EXPECT_EQ(2990000, anchor.value().first_unread_pts_us);
+    EXPECT_TRUE(anchor.value().used_fallback);
     EXPECT_EQ(0, observed->htimestamp_count);
-    EXPECT_EQ(0, observed->monotonic_now_count);
+    EXPECT_EQ(1, observed->avail_update_count);
+    EXPECT_EQ(1, observed->monotonic_now_count);
 }
 
 TEST(AlsaSystemTest, TimestampConvertsAvailableFramesToFirstUnreadSamplePts) {
@@ -272,15 +281,22 @@ TEST(AlsaSystemTest, SuspendResumeNeverBlocksExecutor) {
 
     const eavp::Result<eavp::detail::AlsaReadResult> first =
         system.read_interleaved(reinterpret_cast<std::uint8_t*>(observed), 480);
+    ASSERT_TRUE(first.ok());
+    EXPECT_TRUE(first.value().would_block);
+    EXPECT_TRUE(first.value().timeline_discontinuity);
+    EXPECT_EQ(0, observed->pcm_resume_count);
     const eavp::Result<eavp::detail::AlsaReadResult> second =
         system.read_interleaved(reinterpret_cast<std::uint8_t*>(observed), 480);
-
-    ASSERT_TRUE(first.ok());
     ASSERT_TRUE(second.ok());
-    EXPECT_TRUE(first.value().would_block);
     EXPECT_TRUE(second.value().would_block);
-    EXPECT_TRUE(first.value().timeline_discontinuity);
     EXPECT_FALSE(second.value().timeline_discontinuity);
+    EXPECT_EQ(1, observed->pcm_resume_count);
+    const eavp::Result<eavp::detail::AlsaReadResult> third =
+        system.read_interleaved(reinterpret_cast<std::uint8_t*>(observed), 480);
+
+    ASSERT_TRUE(third.ok());
+    EXPECT_TRUE(third.value().would_block);
+    EXPECT_FALSE(third.value().timeline_discontinuity);
     EXPECT_EQ(2, observed->pcm_resume_count);
 }
 
@@ -293,34 +309,50 @@ TEST(AlsaSystemTest, SuspendResumeFatalFallsBackToPrepareAndStart) {
     ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
     ASSERT_TRUE(system.start().ok());
 
-    const eavp::Result<eavp::detail::AlsaReadResult> read =
+    const eavp::Result<eavp::detail::AlsaReadResult> first =
+        system.read_interleaved(reinterpret_cast<std::uint8_t*>(observed), 480);
+    ASSERT_TRUE(first.ok());
+    EXPECT_TRUE(first.value().would_block);
+    EXPECT_TRUE(first.value().timeline_discontinuity);
+    EXPECT_EQ(0, observed->pcm_resume_count);
+    EXPECT_EQ(1, observed->pcm_prepare_count);
+    EXPECT_EQ(1, observed->pcm_start_count);
+
+    const eavp::Result<eavp::detail::AlsaReadResult> second =
         system.read_interleaved(reinterpret_cast<std::uint8_t*>(observed), 480);
 
-    ASSERT_TRUE(read.ok());
-    EXPECT_TRUE(read.value().would_block);
-    EXPECT_TRUE(read.value().timeline_discontinuity);
+    ASSERT_TRUE(second.ok());
+    EXPECT_TRUE(second.value().would_block);
+    EXPECT_FALSE(second.value().timeline_discontinuity);
+    EXPECT_EQ(1, observed->pcm_resume_count);
     EXPECT_EQ(2, observed->pcm_prepare_count);
     EXPECT_EQ(2, observed->pcm_start_count);
 }
 
 TEST(AlsaSystemTest, SuspendResumeDeviceLossDoesNotAttemptFallback) {
-    std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
-    FakeAlsaApi* observed = fake.get();
-    observed->pcm_read_results.push_back(-ESTRPIPE);
-    observed->pcm_resume_results.push_back(-ENODEV);
-    eavp::detail::AlsaSystem system(std::move(fake));
-    ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
-    ASSERT_TRUE(system.start().ok());
+    const int codes[] = {-ENODEV, -ENXIO};
+    for (std::size_t index = 0U; index < 2U; ++index) {
+        std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+        FakeAlsaApi* observed = fake.get();
+        observed->pcm_read_results.push_back(-ESTRPIPE);
+        observed->pcm_resume_results.push_back(codes[index]);
+        eavp::detail::AlsaSystem system(std::move(fake));
+        ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+        ASSERT_TRUE(system.start().ok());
 
-    const eavp::Result<eavp::detail::AlsaReadResult> read =
-        system.read_interleaved(reinterpret_cast<std::uint8_t*>(observed), 480);
+        ASSERT_TRUE(system.read_interleaved(
+            reinterpret_cast<std::uint8_t*>(observed), 480).ok());
+        const eavp::Result<eavp::detail::AlsaReadResult> read =
+            system.read_interleaved(reinterpret_cast<std::uint8_t*>(observed), 480);
 
-    ASSERT_FALSE(read.ok());
-    EXPECT_EQ(eavp::StatusCode::kDeviceLost, read.status().code());
-    EXPECT_EQ("snd_pcm_resume", read.status().operation());
-    EXPECT_EQ(-ENODEV, read.status().native_code());
-    EXPECT_EQ(1, observed->pcm_prepare_count);
-    EXPECT_EQ(1, observed->pcm_start_count);
+        ASSERT_FALSE(read.ok());
+        EXPECT_EQ(eavp::StatusCode::kDeviceLost, read.status().code());
+        EXPECT_EQ("snd_pcm_resume", read.status().operation());
+        EXPECT_EQ(codes[index], read.status().native_code());
+        EXPECT_EQ(1, observed->pcm_resume_count);
+        EXPECT_EQ(1, observed->pcm_prepare_count);
+        EXPECT_EQ(1, observed->pcm_start_count);
+    }
 }
 
 TEST(AlsaSystemTest, RecoveryFailureRetainsNativeOperationAndCode) {
