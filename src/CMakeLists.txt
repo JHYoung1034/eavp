@@ -108,6 +108,10 @@ target_link_libraries(
     PRIVATE $<BUILD_INTERFACE:eavp_project_options>
 )
 if(EAVP_ENABLE_ALSA)
+    target_sources(eavp_platform PRIVATE
+        platform/linux/alsa_lib_api.cpp
+        platform/linux/alsa_system.cpp
+    )
     target_link_libraries(eavp_platform PUBLIC ALSA::ALSA)
 endif()
 target_include_directories(
@@ -116,6 +120,9 @@ target_include_directories(
         $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+if(EAVP_ENABLE_ALSA)
+    target_include_directories(eavp_platform PRIVATE ${PROJECT_SOURCE_DIR}/src)
+endif()
 set_target_properties(eavp_platform PROPERTIES EXPORT_NAME platform)
 install(TARGETS eavp_platform EXPORT EAVPTargets)
 install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/eavp/platform
