@@ -443,7 +443,7 @@ EAVP_ENABLE_ALSA_DEVICE_TESTS=OFF
 6. 开启 ALSA 的安装结果可由独立 `find_package(EAVP)` 消费并链接 `EAVP::platform`；
 7. 三套 ARM preset clean build 平台无关 AudioFormat/AudioFrame，并保持 ALSA/设备测试关闭；
 8. 0.3b 不链接 FFmpeg，不生成 AAC/Opus，不宣称跨设备 A/V 同步；
-9. 文档以简体中文为主，无未解释的遗留标记。
+9. 文档以简体中文为主，无未解释的占位标记。
 
 ## 16. 后续里程碑边界
 
