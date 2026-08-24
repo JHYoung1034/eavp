@@ -97,7 +97,7 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/eavp/management
         OPTIONAL)
 
 add_library(eavp_platform STATIC
-    platform/linux/alsa_capture.cpp
+    platform/linux/alsa_capture_config.cpp
     platform/reference_media_platform.cpp
     platform/simulated_platform.cpp
 )
@@ -109,10 +109,11 @@ target_link_libraries(
 )
 if(EAVP_ENABLE_ALSA)
     target_sources(eavp_platform PRIVATE
+        platform/linux/alsa_capture.cpp
         platform/linux/alsa_lib_api.cpp
         platform/linux/alsa_system.cpp
     )
-    target_link_libraries(eavp_platform PUBLIC ALSA::ALSA)
+    target_link_libraries(eavp_platform PRIVATE ALSA::ALSA)
 endif()
 target_include_directories(
     eavp_platform
