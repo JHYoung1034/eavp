@@ -36,10 +36,19 @@ struct AlsaReadResult {
 };
 
 struct AlsaAnchor {
+    enum Outcome {
+        kAnchor,
+        kWouldBlock,
+        kTimelineDiscontinuity
+    };
+
+    explicit AlsaAnchor(Outcome outcome_value)
+        : outcome(outcome_value), first_unread_pts_us(0), used_fallback(false) {}
     AlsaAnchor(std::int64_t first_unread_pts_us_value, bool used_fallback_value)
-        : first_unread_pts_us(first_unread_pts_us_value),
+        : outcome(kAnchor), first_unread_pts_us(first_unread_pts_us_value),
           used_fallback(used_fallback_value) {}
 
+    Outcome outcome;
     std::int64_t first_unread_pts_us;
     bool used_fallback;
 };
@@ -70,6 +79,8 @@ private:
     };
 
     int close_resources();
+    Status recover_xrun();
+    void begin_suspend_recovery();
 
     std::unique_ptr<AlsaApi> api_;
     snd_pcm_t* pcm_;

@@ -379,6 +379,25 @@ Status AlsaSystem::stop() {
     return Status::ok_status();
 }
 
+Status AlsaSystem::recover_xrun() {
+    const int prepare_result = api_->pcm_prepare(pcm_);
+    if (prepare_result < 0) {
+        return alsa_failure(system_error_code(prepare_result),
+                            "snd_pcm_prepare", prepare_result, *api_);
+    }
+    const int start_result = api_->pcm_start(pcm_);
+    if (start_result < 0) {
+        return alsa_failure(system_error_code(start_result),
+                            "snd_pcm_start", start_result, *api_);
+    }
+    state_ = kRunning;
+    return Status::ok_status();
+}
+
+void AlsaSystem::begin_suspend_recovery() {
+    suspended_ = true;
+}
+
 Result<AlsaReadResult> AlsaSystem::read_interleaved(std::uint8_t* destination,
                                                     int requested_frames) {
     if (state_ != kRunning || pcm_ == NULL || destination == NULL ||
@@ -436,22 +455,12 @@ Result<AlsaReadResult> AlsaSystem::read_interleaved(std::uint8_t* destination,
         return Result<AlsaReadResult>(AlsaReadResult(0, true, false));
     }
     if (result == -EPIPE) {
-        const int prepare_result = api_->pcm_prepare(pcm_);
-        if (prepare_result < 0) {
-            return Result<AlsaReadResult>(alsa_failure(
-                system_error_code(prepare_result), "snd_pcm_prepare", prepare_result,
-                *api_));
-        }
-        const int start_result = api_->pcm_start(pcm_);
-        if (start_result < 0) {
-            return Result<AlsaReadResult>(alsa_failure(
-                system_error_code(start_result), "snd_pcm_start", start_result, *api_));
-        }
-        state_ = kRunning;
+        const Status recovery = recover_xrun();
+        if (!recovery.ok()) return Result<AlsaReadResult>(recovery);
         return Result<AlsaReadResult>(AlsaReadResult(0, true, true));
     }
     if (result == -ESTRPIPE) {
-        suspended_ = true;
+        begin_suspend_recovery();
         return Result<AlsaReadResult>(AlsaReadResult(0, true, true));
     }
     return Result<AlsaReadResult>(read_failure(result, *api_));
@@ -480,6 +489,22 @@ Result<AlsaAnchor> AlsaSystem::capture_anchor() {
         snd_htimestamp_t timestamp;
         const int htimestamp_result =
             api_->pcm_htimestamp(pcm_, &available, &timestamp);
+        if (htimestamp_result == -EPIPE) {
+            const Status recovery = recover_xrun();
+            if (!recovery.ok()) return Result<AlsaAnchor>(recovery);
+            return Result<AlsaAnchor>(
+                AlsaAnchor(AlsaAnchor::kTimelineDiscontinuity));
+        }
+        if (htimestamp_result == -ESTRPIPE) {
+            begin_suspend_recovery();
+            return Result<AlsaAnchor>(
+                AlsaAnchor(AlsaAnchor::kTimelineDiscontinuity));
+        }
+        if (is_device_lost_error(htimestamp_result)) {
+            return Result<AlsaAnchor>(alsa_failure(
+                StatusCode::kDeviceLost, "snd_pcm_htimestamp",
+                htimestamp_result, *api_));
+        }
         if (htimestamp_result >= 0 && valid_monotonic_now &&
             timespec_to_us(timestamp, &timestamp_us) &&
             !(timestamp_us > now_us &&
@@ -492,6 +517,20 @@ Result<AlsaAnchor> AlsaSystem::capture_anchor() {
 
     const snd_pcm_sframes_t fallback_available = api_->pcm_avail_update(pcm_);
     if (fallback_available < 0) {
+        if (fallback_available == -EAGAIN) {
+            return Result<AlsaAnchor>(AlsaAnchor(AlsaAnchor::kWouldBlock));
+        }
+        if (fallback_available == -EPIPE) {
+            const Status recovery = recover_xrun();
+            if (!recovery.ok()) return Result<AlsaAnchor>(recovery);
+            return Result<AlsaAnchor>(
+                AlsaAnchor(AlsaAnchor::kTimelineDiscontinuity));
+        }
+        if (fallback_available == -ESTRPIPE) {
+            begin_suspend_recovery();
+            return Result<AlsaAnchor>(
+                AlsaAnchor(AlsaAnchor::kTimelineDiscontinuity));
+        }
         return Result<AlsaAnchor>(alsa_failure(
             system_error_code(static_cast<int>(fallback_available)),
             "snd_pcm_avail_update", static_cast<int>(fallback_available), *api_));

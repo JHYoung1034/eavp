@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
 
 #include <cerrno>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <string>
 
 #include "eavp/management/health.hpp"
 #include "eavp/management/metrics.hpp"
@@ -101,6 +103,29 @@ private:
     bool block_fallback;
 };
 
+void configure_anchor_query_path(eavp_test::FakeAlsaApi* fake,
+                                 bool use_fallback) {
+    if (use_fallback) {
+        fake->fail_step = eavp_test::FakeAlsaApi::kSwParamsSetTstampType;
+        fake->fail_code = -EINVAL;
+    }
+}
+
+void set_anchor_query_result(eavp_test::FakeAlsaApi* fake,
+                             bool use_fallback, int result) {
+    if (use_fallback) {
+        fake->avail_update_result = result;
+    } else {
+        fake->htimestamp_result = result;
+    }
+}
+
+std::uint64_t counter_or_zero(const eavp::MetricRegistry& metrics,
+                              const std::string& name) {
+    const eavp::Result<std::uint64_t> counter = metrics.counter(name);
+    return counter.ok() ? counter.value() : 0U;
+}
+
 TEST(AlsaSourceNodeTest, AggregatesShortReadsIntoOneExactFrame) {
     eavp_test::ScriptedAlsa source;
     source.read_frames.push_back(120);
@@ -149,6 +174,114 @@ TEST(AlsaSourceNodeTest, PtsDiscardsWouldBlockAnchorCandidateAndResamplesBeforeR
     ASSERT_EQ(1U, fixture.input.queue_size());
     EXPECT_EQ(500000, fixture.take_frame()->pts());
     EXPECT_EQ(2, observed->htimestamp_count);
+}
+
+TEST(AlsaSourceNodeTest,
+     AnchorQueryDiscontinuitiesBeforeFirstReadRecoverAndMarkTheFirstFrame) {
+    const int errors[] = {-EPIPE, -ESTRPIPE};
+    for (std::size_t fallback_index = 0U; fallback_index < 2U;
+         ++fallback_index) {
+        for (std::size_t error_index = 0U; error_index < 2U; ++error_index) {
+            SCOPED_TRACE(::testing::Message()
+                         << "fallback=" << fallback_index
+                         << ", error=" << errors[error_index]);
+            std::unique_ptr<eavp_test::FakeAlsaApi> fake(
+                new eavp_test::FakeAlsaApi());
+            eavp_test::FakeAlsaApi* observed = fake.get();
+            configure_anchor_query_path(observed, fallback_index != 0U);
+            set_anchor_query_result(observed, fallback_index != 0U,
+                                    errors[error_index]);
+            observed->pcm_read_results.push_back(480);
+            observed->pcm_read_results.push_back(480);
+            std::unique_ptr<eavp::detail::AlsaSystem> system(
+                new eavp::detail::AlsaSystem(
+                    std::unique_ptr<eavp::detail::AlsaApi>(fake.release())));
+            NodeFixture fixture(std::move(system),
+                                eavp_test::make_alsa_config(), 1U);
+            ASSERT_TRUE(fixture.start());
+
+            const eavp::Status discontinuity = fixture.tick_once_running();
+            EXPECT_EQ(eavp::StatusCode::kWouldBlock, discontinuity.code());
+            if (discontinuity.code() != eavp::StatusCode::kWouldBlock) continue;
+            EXPECT_EQ(2U, observed->pcm_read_results.size());
+            set_anchor_query_result(observed, fallback_index != 0U, 0);
+            if (errors[error_index] == -ESTRPIPE) {
+                EXPECT_EQ(eavp::StatusCode::kWouldBlock,
+                          fixture.tick_once_running().code());
+            }
+            ASSERT_TRUE(fixture.tick_once_running().ok());
+            ASSERT_EQ(1U, fixture.input.queue_size());
+            EXPECT_TRUE(fixture.take_frame()->discontinuity());
+            ASSERT_TRUE(fixture.tick_once_running().ok());
+            ASSERT_EQ(1U, fixture.input.queue_size());
+            EXPECT_FALSE(fixture.take_frame()->discontinuity());
+            EXPECT_EQ(errors[error_index] == -EPIPE ? 1U : 0U,
+                      counter_or_zero(fixture.metrics,
+                                      "alsa_capture.mic0.xruns"));
+            EXPECT_EQ(errors[error_index] == -ESTRPIPE ? 1U : 0U,
+                      counter_or_zero(fixture.metrics,
+                                      "alsa_capture.mic0.suspends"));
+            EXPECT_EQ(1U, fixture.metrics.counter(
+                              "alsa_capture.mic0.recoveries").value());
+            EXPECT_EQ(1U, fixture.metrics.counter(
+                              "alsa_capture.mic0.discontinuities").value());
+        }
+    }
+}
+
+TEST(AlsaSourceNodeTest,
+     AnchorQueryDiscontinuitiesDuringReanchorRecoverAndMarkTheFirstFrame) {
+    const int errors[] = {-EPIPE, -ESTRPIPE};
+    for (std::size_t fallback_index = 0U; fallback_index < 2U;
+         ++fallback_index) {
+        for (std::size_t error_index = 0U; error_index < 2U; ++error_index) {
+            SCOPED_TRACE(::testing::Message()
+                         << "fallback=" << fallback_index
+                         << ", error=" << errors[error_index]);
+            std::unique_ptr<eavp_test::FakeAlsaApi> fake(
+                new eavp_test::FakeAlsaApi());
+            eavp_test::FakeAlsaApi* observed = fake.get();
+            configure_anchor_query_path(observed, fallback_index != 0U);
+            observed->pcm_read_results.push_back(-EPIPE);
+            observed->pcm_read_results.push_back(480);
+            observed->pcm_read_results.push_back(480);
+            std::unique_ptr<eavp::detail::AlsaSystem> system(
+                new eavp::detail::AlsaSystem(
+                    std::unique_ptr<eavp::detail::AlsaApi>(fake.release())));
+            NodeFixture fixture(std::move(system),
+                                eavp_test::make_alsa_config(), 1U);
+            ASSERT_TRUE(fixture.start());
+            ASSERT_EQ(eavp::StatusCode::kWouldBlock,
+                      fixture.tick_once_running().code());
+
+            set_anchor_query_result(observed, fallback_index != 0U,
+                                    errors[error_index]);
+            const eavp::Status discontinuity = fixture.tick_once_running();
+            EXPECT_EQ(eavp::StatusCode::kWouldBlock, discontinuity.code());
+            if (discontinuity.code() != eavp::StatusCode::kWouldBlock) continue;
+            set_anchor_query_result(observed, fallback_index != 0U, 0);
+            if (errors[error_index] == -ESTRPIPE) {
+                EXPECT_EQ(eavp::StatusCode::kWouldBlock,
+                          fixture.tick_once_running().code());
+            }
+            ASSERT_TRUE(fixture.tick_once_running().ok());
+            ASSERT_EQ(1U, fixture.input.queue_size());
+            EXPECT_TRUE(fixture.take_frame()->discontinuity());
+            ASSERT_TRUE(fixture.tick_once_running().ok());
+            ASSERT_EQ(1U, fixture.input.queue_size());
+            EXPECT_FALSE(fixture.take_frame()->discontinuity());
+            EXPECT_EQ(errors[error_index] == -EPIPE ? 2U : 1U,
+                      counter_or_zero(fixture.metrics,
+                                      "alsa_capture.mic0.xruns"));
+            EXPECT_EQ(errors[error_index] == -ESTRPIPE ? 1U : 0U,
+                      counter_or_zero(fixture.metrics,
+                                      "alsa_capture.mic0.suspends"));
+            EXPECT_EQ(2U, fixture.metrics.counter(
+                              "alsa_capture.mic0.recoveries").value());
+            EXPECT_EQ(2U, fixture.metrics.counter(
+                              "alsa_capture.mic0.discontinuities").value());
+        }
+    }
 }
 
 TEST(AlsaSourceNodeTest, XrunDropsPartialAndMarksExactlyOneFrame) {

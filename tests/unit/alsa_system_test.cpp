@@ -208,6 +208,106 @@ TEST(AlsaSystemTest, TimestampFallsBackToMonotonicClockWhenHtimestampFails) {
     EXPECT_EQ(1, observed->avail_update_count);
 }
 
+TEST(AlsaSystemTest,
+     AnchorQueryRecoversXrunAndDefersSuspendForBothTimestampPaths) {
+    const int errors[] = {-EPIPE, -ESTRPIPE};
+    for (std::size_t fallback_index = 0U; fallback_index < 2U;
+         ++fallback_index) {
+        for (std::size_t error_index = 0U; error_index < 2U; ++error_index) {
+            SCOPED_TRACE(::testing::Message()
+                         << "fallback=" << fallback_index
+                         << ", error=" << errors[error_index]);
+            std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+            FakeAlsaApi* observed = fake.get();
+            if (fallback_index != 0U) {
+                observed->fail_step = FakeAlsaApi::kSwParamsSetTstampType;
+                observed->fail_code = -EINVAL;
+                observed->avail_update_result = errors[error_index];
+            } else {
+                observed->htimestamp_result = errors[error_index];
+            }
+            eavp::detail::AlsaSystem system(std::move(fake));
+            ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+            ASSERT_TRUE(system.start().ok());
+
+            const eavp::Result<eavp::detail::AlsaAnchor> anchor =
+                system.capture_anchor();
+
+            ASSERT_TRUE(anchor.ok());
+            EXPECT_EQ(eavp::detail::AlsaAnchor::kTimelineDiscontinuity,
+                      anchor.value().outcome);
+            if (errors[error_index] == -EPIPE) {
+                EXPECT_FALSE(system.suspend_recovery_pending());
+                EXPECT_EQ(2, observed->pcm_prepare_count);
+                EXPECT_EQ(2, observed->pcm_start_count);
+            } else {
+                EXPECT_TRUE(system.suspend_recovery_pending());
+                EXPECT_EQ(1, observed->pcm_prepare_count);
+                EXPECT_EQ(1, observed->pcm_start_count);
+                EXPECT_EQ(0, observed->pcm_resume_count);
+            }
+        }
+    }
+}
+
+TEST(AlsaSystemTest, AnchorQueryEagainReturnsWouldBlockWithoutRecovery) {
+    std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+    FakeAlsaApi* observed = fake.get();
+    observed->fail_step = FakeAlsaApi::kSwParamsSetTstampType;
+    observed->fail_code = -EINVAL;
+    observed->avail_update_result = -EAGAIN;
+    eavp::detail::AlsaSystem system(std::move(fake));
+    ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+    ASSERT_TRUE(system.start().ok());
+
+    const eavp::Result<eavp::detail::AlsaAnchor> anchor =
+        system.capture_anchor();
+
+    ASSERT_TRUE(anchor.ok());
+    EXPECT_EQ(eavp::detail::AlsaAnchor::kWouldBlock,
+              anchor.value().outcome);
+    EXPECT_FALSE(system.suspend_recovery_pending());
+    EXPECT_EQ(1, observed->pcm_prepare_count);
+    EXPECT_EQ(1, observed->pcm_start_count);
+}
+
+TEST(AlsaSystemTest, AnchorQueryDeviceLossNeverFallsBack) {
+    const int errors[] = {-ENODEV, -ENXIO};
+    for (std::size_t fallback_index = 0U; fallback_index < 2U;
+         ++fallback_index) {
+        for (std::size_t error_index = 0U; error_index < 2U; ++error_index) {
+            SCOPED_TRACE(::testing::Message()
+                         << "fallback=" << fallback_index
+                         << ", error=" << errors[error_index]);
+            std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+            FakeAlsaApi* observed = fake.get();
+            if (fallback_index != 0U) {
+                observed->fail_step = FakeAlsaApi::kSwParamsSetTstampType;
+                observed->fail_code = -EINVAL;
+                observed->avail_update_result = errors[error_index];
+            } else {
+                observed->htimestamp_result = errors[error_index];
+            }
+            eavp::detail::AlsaSystem system(std::move(fake));
+            ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+            ASSERT_TRUE(system.start().ok());
+
+            const eavp::Result<eavp::detail::AlsaAnchor> anchor =
+                system.capture_anchor();
+
+            ASSERT_FALSE(anchor.ok());
+            EXPECT_EQ(eavp::StatusCode::kDeviceLost, anchor.status().code());
+            EXPECT_EQ(errors[error_index], anchor.status().native_code());
+            EXPECT_EQ(fallback_index == 0U ? "snd_pcm_htimestamp"
+                                           : "snd_pcm_avail_update",
+                      anchor.status().operation());
+            if (fallback_index == 0U) {
+                EXPECT_EQ(0, observed->avail_update_count);
+            }
+        }
+    }
+}
+
 TEST(AlsaSystemTest, TimestampRejectsInvalidOrClearlyFutureAnchorData) {
     std::unique_ptr<FakeAlsaApi> invalid_fake(new FakeAlsaApi());
     invalid_fake->htimestamp_value.tv_sec = 1;

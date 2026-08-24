@@ -272,6 +272,22 @@ public:
         return observer_status.ok() ? media_status : observer_status;
     }
 
+    Status handle_timeline_discontinuity(bool xrun) {
+        reset_timeline_after_discontinuity();
+        const Status partial_status = invoke_observer([this]() {
+            return observer->on_partial(0);
+        });
+        if (!partial_status.ok()) return partial_status;
+        if (xrun) {
+            const Status observer_status = invoke_observer([this]() {
+                return observer->on_recovery(true);
+            });
+            if (!observer_status.ok()) return observer_status;
+        }
+        return report_would_block(Status(
+            StatusCode::kWouldBlock, "ALSA capture recovered timeline"));
+    }
+
     AlsaCaptureConfig config;
     MetricRegistry* metrics;
     HealthManager* health;
@@ -449,25 +465,24 @@ Status AlsaSourceNode::on_tick() {
             if (!anchor_candidate.ok()) {
                 return impl_->report_media_failure(anchor_candidate.status());
             }
+            if (anchor_candidate.value().outcome ==
+                detail::AlsaAnchor::kTimelineDiscontinuity) {
+                return impl_->handle_timeline_discontinuity(
+                    !impl_->system->suspend_recovery_pending());
+            }
+            if (anchor_candidate.value().outcome ==
+                detail::AlsaAnchor::kWouldBlock) {
+                return impl_->report_would_block(Status(
+                    StatusCode::kWouldBlock,
+                    "ALSA capture anchor would block"));
+            }
         }
         const Result<detail::AlsaReadResult> read =
             impl_->system->read_interleaved(destination, missing);
         if (!read.ok()) return impl_->report_media_failure(read.status());
         if (read.value().timeline_discontinuity) {
-            const bool xrun = !impl_->system->suspend_recovery_pending();
-            impl_->reset_timeline_after_discontinuity();
-            const Status partial_status = invoke_observer([this]() {
-                return impl_->observer->on_partial(0);
-            });
-            if (!partial_status.ok()) return partial_status;
-            if (xrun) {
-                const Status observer_status = invoke_observer([this]() {
-                    return impl_->observer->on_recovery(true);
-                });
-                if (!observer_status.ok()) return observer_status;
-            }
-            return impl_->report_would_block(Status(
-                StatusCode::kWouldBlock, "ALSA capture recovered timeline"));
+            return impl_->handle_timeline_discontinuity(
+                !impl_->system->suspend_recovery_pending());
         }
         if (read.value().would_block) {
             return impl_->report_would_block(
