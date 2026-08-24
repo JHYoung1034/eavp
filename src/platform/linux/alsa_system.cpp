@@ -39,6 +39,7 @@ Status read_failure(snd_pcm_sframes_t native_code, const AlsaApi& api) {
 const std::int64_t kMicrosecondsPerSecond = 1000000;
 const std::int64_t kNanosecondsPerSecond = 1000000000;
 const std::int64_t kMaximumFutureTimestampUs = 1000000;
+const int kMaximumReadAttemptsPerTick = 2;
 
 bool timespec_to_us(const struct timespec& value, std::int64_t* result) {
     if (result == NULL || value.tv_sec < 0 || value.tv_nsec < 0 ||
@@ -436,10 +437,11 @@ Result<AlsaReadResult> AlsaSystem::read_interleaved(std::uint8_t* destination,
     }
 
     snd_pcm_sframes_t result = 0;
-    do {
+    for (int attempt = 0; attempt < kMaximumReadAttemptsPerTick; ++attempt) {
         result = api_->pcm_readi(
             pcm_, destination, static_cast<snd_pcm_uframes_t>(requested_frames));
-    } while (result == -EINTR);
+        if (result != -EINTR) break;
+    }
 
     if (result > 0) {
         if (result > requested_frames ||
@@ -451,7 +453,7 @@ Result<AlsaReadResult> AlsaSystem::read_interleaved(std::uint8_t* destination,
         return Result<AlsaReadResult>(AlsaReadResult(
             static_cast<int>(result), false, false));
     }
-    if (result == 0 || result == -EAGAIN) {
+    if (result == 0 || result == -EAGAIN || result == -EINTR) {
         return Result<AlsaReadResult>(AlsaReadResult(0, true, false));
     }
     if (result == -EPIPE) {

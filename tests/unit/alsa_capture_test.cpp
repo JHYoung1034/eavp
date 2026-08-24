@@ -569,6 +569,27 @@ TEST(AlsaSystemReadTest, EintrRetriesSameRead) {
     EXPECT_EQ(2, source.observed_read_calls());
 }
 
+TEST(AlsaSystemReadTest, RepeatedEintrStopsAtTwoReadsAndContinuesNextTick) {
+    eavp_test::ScriptedAlsa source;
+    source.append_error(-EINTR);
+    source.append_error(-EINTR);
+    source.append_error(-EINTR);
+    source.read_frames.push_back(120);
+    eavp::detail::AlsaSystem system = source.take_started_system();
+
+    const eavp::Result<eavp::detail::AlsaReadResult> first =
+        system.read_interleaved(source.bytes(), 480);
+    ASSERT_TRUE(first.ok());
+    EXPECT_TRUE(first.value().would_block);
+    EXPECT_EQ(2, source.observed_read_calls());
+
+    const eavp::Result<eavp::detail::AlsaReadResult> second =
+        system.read_interleaved(source.bytes(), 480);
+    ASSERT_TRUE(second.ok());
+    EXPECT_EQ(120, second.value().frames_read);
+    EXPECT_EQ(4, source.observed_read_calls());
+}
+
 TEST(AlsaSystemReadTest, RejectsInvalidRequests) {
     eavp_test::ScriptedAlsa source;
     std::unique_ptr<eavp::detail::AlsaSystem> stopped_holder = source.take_system();
