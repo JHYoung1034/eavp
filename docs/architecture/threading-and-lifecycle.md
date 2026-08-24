@@ -1,7 +1,7 @@
 # 线程、背压与生命周期
 
 > 状态：已接受\
-> 适用版本：EAVP 0.2.0\
+> 适用版本：稳定包 EAVP 0.2.0 与 0.3b 开发能力\
 > 规范性范围：Node/Pipeline 与媒体后端的执行语义
 
 0.2.0 不允许 Node 或后端实现创建 EAVP 不可见的控制线程。调用者通过确定性 Executor 按拓扑顺序执行 tick，使测试和故障恢复具有可重复顺序。厂商 SDK 的内部线程可以存在，但完成事件必须通过非阻塞 `submit`/`receive` 进入 EAVP；未来线程池只能替换 Executor，不得改变 Node 生命周期接口。
@@ -15,3 +15,5 @@ Processor 与 Encoder 的后端状态为 `Created -> Configured -> Running -> Dr
 `BufferStorage` 实现必须声明自身是否允许同一 Storage 的并发或重入 `map()`；通用 `MappedRegion` 不替 Storage 串行化。无论采用何种策略，每次成功 `map()` 都必须由且仅由对应 `MappedRegion` 触发一次 `unmap()`，move 只转移这一次配对责任。只读映射不暴露可写指针。内置 CPU Storage 明确允许同一线程重入映射，也允许调用方自行同步后的并发映射；其 `unmap()` 不改变底层字节所有权，相关回归同时持有读写与只读映射并验证共享可见性。第三方 Storage 若不允许重入或并发，必须在自身 `map()` 中以明确 Status 拒绝，而不是阻塞 Executor。
 
 Pipeline 的普通 `stop()` 按拓扑跨 Executor 调用逐步排空，`kWouldBlock` 保持 `Draining`。调用方需要放弃排空时可显式 `cancel()`，由 Pipeline 逆拓扑强制 reset；析构只尝试一次普通 stop，未收敛即执行同样的无抛异常清理，不以无界循环等待永久背压。
+
+0.3b `AlsaSourceNode` 不创建线程，也不调用 `snd_pcm_wait`。每次 tick 至多进行一次非阻塞读取：短读仅累积，绝不补零或输出不足 `samples_per_frame` 的帧；`-EAGAIN` 或零读取返回 `kWouldBlock`。若存在 pending AudioFrame，必须优先重试下游发送；背压时不得继续读取 ALSA。XRUN/suspend 恢复有界地跨 tick 推进，恢复时丢弃 partial、重新锚定时间线，并仅在恢复后的第一个完整帧设置 `discontinuity`。`stop` 丢弃 partial/pending 并关闭设备，重复 stop/reset 保持幂等。
