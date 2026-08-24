@@ -5,6 +5,8 @@
 #include <fcntl.h>
 #include <limits>
 #include <memory>
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
 #include <utility>
@@ -98,6 +100,33 @@ public:
 private:
     std::vector<std::uint8_t> bytes_;
     int unmap_count_;
+    std::string provider_id_;
+};
+
+class ThrowingMemoryDomainStorage : public eavp::BufferStorage {
+public:
+    enum Failure { kBadAlloc, kUnexpected };
+
+    explicit ThrowingMemoryDomainStorage(Failure failure)
+        : failure_(failure), provider_id_("throwing-domain") {}
+
+    eavp::MemoryDomain memory_domain() const override {
+        if (failure_ == kBadAlloc) throw std::bad_alloc();
+        throw std::runtime_error("memory domain failed");
+    }
+    std::size_t capacity() const override { return 1920U; }
+    const std::string& provider_id() const override { return provider_id_; }
+    eavp::Status map(eavp::MapMode, std::uint8_t**, std::size_t*) override {
+        return eavp::Status(eavp::StatusCode::kUnsupported);
+    }
+    eavp::Status unmap() override { return eavp::Status::ok_status(); }
+    eavp::Result<eavp::NativeBufferHandle> export_dmabuf() const override {
+        return eavp::Result<eavp::NativeBufferHandle>(
+            eavp::Status(eavp::StatusCode::kUnsupported));
+    }
+
+private:
+    Failure failure_;
     std::string provider_id_;
 };
 
@@ -744,6 +773,43 @@ TEST(AudioFrameTest, RejectsOverflowingPayloadSizeWhenRepresentable) {
         EXPECT_LE(static_cast<std::size_t>(std::numeric_limits<int>::max()),
                   std::numeric_limits<std::size_t>::max() / 8U);
     }
+}
+
+TEST(AudioFrameTest, ConvertsValidationExceptionsWithoutAllocatingDiagnostics) {
+    const eavp::AudioFormat format = eavp::AudioFormat::create(
+        eavp::SampleFormat::kSigned16LittleEndian, 48000,
+        eavp::AudioChannelLayout::kStereo,
+        eavp::AudioSampleLayout::kInterleaved,
+        eavp::MemoryDomain::kCpu).take_value();
+    const eavp::TimeBase time_base =
+        eavp::TimeBase::create(1, 1000000).take_value();
+    const std::vector<eavp::PlaneLayout> planes{
+        eavp::PlaneLayout(0U, 1920U, 1920U)};
+
+    std::shared_ptr<eavp::BufferStorage> bad_alloc_storage(
+        new ThrowingMemoryDomainStorage(
+            ThrowingMemoryDomainStorage::kBadAlloc));
+    const eavp::Buffer bad_alloc_buffer =
+        eavp::Buffer::create(bad_alloc_storage, planes).take_value();
+    const eavp::Result<eavp::AudioFrame> bad_alloc_frame =
+        eavp::AudioFrame::create(
+            bad_alloc_buffer, format, 480, 0, time_base, false);
+    ASSERT_FALSE(bad_alloc_frame.ok());
+    EXPECT_EQ(eavp::StatusCode::kResourceExhausted,
+              bad_alloc_frame.status().code());
+    EXPECT_TRUE(bad_alloc_frame.status().message().empty());
+
+    std::shared_ptr<eavp::BufferStorage> unexpected_storage(
+        new ThrowingMemoryDomainStorage(
+            ThrowingMemoryDomainStorage::kUnexpected));
+    const eavp::Buffer unexpected_buffer =
+        eavp::Buffer::create(unexpected_storage, planes).take_value();
+    const eavp::Result<eavp::AudioFrame> unexpected_frame =
+        eavp::AudioFrame::create(
+            unexpected_buffer, format, 480, 0, time_base, false);
+    ASSERT_FALSE(unexpected_frame.ok());
+    EXPECT_EQ(eavp::StatusCode::kInternal, unexpected_frame.status().code());
+    EXPECT_TRUE(unexpected_frame.status().message().empty());
 }
 
 }  // namespace

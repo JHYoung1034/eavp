@@ -17,8 +17,7 @@ namespace {
 const std::int64_t kMicrosecondsPerSecond = 1000000;
 
 Status allocation_failure() {
-    return Status(StatusCode::kResourceExhausted,
-                  "failed to allocate ALSA capture frame storage");
+    return Status(StatusCode::kResourceExhausted);
 }
 
 bool samples_to_us(std::int64_t samples, int sample_rate, std::int64_t* result) {
@@ -48,10 +47,9 @@ Status invoke_observer(const ObserverCall& call) {
     try {
         return call();
     } catch (const std::bad_alloc&) {
-        return Status(StatusCode::kResourceExhausted,
-                      "ALSA observer exhausted resources");
+        return Status(StatusCode::kResourceExhausted);
     } catch (...) {
-        return Status(StatusCode::kInternal, "ALSA observer failed");
+        return Status(StatusCode::kInternal);
     }
 }
 
@@ -204,8 +202,7 @@ public:
         } catch (const std::bad_alloc&) {
             return allocation_failure();
         } catch (...) {
-            return Status(StatusCode::kInternal,
-                          "failed to retain ALSA capture frame storage");
+            return Status(StatusCode::kInternal);
         }
         return Status::ok_status();
     }
@@ -313,12 +310,12 @@ AlsaSourceNode::~AlsaSourceNode() noexcept {}
 Result<std::unique_ptr<AlsaSourceNode> > AlsaSourceNode::create(
     const std::string& id, const AlsaCaptureConfig& config,
     MetricRegistry* metrics, HealthManager* health) {
-    if (id.empty() || metrics == NULL || health == NULL) {
-        return Result<std::unique_ptr<AlsaSourceNode> >(Status(
-            StatusCode::kInvalidArgument,
-            "ALSA source node id and observers must be configured"));
-    }
     try {
+        if (id.empty() || metrics == NULL || health == NULL) {
+            return Result<std::unique_ptr<AlsaSourceNode> >(Status(
+                StatusCode::kInvalidArgument,
+                "ALSA source node id and observers must be configured"));
+        }
         std::unique_ptr<detail::AlsaSystem> system(
             new detail::AlsaSystem(detail::create_libasound_api()));
         std::unique_ptr<Impl> impl(
@@ -328,8 +325,8 @@ Result<std::unique_ptr<AlsaSourceNode> > AlsaSourceNode::create(
     } catch (const std::bad_alloc&) {
         return Result<std::unique_ptr<AlsaSourceNode> >(allocation_failure());
     } catch (...) {
-        return Result<std::unique_ptr<AlsaSourceNode> >(Status(
-            StatusCode::kInternal, "failed to create ALSA source node"));
+        return Result<std::unique_ptr<AlsaSourceNode> >(
+            Status(StatusCode::kInternal));
     }
 }
 
@@ -348,7 +345,7 @@ Status AlsaSourceNode::on_prepare() {
     } catch (const std::bad_alloc&) {
         return allocation_failure();
     } catch (...) {
-        return Status(StatusCode::kInternal, "failed to prepare ALSA source node");
+        return Status(StatusCode::kInternal);
     }
 }
 
@@ -376,29 +373,33 @@ Status AlsaSourceNode::on_start() {
     } catch (const std::bad_alloc&) {
         return allocation_failure();
     } catch (...) {
-        return Status(StatusCode::kInternal, "failed to start ALSA source node");
+        return Status(StatusCode::kInternal);
     }
 }
 
 Status AlsaSourceNode::on_stop() {
-    impl_->discard_capture_data();
     try {
+        impl_->discard_capture_data();
         return impl_->system->stop();
+    } catch (const std::bad_alloc&) {
+        return allocation_failure();
     } catch (...) {
-        return Status(StatusCode::kInternal, "failed to stop ALSA source node");
+        return Status(StatusCode::kInternal);
     }
 }
 
 Status AlsaSourceNode::on_reset() {
-    impl_->discard_capture_data();
     try {
+        impl_->discard_capture_data();
         const Status stop_status = impl_->system->stop();
         if (!stop_status.ok()) return stop_status;
         return invoke_observer([this]() {
             return impl_->observer->on_negotiated(0, 0);
         });
+    } catch (const std::bad_alloc&) {
+        return allocation_failure();
     } catch (...) {
-        return Status(StatusCode::kInternal, "failed to reset ALSA source node");
+        return Status(StatusCode::kInternal);
     }
 }
 
@@ -526,7 +527,7 @@ Status AlsaSourceNode::on_tick() {
         try {
             impl_->pending.reset(new AudioFrame(frame.value()));
         } catch (const std::bad_alloc&) {
-            return impl_->report_media_failure(allocation_failure());
+            return allocation_failure();
         }
         impl_->partial_buffer.reset();
         impl_->partial_samples = 0;
@@ -558,10 +559,9 @@ Status AlsaSourceNode::on_tick() {
             return impl_->observer->on_frame(*delivered);
         });
     } catch (const std::bad_alloc&) {
-        return impl_->report_media_failure(allocation_failure());
+        return allocation_failure();
     } catch (...) {
-        return impl_->report_media_failure(Status(
-            StatusCode::kInternal, "failed to capture ALSA audio"));
+        return Status(StatusCode::kInternal);
     }
 }
 
@@ -571,12 +571,12 @@ Result<std::unique_ptr<AlsaSourceNode> > AlsaSourceNodeTestPeer::create(
     const std::string& id, const AlsaCaptureConfig& config,
     MetricRegistry* metrics, HealthManager* health,
     std::unique_ptr<AlsaSystem> system, AlsaObserver* observer) {
-    if (id.empty() || metrics == NULL || health == NULL || !system) {
-        return Result<std::unique_ptr<AlsaSourceNode> >(Status(
-            StatusCode::kInvalidArgument,
-            "ALSA source node id, observers and system must be configured"));
-    }
     try {
+        if (id.empty() || metrics == NULL || health == NULL || !system) {
+            return Result<std::unique_ptr<AlsaSourceNode> >(Status(
+                StatusCode::kInvalidArgument,
+                "ALSA source node id, observers and system must be configured"));
+        }
         std::unique_ptr<AlsaSourceNode::Impl> impl(
             new AlsaSourceNode::Impl(id, config, metrics, health, std::move(system),
                                      observer));
@@ -585,8 +585,8 @@ Result<std::unique_ptr<AlsaSourceNode> > AlsaSourceNodeTestPeer::create(
     } catch (const std::bad_alloc&) {
         return Result<std::unique_ptr<AlsaSourceNode> >(allocation_failure());
     } catch (...) {
-        return Result<std::unique_ptr<AlsaSourceNode> >(Status(
-            StatusCode::kInternal, "failed to create ALSA source test node"));
+        return Result<std::unique_ptr<AlsaSourceNode> >(
+            Status(StatusCode::kInternal));
     }
 }
 

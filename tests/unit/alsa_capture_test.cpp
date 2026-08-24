@@ -76,16 +76,70 @@ private:
 class ThrowingAlsaObserver : public FailingAlsaObserver {
 public:
     enum Failure { kBadAlloc, kUnexpected };
+    enum Callback { kWouldBlock, kNegotiated };
 
-    explicit ThrowingAlsaObserver(Failure failure) : failure_(failure) {}
+    explicit ThrowingAlsaObserver(Failure failure,
+                                  Callback callback = kWouldBlock)
+        : failure_(failure), callback_(callback) {}
+
+    eavp::Status on_negotiated(int period_frames, int buffer_frames) override {
+        if (callback_ == kNegotiated) throw_failure();
+        return FailingAlsaObserver::on_negotiated(period_frames, buffer_frames);
+    }
 
     eavp::Status on_would_block() override {
+        if (callback_ == kWouldBlock) throw_failure();
+        return FailingAlsaObserver::on_would_block();
+    }
+
+    void set_callback(Callback callback) { callback_ = callback; }
+
+private:
+    void throw_failure() const {
         if (failure_ == kBadAlloc) throw std::bad_alloc();
         throw std::runtime_error("observer threw");
     }
 
-private:
     Failure failure_;
+    Callback callback_;
+};
+
+class ThrowingOperationAlsaApi : public eavp_test::FakeAlsaApi {
+public:
+    enum Operation { kNone, kOpen, kStart, kDrop, kTimestamp };
+    enum Failure { kBadAlloc, kUnexpected };
+
+    ThrowingOperationAlsaApi()
+        : operation(kNone), failure(kUnexpected) {}
+
+    int pcm_open(snd_pcm_t** pcm, const char* name,
+                 snd_pcm_stream_t stream, int mode) override {
+        maybe_throw(kOpen);
+        return FakeAlsaApi::pcm_open(pcm, name, stream, mode);
+    }
+    int pcm_start(snd_pcm_t* pcm) override {
+        maybe_throw(kStart);
+        return FakeAlsaApi::pcm_start(pcm);
+    }
+    int pcm_drop(snd_pcm_t* pcm) override {
+        maybe_throw(kDrop);
+        return FakeAlsaApi::pcm_drop(pcm);
+    }
+    int pcm_htimestamp(snd_pcm_t* pcm, snd_pcm_uframes_t* available,
+                       snd_htimestamp_t* timestamp) override {
+        maybe_throw(kTimestamp);
+        return FakeAlsaApi::pcm_htimestamp(pcm, available, timestamp);
+    }
+
+    Operation operation;
+    Failure failure;
+
+private:
+    void maybe_throw(Operation current) const {
+        if (operation != current) return;
+        if (failure == kBadAlloc) throw std::bad_alloc();
+        throw std::runtime_error("ALSA API threw");
+    }
 };
 
 class TimestampFallbackWouldBlockObserver : public FailingAlsaObserver {
@@ -485,8 +539,11 @@ TEST(AlsaSourceNodeTest, MapsObserverExceptionsAtTheNodeBoundary) {
                                  eavp_test::make_alsa_config(), 2U,
                                  &bad_alloc_observer);
     ASSERT_TRUE(bad_alloc_fixture.start());
+    const eavp::Status bad_alloc_status =
+        bad_alloc_fixture.tick_once_running();
     EXPECT_EQ(eavp::StatusCode::kResourceExhausted,
-              bad_alloc_fixture.tick_once_running().code());
+              bad_alloc_status.code());
+    EXPECT_TRUE(bad_alloc_status.message().empty());
 
     eavp_test::ScriptedAlsa unexpected_source;
     unexpected_source.read_frames.push_back(0);
@@ -495,8 +552,113 @@ TEST(AlsaSourceNodeTest, MapsObserverExceptionsAtTheNodeBoundary) {
                                   eavp_test::make_alsa_config(), 2U,
                                   &unexpected_observer);
     ASSERT_TRUE(unexpected_fixture.start());
-    EXPECT_EQ(eavp::StatusCode::kInternal,
-              unexpected_fixture.tick_once_running().code());
+    const eavp::Status unexpected_status =
+        unexpected_fixture.tick_once_running();
+    EXPECT_EQ(eavp::StatusCode::kInternal, unexpected_status.code());
+    EXPECT_TRUE(unexpected_status.message().empty());
+}
+
+TEST(AlsaSourceNodeTest, MapsObserverExceptionsDuringStartAndReset) {
+    eavp_test::ScriptedAlsa start_source;
+    ThrowingAlsaObserver start_observer(
+        ThrowingAlsaObserver::kBadAlloc,
+        ThrowingAlsaObserver::kNegotiated);
+    NodeFixture start_fixture(start_source.take_system(),
+                              eavp_test::make_alsa_config(), 2U,
+                              &start_observer);
+    ASSERT_TRUE(start_fixture.node->prepare().ok());
+    const eavp::Status start_status = start_fixture.node->start();
+    EXPECT_EQ(eavp::StatusCode::kResourceExhausted, start_status.code());
+    EXPECT_TRUE(start_status.message().empty());
+
+    eavp_test::ScriptedAlsa reset_source;
+    ThrowingAlsaObserver reset_observer(
+        ThrowingAlsaObserver::kUnexpected,
+        ThrowingAlsaObserver::kWouldBlock);
+    NodeFixture reset_fixture(reset_source.take_system(),
+                              eavp_test::make_alsa_config(), 2U,
+                              &reset_observer);
+    ASSERT_TRUE(reset_fixture.start());
+    reset_observer.set_callback(ThrowingAlsaObserver::kNegotiated);
+    const eavp::Status reset_status = reset_fixture.node->reset();
+    EXPECT_EQ(eavp::StatusCode::kInternal, reset_status.code());
+    EXPECT_TRUE(reset_status.message().empty());
+}
+
+TEST(AlsaSourceNodeTest, MapsThrowingSystemCallsAcrossLifecycleBoundaries) {
+    {
+        std::unique_ptr<ThrowingOperationAlsaApi> fake(
+            new ThrowingOperationAlsaApi());
+        fake->operation = ThrowingOperationAlsaApi::kOpen;
+        fake->failure = ThrowingOperationAlsaApi::kUnexpected;
+        std::unique_ptr<eavp::detail::AlsaSystem> system(
+            new eavp::detail::AlsaSystem(
+                std::unique_ptr<eavp::detail::AlsaApi>(fake.release())));
+        NodeFixture fixture(std::move(system), eavp_test::make_alsa_config());
+        const eavp::Status status = fixture.node->prepare();
+        EXPECT_EQ(eavp::StatusCode::kInternal, status.code());
+        EXPECT_TRUE(status.message().empty());
+    }
+    {
+        std::unique_ptr<ThrowingOperationAlsaApi> fake(
+            new ThrowingOperationAlsaApi());
+        ThrowingOperationAlsaApi* observed = fake.get();
+        std::unique_ptr<eavp::detail::AlsaSystem> system(
+            new eavp::detail::AlsaSystem(
+                std::unique_ptr<eavp::detail::AlsaApi>(fake.release())));
+        NodeFixture fixture(std::move(system), eavp_test::make_alsa_config());
+        ASSERT_TRUE(fixture.node->prepare().ok());
+        observed->operation = ThrowingOperationAlsaApi::kStart;
+        observed->failure = ThrowingOperationAlsaApi::kBadAlloc;
+        const eavp::Status status = fixture.node->start();
+        EXPECT_EQ(eavp::StatusCode::kResourceExhausted, status.code());
+        EXPECT_TRUE(status.message().empty());
+    }
+    {
+        std::unique_ptr<ThrowingOperationAlsaApi> fake(
+            new ThrowingOperationAlsaApi());
+        ThrowingOperationAlsaApi* observed = fake.get();
+        std::unique_ptr<eavp::detail::AlsaSystem> system(
+            new eavp::detail::AlsaSystem(
+                std::unique_ptr<eavp::detail::AlsaApi>(fake.release())));
+        NodeFixture fixture(std::move(system), eavp_test::make_alsa_config());
+        ASSERT_TRUE(fixture.start());
+        observed->operation = ThrowingOperationAlsaApi::kDrop;
+        observed->failure = ThrowingOperationAlsaApi::kBadAlloc;
+        const eavp::Status status = fixture.node->stop();
+        EXPECT_EQ(eavp::StatusCode::kResourceExhausted, status.code());
+        EXPECT_TRUE(status.message().empty());
+    }
+    {
+        std::unique_ptr<ThrowingOperationAlsaApi> fake(
+            new ThrowingOperationAlsaApi());
+        ThrowingOperationAlsaApi* observed = fake.get();
+        std::unique_ptr<eavp::detail::AlsaSystem> system(
+            new eavp::detail::AlsaSystem(
+                std::unique_ptr<eavp::detail::AlsaApi>(fake.release())));
+        NodeFixture fixture(std::move(system), eavp_test::make_alsa_config());
+        ASSERT_TRUE(fixture.start());
+        observed->operation = ThrowingOperationAlsaApi::kDrop;
+        observed->failure = ThrowingOperationAlsaApi::kUnexpected;
+        const eavp::Status status = fixture.node->reset();
+        EXPECT_EQ(eavp::StatusCode::kInternal, status.code());
+        EXPECT_TRUE(status.message().empty());
+    }
+    {
+        std::unique_ptr<ThrowingOperationAlsaApi> fake(
+            new ThrowingOperationAlsaApi());
+        ThrowingOperationAlsaApi* observed = fake.get();
+        std::unique_ptr<eavp::detail::AlsaSystem> system(
+            new eavp::detail::AlsaSystem(
+                std::unique_ptr<eavp::detail::AlsaApi>(fake.release())));
+        NodeFixture fixture(std::move(system), eavp_test::make_alsa_config());
+        ASSERT_TRUE(fixture.start());
+        observed->operation = ThrowingOperationAlsaApi::kTimestamp;
+        observed->failure = ThrowingOperationAlsaApi::kBadAlloc;
+        const eavp::Status status = fixture.tick_once_running();
+        EXPECT_EQ(eavp::StatusCode::kResourceExhausted, status.code());
+        EXPECT_TRUE(status.message().empty());
+    }
 }
 
 TEST(AlsaSourceNodeTest, SuspendRecoveryResumesBeforeSamplingANewAnchor) {
