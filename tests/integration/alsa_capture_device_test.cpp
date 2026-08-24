@@ -148,13 +148,120 @@ eavp::Result<DeviceTestConfig> read_config() {
         samples_per_frame.value(), frame_count.value(), timeout_seconds.value()));
 }
 
+bool old_default_pts_check_accepts(std::int64_t previous_pts, std::int64_t current_pts,
+                                   bool discontinuity, int sample_rate,
+                                   int samples_per_frame) {
+    if (current_pts <= previous_pts) return false;
+    return discontinuity || sample_rate != 48000 || samples_per_frame != 480 ||
+        current_pts - previous_pts == 10000;
+}
+
+class PtsSegmentVerifier {
+public:
+    PtsSegmentVerifier(int sample_rate, int samples_per_frame)
+        : sample_rate_(sample_rate), samples_per_frame_(samples_per_frame),
+          has_segment_(false), segment_pts_(0), emitted_samples_(0U) {}
+
+    eavp::Status observe(std::int64_t pts, bool discontinuity) {
+        if (sample_rate_ <= 0 || samples_per_frame_ <= 0) {
+            return eavp::Status(eavp::StatusCode::kInvalidArgument,
+                                "PTS 段校验器配置无效");
+        }
+        if (!has_segment_ || discontinuity) {
+            has_segment_ = true;
+            segment_pts_ = pts;
+            emitted_samples_ = 0U;
+            return advance_samples();
+        }
+
+        std::int64_t expected_pts = 0;
+        const eavp::Status rescale_status = expected_pts_for_emitted_samples(&expected_pts);
+        if (!rescale_status.ok()) return rescale_status;
+        if (pts != expected_pts) {
+            return eavp::Status(eavp::StatusCode::kCorruptData,
+                                "设备帧 PTS 不符合累计采样时间线");
+        }
+        return advance_samples();
+    }
+
+private:
+    eavp::Status expected_pts_for_emitted_samples(std::int64_t* result) const {
+        if (result == NULL) {
+            return eavp::Status(eavp::StatusCode::kInvalidArgument,
+                                "PTS 输出参数不能为空");
+        }
+        const std::uint64_t rate = static_cast<std::uint64_t>(sample_rate_);
+        const std::uint64_t whole_seconds = emitted_samples_ / rate;
+        const std::uint64_t remaining_samples = emitted_samples_ % rate;
+        const std::uint64_t microseconds_per_second = 1000000U;
+        const std::uint64_t max_pts =
+            static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+        if (whole_seconds > max_pts / microseconds_per_second) {
+            return eavp::Status(eavp::StatusCode::kCorruptData,
+                                "设备帧 PTS 重标定溢出");
+        }
+        std::uint64_t offset_us = whole_seconds * microseconds_per_second;
+        if (remaining_samples > (max_pts - offset_us) / microseconds_per_second) {
+            return eavp::Status(eavp::StatusCode::kCorruptData,
+                                "设备帧 PTS 重标定溢出");
+        }
+        offset_us += (remaining_samples * microseconds_per_second) / rate;
+        const std::int64_t offset = static_cast<std::int64_t>(offset_us);
+        if (segment_pts_ > std::numeric_limits<std::int64_t>::max() - offset) {
+            return eavp::Status(eavp::StatusCode::kCorruptData,
+                                "设备帧 PTS 重标定溢出");
+        }
+        *result = segment_pts_ + offset;
+        return eavp::Status::ok_status();
+    }
+
+    eavp::Status advance_samples() {
+        const std::uint64_t frame_samples =
+            static_cast<std::uint64_t>(samples_per_frame_);
+        if (emitted_samples_ > std::numeric_limits<std::uint64_t>::max() -
+                                   frame_samples) {
+            return eavp::Status(eavp::StatusCode::kCorruptData,
+                                "设备帧累计采样数溢出");
+        }
+        emitted_samples_ += frame_samples;
+        return eavp::Status::ok_status();
+    }
+
+    int sample_rate_;
+    int samples_per_frame_;
+    bool has_segment_;
+    std::int64_t segment_pts_;
+    std::uint64_t emitted_samples_;
+};
+
+TEST(AlsaCaptureDevicePtsTest, RejectsIncorrectNonIntegralRateTimeline) {
+    const std::int64_t segment_pts = 1000000;
+    const std::int64_t incorrect_but_increasing_pts = 1010000;
+    ASSERT_TRUE(old_default_pts_check_accepts(
+        segment_pts, incorrect_but_increasing_pts, false, 44100, 480));
+
+    PtsSegmentVerifier verifier(44100, 480);
+    ASSERT_TRUE(verifier.observe(segment_pts, false).ok());
+    const eavp::Status status = verifier.observe(incorrect_but_increasing_pts, false);
+    EXPECT_EQ(eavp::StatusCode::kCorruptData, status.code());
+}
+
+TEST(AlsaCaptureDevicePtsTest, UsesCumulativeFloorRescaleForNonIntegralRate) {
+    PtsSegmentVerifier verifier(44100, 480);
+    EXPECT_TRUE(verifier.observe(1000000, false).ok());
+    EXPECT_TRUE(verifier.observe(1010884, false).ok());
+    EXPECT_TRUE(verifier.observe(1021768, false).ok());
+    EXPECT_TRUE(verifier.observe(1032653, false).ok());
+}
+
 class DeviceAudioSink : public eavp::MediaNode {
 public:
     explicit DeviceAudioSink(const DeviceTestConfig& config)
         : eavp::MediaNode("alsa-device-sink"),
           input_("alsa-device-input", 8U, eavp::OverflowPolicy::kBlock),
           config_(config), frames_(0), samples_(0), has_previous_pts_(false),
-          previous_pts_(0) {}
+          previous_pts_(0), pts_verifier_(config.sample_rate,
+                                         config.samples_per_frame) {}
 
     eavp::InputPort<eavp::AudioFrame>& input() { return input_; }
     int frames() const { return frames_; }
@@ -195,12 +302,10 @@ protected:
                 return eavp::Status(eavp::StatusCode::kCorruptData,
                                     "设备帧 PTS 不是单调递增");
             }
-            if (!frame->discontinuity() && config_.sample_rate == 48000 &&
-                config_.samples_per_frame == 480 && frame->pts() - previous_pts_ != 10000) {
-                return eavp::Status(eavp::StatusCode::kCorruptData,
-                                    "默认 48 kHz/480 设备帧的 PTS 间隔不是 10000 us");
-            }
         }
+        const eavp::Status pts_status =
+            pts_verifier_.observe(frame->pts(), frame->discontinuity());
+        if (!pts_status.ok()) return pts_status;
         previous_pts_ = frame->pts();
         has_previous_pts_ = true;
         if (samples_ > std::numeric_limits<std::uint64_t>::max() -
@@ -220,6 +325,7 @@ private:
     std::uint64_t samples_;
     bool has_previous_pts_;
     std::int64_t previous_pts_;
+    PtsSegmentVerifier pts_verifier_;
 };
 
 bool deadline_reached(const struct timespec& started, int timeout_seconds) {
@@ -235,8 +341,9 @@ bool deadline_reached(const struct timespec& started, int timeout_seconds) {
 
 void report_failure_and_cancel(eavp::MediaPipeline* pipeline,
                                const eavp::Status& status) {
-    pipeline->cancel();
-    ADD_FAILURE() << status_description(status);
+    const eavp::Status cancel_status = pipeline->cancel();
+    ADD_FAILURE() << "管线 tick 失败: " << status_description(status)
+                  << "; 取消结果: " << status_description(cancel_status);
 }
 
 TEST(AlsaCaptureDeviceTest, CapturesConfiguredFramesFromExistingProducer) {
@@ -264,12 +371,18 @@ TEST(AlsaCaptureDeviceTest, CapturesConfiguredFramesFromExistingProducer) {
     ASSERT_TRUE(capture_result.ok()) << status_description(capture_result.status());
     std::unique_ptr<DeviceAudioSink> sink(new DeviceAudioSink(config));
     DeviceAudioSink* observed_sink = sink.get();
-    ASSERT_TRUE(eavp::connect(capture_result.value()->output(), observed_sink->input()).ok());
+    const eavp::Status port_connect =
+        eavp::connect(capture_result.value()->output(), observed_sink->input());
+    ASSERT_TRUE(port_connect.ok()) << status_description(port_connect);
 
     eavp::MediaPipeline pipeline("alsa-device-pipeline");
-    ASSERT_TRUE(pipeline.add_node(capture_result.take_value()).ok());
-    ASSERT_TRUE(pipeline.add_node(std::move(sink)).ok());
-    ASSERT_TRUE(pipeline.connect("alsa-device", "alsa-device-sink").ok());
+    const eavp::Status add_capture = pipeline.add_node(capture_result.take_value());
+    ASSERT_TRUE(add_capture.ok()) << status_description(add_capture);
+    const eavp::Status add_sink = pipeline.add_node(std::move(sink));
+    ASSERT_TRUE(add_sink.ok()) << status_description(add_sink);
+    const eavp::Status pipeline_connect =
+        pipeline.connect("alsa-device", "alsa-device-sink");
+    ASSERT_TRUE(pipeline_connect.ok()) << status_description(pipeline_connect);
     const eavp::Status start = pipeline.start();
     ASSERT_TRUE(start.ok()) << "设备配置或打开失败: " << status_description(start);
 
@@ -284,11 +397,12 @@ TEST(AlsaCaptureDeviceTest, CapturesConfiguredFramesFromExistingProducer) {
         }
     }
     if (observed_sink->frames() != config.frame_count) {
-        pipeline.cancel();
+        const eavp::Status cancel_status = pipeline.cancel();
         ADD_FAILURE() << "环境超时：设备 " << config.device << " 在 "
                       << config.timeout_seconds << " 秒内仅采集到 "
                       << observed_sink->frames() << "/" << config.frame_count
-                      << " 帧；请确认外部 Loopback producer、设备权限和精确格式配置。";
+                      << " 帧；请确认外部 Loopback producer、设备权限和精确格式配置。"
+                      << " 取消结果: " << status_description(cancel_status);
         return;
     }
 
