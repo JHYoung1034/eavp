@@ -113,7 +113,7 @@ if(EAVP_ENABLE_ALSA)
         platform/linux/alsa_lib_api.cpp
         platform/linux/alsa_system.cpp
     )
-    target_link_libraries(eavp_platform PRIVATE ALSA::ALSA)
+    target_link_libraries(eavp_platform PUBLIC ALSA::ALSA)
 endif()
 target_include_directories(
     eavp_platform
