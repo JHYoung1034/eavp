@@ -40,7 +40,7 @@ public:
 
     struct State {
         State() : read_calls(0), prepared_after_start(0), starts_after_start(0),
-                  started(false), next_byte(0U), read_events(), resume_events(),
+                  open_handles(0), started(false), next_byte(0U), read_events(), resume_events(),
                   has_htimestamp(false), htimestamp_us(0), htimestamp_available(0U),
                   has_initial_anchor(false), initial_anchor_us(0),
                   has_recovery_anchor(false), recovery_anchor_us(0),
@@ -50,6 +50,7 @@ public:
         int read_calls;
         int prepared_after_start;
         int starts_after_start;
+        int open_handles;
         bool started;
         std::uint8_t next_byte;
         std::deque<Event> read_events;
@@ -117,6 +118,7 @@ public:
     int observed_read_calls() const { return state_->read_calls; }
     int prepare_after_xrun_calls() const { return state_->prepared_after_start; }
     int start_after_xrun_calls() const { return state_->starts_after_start; }
+    int open_handles() const { return state_->open_handles; }
 
 private:
     std::shared_ptr<State> state_;
@@ -132,6 +134,17 @@ public:
     explicit ScriptedAlsaApi(const std::shared_ptr<ScriptedAlsa::State>& state)
         : state_(state) {}
 
+    int pcm_open(snd_pcm_t** pcm, const char* name, snd_pcm_stream_t stream,
+                 int mode) override {
+        const int result = FakeAlsaApi::pcm_open(pcm, name, stream, mode);
+        if (result >= 0) ++state_->open_handles;
+        return result;
+    }
+    int pcm_close(snd_pcm_t* pcm) override {
+        const int result = FakeAlsaApi::pcm_close(pcm);
+        if (result >= 0) --state_->open_handles;
+        return result;
+    }
     int pcm_prepare(snd_pcm_t* pcm) override {
         if (state_->started) ++state_->prepared_after_start;
         return FakeAlsaApi::pcm_prepare(pcm);
