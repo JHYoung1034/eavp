@@ -3,6 +3,9 @@
 
 #include "eavp/media/backend_registry.hpp"
 #include "eavp/media/reference_backend.hpp"
+#include "eavp/management/health.hpp"
+#include "eavp/management/metrics.hpp"
+#include "eavp/platform/linux/alsa_capture.hpp"
 #include "eavp/platform/simulated_platform.hpp"
 
 int main() {
@@ -28,6 +31,30 @@ int main() {
     eavp::Result<eavp::VideoProcessorConfig> config_result =
         eavp::VideoProcessorConfig::create(format, format, 0, 0, 2, 2, 0);
     if (!config_result.ok()) {
+        return 1;
+    }
+
+    eavp::Result<eavp::AudioFormat> audio_format_result =
+        eavp::AudioFormat::create(
+            eavp::SampleFormat::kSigned16LittleEndian, 48000,
+            eavp::AudioChannelLayout::kStereo,
+            eavp::AudioSampleLayout::kInterleaved,
+            eavp::MemoryDomain::kCpu);
+    if (!audio_format_result.ok()) {
+        return 1;
+    }
+    eavp::Result<eavp::AlsaCaptureConfig> alsa_config_result =
+        eavp::AlsaCaptureConfig::create(
+            "hw:Loopback,1,0", audio_format_result.value(), 480, 480, 4);
+    if (!alsa_config_result.ok()) {
+        return 1;
+    }
+    eavp::MetricRegistry metrics;
+    eavp::HealthManager health;
+    eavp::Result<std::unique_ptr<eavp::AlsaSourceNode> > alsa_source_result =
+        eavp::AlsaSourceNode::create(
+            "consumer-alsa", alsa_config_result.value(), &metrics, &health);
+    if (!alsa_source_result.ok()) {
         return 1;
     }
 

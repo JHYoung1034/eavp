@@ -14,3 +14,11 @@ target_include_directories(eavp_alsa_capture_pipeline_tests
                            PRIVATE ${PROJECT_SOURCE_DIR}/src
                                    ${PROJECT_SOURCE_DIR}/tests)
 gtest_discover_tests(eavp_alsa_capture_pipeline_tests)
+
+if(EAVP_ENABLE_ALSA_DEVICE_TESTS)
+    add_executable(eavp_alsa_capture_device_tests alsa_capture_device_test.cpp)
+    target_link_libraries(eavp_alsa_capture_device_tests
+                          PRIVATE EAVP::platform GTest::gtest_main)
+    gtest_discover_tests(eavp_alsa_capture_device_tests
+        TEST_PREFIX "eavp.alsa_device.")
+endif()
