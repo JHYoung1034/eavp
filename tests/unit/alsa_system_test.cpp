@@ -24,6 +24,14 @@ TEST(AlsaSystemTest, ConfiguresExactInterleavedCaptureAndReadsBackValues) {
 
     ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
     EXPECT_EQ(SND_PCM_STREAM_CAPTURE, observed->opened_stream);
+    const int expected_open_mode =
+        SND_PCM_NONBLOCK | SND_PCM_NO_AUTO_RESAMPLE |
+        SND_PCM_NO_AUTO_CHANNELS | SND_PCM_NO_AUTO_FORMAT;
+    EXPECT_EQ(expected_open_mode, observed->opened_mode);
+    EXPECT_NE(0, observed->opened_mode & SND_PCM_NONBLOCK);
+    EXPECT_NE(0, observed->opened_mode & SND_PCM_NO_AUTO_RESAMPLE);
+    EXPECT_NE(0, observed->opened_mode & SND_PCM_NO_AUTO_CHANNELS);
+    EXPECT_NE(0, observed->opened_mode & SND_PCM_NO_AUTO_FORMAT);
     EXPECT_EQ(SND_PCM_ACCESS_RW_INTERLEAVED, observed->requested_access);
     EXPECT_EQ(SND_PCM_FORMAT_S16_LE, observed->requested_format);
     EXPECT_EQ(48000U, observed->requested_rate);
@@ -31,6 +39,28 @@ TEST(AlsaSystemTest, ConfiguresExactInterleavedCaptureAndReadsBackValues) {
     EXPECT_EQ(512U, system.negotiated().period_frames);
     EXPECT_EQ(2048U, system.negotiated().buffer_frames);
     EXPECT_TRUE(system.negotiated().monotonic_timestamp);
+}
+
+TEST(AlsaSystemTest, MapsMonoAndStereoChannelCountsExactly) {
+    struct Case {
+        eavp::AudioChannelLayout layout;
+        unsigned int channels;
+    };
+    const Case cases[] = {
+        {eavp::AudioChannelLayout::kMono, 1U},
+        {eavp::AudioChannelLayout::kStereo, 2U},
+    };
+    for (std::size_t index = 0U; index < 2U; ++index) {
+        std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+        FakeAlsaApi* observed = fake.get();
+        observed->negotiated_channels = cases[index].channels;
+        eavp::detail::AlsaSystem system(std::move(fake));
+
+        ASSERT_TRUE(system.prepare(make_alsa_config(
+            eavp::SampleFormat::kSigned16LittleEndian,
+            cases[index].layout)).ok());
+        EXPECT_EQ(cases[index].channels, observed->requested_channels);
+    }
 }
 
 TEST(AlsaSystemTest, MapsEveryApprovedSampleFormatExactly) {

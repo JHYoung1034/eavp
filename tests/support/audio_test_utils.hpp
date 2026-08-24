@@ -16,9 +16,11 @@ namespace eavp_test {
 
 inline eavp::AlsaCaptureConfig make_alsa_config(
     eavp::SampleFormat sample_format =
-        eavp::SampleFormat::kSigned16LittleEndian) {
+        eavp::SampleFormat::kSigned16LittleEndian,
+    eavp::AudioChannelLayout channel_layout =
+        eavp::AudioChannelLayout::kStereo) {
     const eavp::Result<eavp::AudioFormat> format = eavp::AudioFormat::create(
-        sample_format, 48000, eavp::AudioChannelLayout::kStereo,
+        sample_format, 48000, channel_layout,
         eavp::AudioSampleLayout::kInterleaved, eavp::MemoryDomain::kCpu);
     const eavp::Result<eavp::AlsaCaptureConfig> config =
         eavp::AlsaCaptureConfig::create("hw:Fake,0", format.value(), 480,

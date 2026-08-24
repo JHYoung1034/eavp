@@ -614,29 +614,44 @@ TEST(VideoEncoderConfigTest, RejectsInvalidAndCrossCodecProfiles) {
                   eavp::CodecProfile::kH264Baseline, 0, true).status().code());
 }
 
-TEST(AudioFormatTest, DescribesSupportedInterleavedFormatsExactly) {
-    struct Case {
+TEST(AudioFormatTest, DescribesSupportedInterleavedFormatsAndLayoutsExactly) {
+    struct FormatCase {
         eavp::SampleFormat sample_format;
         std::size_t bytes_per_sample;
     };
-    const Case cases[] = {
+    const FormatCase formats[] = {
         {eavp::SampleFormat::kSigned16LittleEndian, 2U},
         {eavp::SampleFormat::kSigned24In32LittleEndian, 4U},
         {eavp::SampleFormat::kSigned32LittleEndian, 4U},
         {eavp::SampleFormat::kFloat32LittleEndian, 4U},
     };
-    for (std::size_t index = 0U; index < 4U; ++index) {
-        eavp::Result<eavp::AudioFormat> format = eavp::AudioFormat::create(
-            cases[index].sample_format, 48000,
-            eavp::AudioChannelLayout::kStereo,
-            eavp::AudioSampleLayout::kInterleaved,
-            eavp::MemoryDomain::kCpu);
-        ASSERT_TRUE(format.ok());
-        EXPECT_EQ(2, format.value().channels());
-        EXPECT_EQ(cases[index].bytes_per_sample,
-                  format.value().bytes_per_sample());
-        EXPECT_EQ(cases[index].bytes_per_sample * 2U,
-                  format.value().bytes_per_pcm_frame());
+    struct LayoutCase {
+        eavp::AudioChannelLayout layout;
+        int channels;
+    };
+    const LayoutCase layouts[] = {
+        {eavp::AudioChannelLayout::kMono, 1},
+        {eavp::AudioChannelLayout::kStereo, 2},
+    };
+    for (std::size_t format_index = 0U; format_index < 4U; ++format_index) {
+        for (std::size_t layout_index = 0U; layout_index < 2U;
+             ++layout_index) {
+            const eavp::Result<eavp::AudioFormat> format =
+                eavp::AudioFormat::create(
+                    formats[format_index].sample_format, 48000,
+                    layouts[layout_index].layout,
+                    eavp::AudioSampleLayout::kInterleaved,
+                    eavp::MemoryDomain::kCpu);
+            ASSERT_TRUE(format.ok());
+            EXPECT_EQ(layouts[layout_index].channels,
+                      format.value().channels());
+            EXPECT_EQ(formats[format_index].bytes_per_sample,
+                      format.value().bytes_per_sample());
+            EXPECT_EQ(formats[format_index].bytes_per_sample *
+                          static_cast<std::size_t>(
+                              layouts[layout_index].channels),
+                      format.value().bytes_per_pcm_frame());
+        }
     }
 }
 
@@ -679,20 +694,35 @@ TEST(AudioFormatTest, RejectsInvalidConfigurations) {
 }
 
 TEST(AudioFrameTest, UsesFirstSamplePtsAndExactPayloadSize) {
-    const eavp::AudioFormat format = eavp::AudioFormat::create(
-        eavp::SampleFormat::kSigned16LittleEndian, 48000,
-        eavp::AudioChannelLayout::kStereo,
-        eavp::AudioSampleLayout::kInterleaved,
-        eavp::MemoryDomain::kCpu).take_value();
-    const eavp::Buffer buffer = eavp::Buffer::allocate(1920U).take_value();
-    const eavp::AudioFrame frame = eavp::AudioFrame::create(
-        buffer, format, 480, 1234000,
-        eavp::TimeBase::create(1, 1000000).take_value(), true).take_value();
+    struct Case {
+        eavp::AudioChannelLayout layout;
+        int channels;
+        std::size_t payload_size;
+    };
+    const Case cases[] = {
+        {eavp::AudioChannelLayout::kMono, 1, 960U},
+        {eavp::AudioChannelLayout::kStereo, 2, 1920U},
+    };
+    const eavp::TimeBase time_base =
+        eavp::TimeBase::create(1, 1000000).take_value();
+    for (std::size_t index = 0U; index < 2U; ++index) {
+        const eavp::AudioFormat format = eavp::AudioFormat::create(
+            eavp::SampleFormat::kSigned16LittleEndian, 48000,
+            cases[index].layout, eavp::AudioSampleLayout::kInterleaved,
+            eavp::MemoryDomain::kCpu).take_value();
+        const eavp::Buffer buffer =
+            eavp::Buffer::allocate(cases[index].payload_size).take_value();
+        const eavp::AudioFrame frame = eavp::AudioFrame::create(
+            buffer, format, 480, 1234000, time_base, true).take_value();
 
-    EXPECT_EQ(480, frame.samples_per_channel());
-    EXPECT_EQ(1234000, frame.pts());
-    EXPECT_TRUE(frame.discontinuity());
-    EXPECT_EQ(48000, frame.format().sample_rate());
+        EXPECT_EQ(cases[index].channels, frame.format().channels());
+        EXPECT_EQ(cases[index].payload_size,
+                  frame.buffer().plane_layout(0U).value().size);
+        EXPECT_EQ(480, frame.samples_per_channel());
+        EXPECT_EQ(1234000, frame.pts());
+        EXPECT_TRUE(frame.discontinuity());
+        EXPECT_EQ(48000, frame.format().sample_rate());
+    }
 }
 
 TEST(AudioFrameTest, RejectsWrongBufferAndNonPositiveTimeBase) {
