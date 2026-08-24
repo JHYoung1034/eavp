@@ -49,3 +49,7 @@ Debug、Release 和 Sanitizer 默认预设不联网。构建机没有系统 Goog
 find_package(EAVP 0.2 CONFIG REQUIRED)
 target_link_libraries(product PRIVATE EAVP::platform)
 ```
+
+安装包配置导出布尔变量 `EAVP_ALSA_ENABLED`。消费方可以始终使用
+`AudioFormat` 与 `AlsaCaptureConfig`；只有该变量为真时，安装的
+`EAVP::platform` 才提供 `AlsaSourceNode` 实现并传递 `ALSA::ALSA` 依赖。

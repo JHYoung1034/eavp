@@ -23,15 +23,20 @@ add_executable(eavp_management_tests management_test.cpp)
 target_link_libraries(eavp_management_tests PRIVATE EAVP::management GTest::gtest_main)
 gtest_discover_tests(eavp_management_tests)
 
-add_executable(eavp_alsa_capture_tests alsa_capture_test.cpp)
-target_link_libraries(eavp_alsa_capture_tests
+add_executable(eavp_alsa_capture_config_tests alsa_capture_config_test.cpp)
+target_link_libraries(eavp_alsa_capture_config_tests
                       PRIVATE EAVP::platform GTest::gtest_main)
-target_include_directories(eavp_alsa_capture_tests
-                           PRIVATE ${PROJECT_SOURCE_DIR}/src
-                                   ${PROJECT_SOURCE_DIR}/tests)
-gtest_discover_tests(eavp_alsa_capture_tests)
+gtest_discover_tests(eavp_alsa_capture_config_tests)
 
 if(EAVP_ENABLE_ALSA)
+    add_executable(eavp_alsa_capture_tests alsa_capture_test.cpp)
+    target_link_libraries(eavp_alsa_capture_tests
+                          PRIVATE EAVP::platform GTest::gtest_main)
+    target_include_directories(eavp_alsa_capture_tests
+                               PRIVATE ${PROJECT_SOURCE_DIR}/src
+                                       ${PROJECT_SOURCE_DIR}/tests)
+    gtest_discover_tests(eavp_alsa_capture_tests)
+
     add_executable(eavp_alsa_system_tests alsa_system_test.cpp)
     target_link_libraries(eavp_alsa_system_tests
                           PRIVATE EAVP::platform GTest::gtest_main)

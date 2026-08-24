@@ -2,7 +2,8 @@
 
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
-if(@EAVP_ENABLE_ALSA@)
+set(EAVP_ALSA_ENABLED @EAVP_ENABLE_ALSA@)
+if(EAVP_ALSA_ENABLED)
     find_dependency(ALSA)
 endif()
 

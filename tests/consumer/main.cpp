@@ -49,6 +49,7 @@ int main() {
     if (!alsa_config_result.ok()) {
         return 1;
     }
+#if defined(EAVP_CONSUMER_ALSA_ENABLED)
     eavp::MetricRegistry metrics;
     eavp::HealthManager health;
     eavp::Result<std::unique_ptr<eavp::AlsaSourceNode> > alsa_source_result =
@@ -57,6 +58,7 @@ int main() {
     if (!alsa_source_result.ok()) {
         return 1;
     }
+#endif
 
     eavp::BackendRegistry registry;
     std::shared_ptr<eavp::MediaBackendProvider> provider =
