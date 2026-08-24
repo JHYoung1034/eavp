@@ -44,6 +44,7 @@ public:
                   has_htimestamp(false), htimestamp_us(0), htimestamp_available(0U),
                   has_initial_anchor(false), initial_anchor_us(0),
                   has_recovery_anchor(false), recovery_anchor_us(0),
+                  has_monotonic_now(false), monotonic_now_us(0),
                   force_timestamp_fallback(false),
                   scratch(8192U, 0U) {}
 
@@ -62,6 +63,8 @@ public:
         std::int64_t initial_anchor_us;
         bool has_recovery_anchor;
         std::int64_t recovery_anchor_us;
+        bool has_monotonic_now;
+        std::int64_t monotonic_now_us;
         bool force_timestamp_fallback;
         std::vector<std::uint8_t> scratch;
     };
@@ -112,6 +115,10 @@ public:
     void set_recovery_anchor(std::int64_t anchor_us) {
         state_->has_recovery_anchor = true;
         state_->recovery_anchor_us = anchor_us;
+    }
+    void set_monotonic_now(std::int64_t timestamp_us) {
+        state_->has_monotonic_now = true;
+        state_->monotonic_now_us = timestamp_us;
     }
     void force_timestamp_fallback() { state_->force_timestamp_fallback = true; }
     std::uint8_t* bytes() { return state_->scratch.data(); }
@@ -194,6 +201,16 @@ public:
         timestamp->tv_sec = static_cast<time_t>(timestamp_us / 1000000);
         timestamp->tv_nsec = static_cast<long>(
             (timestamp_us % 1000000) * 1000);
+        return 0;
+    }
+    int monotonic_now(struct timespec* timestamp) override {
+        if (!state_->has_monotonic_now) {
+            return FakeAlsaApi::monotonic_now(timestamp);
+        }
+        timestamp->tv_sec = static_cast<time_t>(
+            state_->monotonic_now_us / 1000000);
+        timestamp->tv_nsec = static_cast<long>(
+            (state_->monotonic_now_us % 1000000) * 1000);
         return 0;
     }
 

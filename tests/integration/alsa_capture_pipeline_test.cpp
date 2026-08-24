@@ -54,13 +54,17 @@ public:
         : eavp::MediaNode("audio-checksum"),
           input_("audio-input", 4U, eavp::OverflowPolicy::kBlock), frames_(0U),
           samples_(0U), checksum_(kFnv1aOffsetBasis), discontinuities_(0U),
-          has_previous_pts_(false), previous_pts_(0), pts_steps_are_ten_ms_(true) {}
+          first_discontinuity_pts_(0), has_previous_pts_(false), previous_pts_(0),
+          pts_steps_are_ten_ms_(true) {}
 
     eavp::InputPort<eavp::AudioFrame>& input() { return input_; }
     std::size_t frames() const { return frames_; }
     std::size_t samples() const { return samples_; }
     std::uint64_t checksum() const { return checksum_; }
     std::size_t discontinuities() const { return discontinuities_; }
+    std::int64_t first_discontinuity_pts() const {
+        return first_discontinuity_pts_;
+    }
     bool pts_steps_are_ten_ms() const { return pts_steps_are_ten_ms_; }
 
 protected:
@@ -83,6 +87,9 @@ protected:
         }
         previous_pts_ = frame->pts();
         has_previous_pts_ = true;
+        if (frame->discontinuity() && discontinuities_ == 0U) {
+            first_discontinuity_pts_ = frame->pts();
+        }
         if (frame->discontinuity()) ++discontinuities_;
         samples_ += static_cast<std::size_t>(frame->samples_per_channel());
         ++frames_;
@@ -95,6 +102,7 @@ private:
     std::size_t samples_;
     std::uint64_t checksum_;
     std::size_t discontinuities_;
+    std::int64_t first_discontinuity_pts_;
     bool has_previous_pts_;
     std::int64_t previous_pts_;
     bool pts_steps_are_ten_ms_;
@@ -103,6 +111,8 @@ private:
 TEST(AlsaCapturePipelineTest,
      DeliversThreeHundredExactFramesAcrossShortReadsAndOneXrun) {
     eavp_test::ScriptedAlsa source;
+    source.set_initial_anchor(500000);
+    source.set_monotonic_now(9000000);
     source.append_patterned_frames(150, 120, 360);
     source.read_frames.push_back(240);
     source.append_error(-EPIPE);
@@ -133,9 +143,18 @@ TEST(AlsaCapturePipelineTest,
     EXPECT_EQ(300U * 480U, observed_sink->samples());
     EXPECT_EQ(expected_checksum(), observed_sink->checksum());
     EXPECT_EQ(1U, observed_sink->discontinuities());
+    EXPECT_EQ(9000000, observed_sink->first_discontinuity_pts());
     EXPECT_TRUE(observed_sink->pts_steps_are_ten_ms());
     EXPECT_LT(turns, 2000U);
+    EXPECT_EQ(300U, metrics.counter("alsa_capture.mic0.frames").value());
+    EXPECT_EQ(300U * 480U,
+              metrics.counter("alsa_capture.mic0.samples").value());
+    EXPECT_EQ(300U * 480U * 4U,
+              metrics.counter("alsa_capture.mic0.bytes").value());
+    EXPECT_EQ(301U, metrics.counter("alsa_capture.mic0.short_reads").value());
     EXPECT_EQ(1U, metrics.counter("alsa_capture.mic0.xruns").value());
+    EXPECT_EQ(1U,
+              metrics.counter("alsa_capture.mic0.discontinuities").value());
     EXPECT_EQ(eavp::HealthStatus::kDegraded, health.aggregate());
     ASSERT_TRUE(pipeline.stop().ok());
     EXPECT_EQ(0, source.open_handles());
