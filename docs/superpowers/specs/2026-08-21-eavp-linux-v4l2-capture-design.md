@@ -1,6 +1,6 @@
 # EAVP Linux V4L2 Capture 0.3a 设计规格
 
-> 状态：待审阅
+> 状态：已批准
 >
 > 适用版本：`0.3.0` 开发阶段，稳定版本仍为 `0.2.0`
 >
@@ -75,10 +75,11 @@ struct V4L2CaptureConfig {
 
 class V4L2SourceNode : public MediaNode {
 public:
-    V4L2SourceNode(const std::string& id,
-                   const V4L2CaptureConfig& config,
-                   MetricRegistry* metrics);
-    ~V4L2SourceNode();
+    static Result<std::unique_ptr<V4L2SourceNode> > create(
+        const std::string& id,
+        const V4L2CaptureConfig& config,
+        MetricRegistry* metrics);
+    ~V4L2SourceNode() noexcept;
 
     OutputPort<VideoFrame>& output();
     Result<VideoFormat> actual_format() const;
@@ -87,18 +88,21 @@ public:
 }  // namespace eavp
 ```
 
-构造函数不访问设备；所有可能失败的资源操作进入 `prepare()`。`MetricRegistry*` 可为空；非空时 Node 发布采集指标。Node 不持有 HealthManager 或 StateStore，避免把管理状态策略固化在设备适配中；组合层根据 enriched Status 发布 Actual/Health。
+factory 只创建对象，不访问设备；所有设备资源操作进入 `prepare()`。factory 捕获分配失败和未知异常，公共边界不抛出异常。`MetricRegistry*` 可为空；非空时 Node 发布采集指标。Node 不持有 HealthManager 或 StateStore，避免把管理状态策略固化在设备适配中；组合层根据 enriched Status 发布 Actual/Health。
 
 ### 4.2 私有系统边界
 
 新增私有文件：
 
+- `src/platform/linux/v4l2_api.hpp`
+- `src/platform/linux/v4l2_linux_api.cpp`
 - `src/platform/linux/v4l2_system.hpp`
 - `src/platform/linux/v4l2_system.cpp`
+- `src/platform/linux/v4l2_capture_internal.hpp`
 
-`V4L2System` 封装 `open`、`ioctl`、`mmap`、`munmap`、`close` 与 monotonic clock。生产实现只调用 POSIX/Linux UAPI；测试实现按脚本返回结果。该接口不安装、不导出，不成为平台 ABI。
+内部按 `V4L2Api -> V4L2System -> V4L2SourceNode::Impl` 分层。`V4L2Api` 仅封装 `open`、`ioctl`、`mmap`、`munmap`、`close` 与 monotonic clock；`V4L2System` 独占设备会话、MMAP regions、驱动队列状态和协商结果。生产实现只调用 POSIX/Linux UAPI；测试实现按脚本返回结果。私有接口不安装、不导出，不成为平台 ABI。
 
-fd、MMAP Region 和已申请内核 Buffer 分别由 move-only RAII 对象持有。prepare 中任一步失败时，已取得资源必须按 `STREAMOFF（若已启动）→ munmap → REQBUFS(count=0) → close` 顺序清理。
+fd、MMAP Region 和已申请内核 Buffer 分别由 move-only RAII 对象持有。prepare 中任一步失败时，必须在返回前按 `munmap -> REQBUFS(count=0) -> close` 顺序完成回滚；已进入 streaming 的会话在释放前先 `STREAMOFF`。析构函数执行 noexcept 的兜底释放。
 
 ### 4.3 Target 与依赖方向
 
@@ -143,12 +147,20 @@ Node 使用 `VIDIOC_S_FMT` 提交配置，再以驱动返回值作为唯一实�
 MMAP 区域始终由驱动队列拥有，不包装成跨 tick 生存的 VideoFrame。每次成功 DQBUF 后：
 
 1. 校验 buffer index、flags、bytesused 和 plane 范围；
-2. 分配 EAVP CPU Buffer；
-3. 逐 plane 复制包含 stride 的有效区域；
+2. 使用新增的 `Buffer::allocate(size, planes)` 分配具有协商布局的 EAVP 多平面 CPU Buffer；
+3. 目标存储先清零，再逐 plane、逐行复制有效像素字节；
 4. 构造共享只读 VideoFrame；
 5. 立即 QBUF 归还驱动 Buffer。
 
-因此下游队列、背压和 Frame 生命周期不延长 V4L2 MMAP Buffer 的占用。0.3a 不宣称零拷贝。
+CPU Buffer 保留协商得到的 stride 和 plane offset，但不复制驱动 padding 中的未定义数据；`bytesused` 必须覆盖最后一个有效像素，不要求尾部 padding 被标记为有效媒体数据。因此下游队列、背压和 Frame 生命周期不延长 V4L2 MMAP Buffer 的占用，校验统计也不受未定义 padding 影响。0.3a 不宣称零拷贝。
+
+单平面格式的布局约束为：
+
+- YUV420P：宽高和 luma stride 为偶数，Y stride 为 `bytesperline`，U/V stride 各为其一半；
+- NV12：宽高为偶数，Y/UV stride 均为 `bytesperline`；
+- YUYV422：单 plane packed，stride 不小于 `width * 2`。
+
+所有 stride、offset、plane size、总容量和最后有效字节位置均在乘加前检查溢出。
 
 ## 6. 调度与生命周期
 
@@ -163,7 +175,7 @@ Node 不创建私有线程，设备以 `O_RDWR | O_NONBLOCK | O_CLOEXEC` 打开�
 
 | Node 操作 | V4L2 行为 | 结果 |
 |---|---|---|
-| `prepare` | QUERYCAP、S/G_FMT、S/G_PARM、REQBUFS、QUERYBUF、mmap | Prepared |
+| `prepare` | open、QUERYCAP、S/G_FMT、S/G_PARM、REQBUFS、QUERYBUF、mmap | Prepared |
 | `start` | 全部 QBUF 后 STREAMON | Running |
 | `tick` | 至多一次 DQBUF/copy/QBUF/send | Running 或 Error |
 | `stop` | 立即 STREAMOFF，丢弃内部 pending | Stopped |
@@ -171,15 +183,17 @@ Node 不创建私有线程，设备以 `O_RDWR | O_NONBLOCK | O_CLOEXEC` 打开�
 
 stop 不再采集新 Frame；已经进入端口队列的 Frame 由现有 Pipeline 继续排空。尚未进入队列的 pending Frame 在 stop 时丢弃，并计入 `v4l2.frames.dropped_on_stop`。重复 stop/reset 必须幂等。
 
+所有 `open`/`ioctl` 的 `EINTR` 最多重试 64 次；达到上限后返回 enriched I/O 错误，避免单线程 Executor 永久停留在一次 tick 中。DQBUF 成功后，无论复制或 Frame 构造是否成功都必须尝试 QBUF；若原媒体操作和 QBUF 同时失败，优先返回会破坏后续驱动队列可用性的 QBUF 错误。
+
 ## 7. 时间戳与序列
 
 VideoFrame 统一使用 `TimeBase(1, 1000000)`：
 
 - 驱动设置 `V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC` 时，将 `v4l2_buffer.timestamp` 转为微秒；
-- 驱动时间戳类型不可靠或为零时，使用 DQBUF 后读取的 `CLOCK_MONOTONIC`；
+- 仅接受明确标记为 monotonic 且字段合法、非零的驱动时间戳；其他情况使用 DQBUF 后读取的 `CLOCK_MONOTONIC`；
 - 乘加转换必须检查 `int64_t` 溢出；
 - 对外 PTS 必须单调不减，回退时不得小于上一帧 PTS；
-- `v4l2_buffer.sequence` 不连续不使 Pipeline 失败，但递增 gap 指标。
+- `v4l2_buffer.sequence` 不连续不使 Pipeline 失败，`v4l2.sequence.gaps` 累加缺失帧数量，并正确处理 `uint32_t` 回绕。
 
 0.3a 不生成 DTS，也不做跨设备时钟同步。
 
@@ -216,7 +230,7 @@ Node 在 MetricRegistry 非空时发布：
 - Counter `v4l2.bytes.copied`；
 - Gauge `v4l2.pending_frame`，取值 0 或 1。
 
-指标写入失败不得静默忽略；当媒体操作和指标写入同时失败时，优先返回媒体操作失败。验收组合层使用 Status 的 provider/operation/message/native code 发布 Actual Error，并将组件 `v4l2.capture` 的 Health 置为 Error；成功显式恢复后清理旧错误并恢复 Health。
+私有 `V4L2Observer` 隔离 Node 事件与具体 MetricRegistry 写入，并允许 Fake 注入确定性指标失败。指标写入失败不得静默忽略；单独发生时向上传播，当媒体操作和指标写入同时失败时优先返回媒体操作失败。验收组合层使用 Status 的 provider/operation/message/native code 发布 Actual Error，并将组件 `v4l2.capture` 的 Health 置为 Error；成功显式恢复后清理旧错误并恢复 Health。0.3a 不把 HealthManager 注入设备 Node，也不重复实现组合层健康策略。
 
 ## 10. 构建与可移植性
 
@@ -274,6 +288,10 @@ Fake V4L2System 必须覆盖：
 - `EAVP_V4L2_DEVICE`，默认 `/dev/video10`；
 - `EAVP_V4L2_FRAME_COUNT`，默认 `300`；
 - `EAVP_V4L2_TIMEOUT_SECONDS`，默认 `20`。
+- `EAVP_V4L2_PIXEL_FORMAT`，默认 `yuv420p`；
+- `EAVP_V4L2_WIDTH`、`EAVP_V4L2_HEIGHT`，默认 `1920`、`1080`；
+- `EAVP_V4L2_FPS_NUMERATOR`、`EAVP_V4L2_FPS_DENOMINATOR`，默认 `30`、`1`；
+- `EAVP_V4L2_BUFFER_COUNT`，默认 `4`。
 
 测试必须先检查设备存在、权限、capture/streaming 能力和实际格式；在超时内采集指定帧数，并验证格式、plane 布局、PTS、帧数、校验统计、Metrics 和 Health。设备存在但没有数据时返回明确的环境超时诊断，不冒充 DeviceLost 或测试崩溃。
 
