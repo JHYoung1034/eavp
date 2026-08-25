@@ -98,6 +98,8 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/eavp/management
 
 add_library(eavp_platform STATIC
     platform/linux/alsa_capture_config.cpp
+    platform/linux/linux_event_loop.cpp
+    platform/linux/linux_runtime_api.cpp
     platform/linux/platform_runtime.cpp
     platform/reference_media_platform.cpp
     platform/simulated_platform.cpp
