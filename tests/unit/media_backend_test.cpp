@@ -468,6 +468,15 @@ TEST(CapabilityTest, RejectsInvalidRangeAndChecksStepAndAlignmentCapacity) {
     EXPECT_FALSE(range.contains(1090));
 }
 
+TEST(CapabilityTest, RecognizesYuyv422AsASinglePlaneFormat) {
+    const eavp::FormatMemoryDomain format(
+        eavp::PixelFormat::kYuyv422, eavp::MemoryDomain::kCpu,
+        std::vector<eavp::PlaneLayoutConstraint>{
+            eavp::PlaneLayoutConstraint(1, 1, 2U, 1U, 1U, 1U, 1U)});
+
+    EXPECT_TRUE(format.valid());
+}
+
 TEST(CapabilityTest, RejectsResolutionAlignmentAndMemoryDomainMismatch) {
     const eavp::VideoEncoderCapability capability =
         make_h264_capability_for_test();

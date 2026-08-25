@@ -97,6 +97,8 @@ private:
 class Buffer {
 public:
     static Result<Buffer> allocate(std::size_t size);
+    static Result<Buffer> allocate(std::size_t size,
+                                   const std::vector<PlaneLayout>& planes);
     static Result<Buffer> create(const std::shared_ptr<BufferStorage>& storage,
                                  const std::vector<PlaneLayout>& planes);
 
