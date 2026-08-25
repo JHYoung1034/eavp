@@ -4,7 +4,7 @@
 >
 > 适用版本：`0.3.0` 开发阶段，稳定版本仍为 `0.2.0`
 >
-> 规范性范围：Linux V4L2 单平面 MMAP 视频采集、CPU Frame 输出、生命周期、错误模型、可观测性与验收边界
+> 规范性范围：Linux V4L2 单平面 MMAP 视频采集、CPU Frame 输出、事件驱动调度、生命周期、错误模型、可观测性与验收边界
 
 ## 1. 背景与决策
 
@@ -24,7 +24,7 @@ EAVP 0.2 已建立 Buffer、VideoFrame、类型化 Port、Pipeline、Capability�
 1. Linux V4L2 `VIDEO_CAPTURE` 单平面、MMAP、非阻塞采集；
 2. YUV420P、NV12 与 YUYV422 到 EAVP VideoFormat/PlaneLayout 的严格映射；
 3. 驱动 Buffer 到 EAVP CPU Buffer 的有界复制与明确所有权；
-4. 与现有 MediaNode、OutputPort、MediaPipeline 和确定性 Executor 一致的调度语义；
+4. 与现有 MediaNode、OutputPort、MediaPipeline 及 Linux Platform Runtime 一致的事件驱动调度语义；
 5. enriched Status、Metrics 与上层 Health 发布所需的完整错误上下文；
 6. Fake System 的确定性测试，以及 `/dev/video10` 上连续 300 帧的可选真实设备验收；
 7. Linux x86_64 原生矩阵和三套 ARM 交叉构建兼容性。
@@ -118,6 +118,8 @@ EAVP::platform
 
 `media` 不包含 `<linux/videodev2.h>`，不依赖 platform。0.3c 的开发机验证实现使用独立可选 build-tree target `EAVP::backend_ffmpeg -> EAVP::media`，不反向进入 Core，不安装或导出。
 
+V4L2 Source 实现 `LinuxWaitSource`，并由 `docs/superpowers/specs/2026-08-25-eavp-linux-platform-runtime-design.md` 定义的 Linux Platform Runtime 驱动。Runtime 属于 `platform`，不改变上述依赖方向。
+
 ## 5. 格式与内存契约
 
 ### 5.1 支持格式
@@ -164,12 +166,14 @@ CPU Buffer 保留协商得到的 stride 和 plane offset，但不复制驱动 pa
 
 ## 6. 调度与生命周期
 
-Node 不创建私有线程，设备以 `O_RDWR | O_NONBLOCK | O_CLOEXEC` 打开。每次 `tick()` 最多产生一帧：
+Node 不创建私有线程，设备以 `O_RDWR | O_NONBLOCK | O_CLOEXEC` 打开，并向 Runtime 暴露一个 V4L2 poll descriptor。Runtime 使用 level-triggered epoll，在设备 readable 时执行一次完整 Pipeline tick。每次 `tick()` 最多产生一帧：
 
 1. 若存在 `pending_frame`，先尝试发送；仍背压则返回 `kWouldBlock`；
 2. 执行一次非阻塞 DQBUF；`EAGAIN` 返回 `kWouldBlock`；
 3. 完成校验、复制和 QBUF；
 4. 尝试发送新 Frame；下游背压时保存为 `pending_frame`。
+
+设备仍有已完成 Buffer 时，level-triggered epoll 会再次报告 ready；因此积压通过多次有界 Pipeline turn 消化，不在一次 tick 内无界循环。`DeterministicExecutor` 只保留给 Fake 和单元测试，真实设备验收必须通过 Linux Platform Runtime 驱动。
 
 生命周期行为：
 
@@ -242,6 +246,7 @@ EAVP_ENABLE_V4L2_DEVICE_TESTS=OFF
 ```
 
 - Linux 上 V4L2 默认启用；缺少 `<linux/videodev2.h>` 时配置失败并给出安装提示；
+- V4L2 真实调度要求 `EAVP_ENABLE_LINUX_RUNTIME=ON`；Runtime 只依赖 Threads、POSIX 与 Linux UAPI；
 - 非 Linux 平台强制关闭并不编译公开 V4L2 头；
 - 生产代码只依赖 C++11、POSIX 与 Linux UAPI；
 - FFmpeg、v4l2-ctl 和 v4l2loopback 不进入生产 target，也不是普通测试依赖；
@@ -270,7 +275,7 @@ Fake V4L2System 必须覆盖：
 
 ### 11.2 确定性集成测试
 
-使用 Fake System 组合真实 `V4L2SourceNode → bounded Queue → FrameChecksumSink`，连续生成 300 帧。断言：
+使用 Fake System 组合真实 `LinuxPlatformRuntime -> V4L2SourceNode -> bounded Queue -> FrameChecksumSink`，通过 Fake readiness 连续生成 300 帧。断言：
 
 - Sink 正好接收 300 帧，无重复；
 - 格式、plane、stride 与 TimeBase 正确；
@@ -279,7 +284,7 @@ Fake V4L2System 必须覆盖：
 - Pipeline、Metrics 和 Health 最终健康；
 - stop 后所有 V4L2 资源释放。
 
-该测试进入 Debug、Release 和 ASan/UBSan 普通 CTest。
+该测试进入 Debug、Release、ASan/UBSan 和 ThreadSanitizer 普通 CTest。
 
 ### 11.3 可选真实设备验收
 
@@ -308,6 +313,7 @@ Fake V4L2System 必须覆盖：
 7. 不新增生产第三方库，FFmpeg 不进入链接依赖；
 8. 文档以简体中文为主，无未解释的占位标记；
 9. 不宣称 DMABUF 零拷贝、FFmpeg 编码 Backend、oneVPL、VA-API、MPP/RGA 或 `HI_MPI` 已实现。
+10. Linux Platform Runtime 的 eventfd stop、串行 Pipeline tick 和 ThreadSanitizer 验收通过。
 
 ## 13. 0.3c 开发机 FFmpeg 软件编码验证
 
@@ -362,5 +368,7 @@ FFmpeg Backend 只验证平台架构、Backend 契约和标准码流数据流，
 
 - Linux Kernel V4L2 capture 示例：`https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/capture.c.html`
 - Linux Kernel V4L2 MMAP streaming：`https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/mmap.html`
+- Linux Kernel V4L2 poll：`https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/func-poll.html`
+- EAVP Linux Platform Runtime：`docs/superpowers/specs/2026-08-25-eavp-linux-platform-runtime-design.md`
 - FFmpeg libavcodec send/receive API：`https://ffmpeg.org/doxygen/6.1/group__lavc__encdec.html`
 - 本机验证：Linux 7.0、`/dev/video10` 为 v4l2loopback YUV420P 1920×1080@30、FFmpeg 6.1.1 的 libavcodec 已启用 libx264/libx265。

@@ -1,6 +1,6 @@
 # EAVP Linux ALSA Capture 0.3b 设计规格
 
-> 状态：已实现（2026-08-24）
+> 状态：0.3b 采集已实现（2026-08-24）；0.3a readiness 适配已批准、待实现
 >
 > 适用版本：`0.3b`（`0.3.0` 开发阶段），稳定版本仍为 `0.2.0`
 >
@@ -29,7 +29,7 @@ EAVP 必须把音频和视频作为同等重要的媒体输入。0.2 已提供 B
 4. 默认每个 AudioFrame 包含每声道 480 个采样，即 48 kHz 下 10 ms；
 5. 硬件 period 与 EAVP 输出帧解耦，短读累积为固定长度 AudioFrame；
 6. 首采样点 PTS、XRUN/suspend 重锚定及显式 discontinuity；
-7. 与 MediaNode、OutputPort、MediaPipeline 和单线程确定性 Executor 一致的背压语义；
+7. 与 MediaNode、OutputPort、MediaPipeline 和平台统一 Linux Runtime 一致的事件驱动与背压语义；
 8. Fake System 确定性测试，以及现有 ALSA Loopback 节点上的可选真实设备验收；
 9. ALSA 原生错误上下文、Metrics 和 Health 汇总。
 
@@ -214,7 +214,7 @@ SND_PCM_NO_AUTO_CHANNELS
 SND_PCM_NO_AUTO_FORMAT
 ```
 
-禁止 ALSA plugin 静默改变 rate、channels 或 sample format。0.3b 不调用 `snd_pcm_wait`，避免阻塞单线程 Executor。
+禁止 ALSA plugin 静默改变 rate、channels 或 sample format。Node 不调用 `snd_pcm_wait`；0.3a Runtime 通过完整 ALSA poll descriptor 集合等待 readiness，Node tick 仍保持非阻塞。
 
 ### 7.2 HW params
 
@@ -265,6 +265,8 @@ AlsaSourceNode 不创建线程。每次 `tick()`：
 ALSA ring 中的数据必须复制到 EAVP 拥有的 CPU Buffer。AudioFrame 离开当前 tick 后仍有效，不持有 ALSA ring 指针。一次 tick 不循环抽干设备，避免音频节点独占 Executor。
 
 `snd_pcm_readi` 返回 0 或 `-EAGAIN` 时返回 `kWouldBlock`；短读是正常行为，不补零、不丢弃，也不提前输出不足长度的 AudioFrame。
+
+0.3a 为 AlsaSourceNode 增加 `LinuxWaitSource` 适配：descriptor 数量和顺序来自 `snd_pcm_poll_descriptors_count()`/`snd_pcm_poll_descriptors()`，事件必须由 `snd_pcm_poll_descriptors_revents()` 解释。ALSA Source 与 V4L2 Source 可注册到同一平台 Reactor；既有 AudioFrame、PTS、XRUN/suspend 和 Health 契约不变。
 
 ## 9. PTS 与 discontinuity
 
@@ -446,6 +448,8 @@ EAVP_ENABLE_ALSA_DEVICE_TESTS=OFF
 9. 文档以简体中文为主，无未解释的占位标记。
 
 ## 16. 后续里程碑边界
+
+Linux 事件驱动线程模型由 `docs/superpowers/specs/2026-08-25-eavp-linux-platform-runtime-design.md` 冻结。0.3a 在不改变已验收音频数据契约的前提下，为 ALSA 增加 readiness 适配和 Runtime 回归测试。
 
 ### 16.1 0.3c 开发机 FFmpeg 编码验证
 

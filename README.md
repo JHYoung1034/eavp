@@ -42,6 +42,7 @@ ARM 交叉构建仅验证 Core（含平台无关的 AudioFormat/AudioFrame）和
 - `docs/superpowers/specs/2026-08-18-eavp-media-backend-foundation-design.md`：Media Backend Foundation 0.2 规范。
 - `docs/superpowers/specs/2026-08-21-eavp-linux-v4l2-capture-design.md`：Linux V4L2 Capture 0.3a 设计规格。
 - `docs/superpowers/specs/2026-08-22-eavp-linux-alsa-capture-design.md`：Linux ALSA Capture 0.3b 设计规格。
+- `docs/superpowers/specs/2026-08-25-eavp-linux-platform-runtime-design.md`：Linux Platform Runtime 0.3a 事件驱动与统一线程管理规格。
 - `docs/migrations/0.1-to-0.2.md`：从 0.1 到 0.2 的 API 迁移说明。
 - `docs/migrations/0.2-to-0.3-audio.md`：从 0.2 到 0.3b 的 AudioFrame API 迁移说明。
 - `docs/architecture/README.md`：规范性架构文档索引。
