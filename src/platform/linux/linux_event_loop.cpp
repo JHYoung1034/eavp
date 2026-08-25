@@ -42,6 +42,36 @@ short poll_events(std::uint32_t events) {
     return translated;
 }
 
+class ScopedLoopFds {
+public:
+    explicit ScopedLoopFds(LinuxRuntimeApi* runtime_api)
+        : epoll_fd(-1), event_fd(-1), api_(runtime_api) {}
+
+    ~ScopedLoopFds() noexcept {
+        close_noexcept(event_fd);
+        close_noexcept(epoll_fd);
+    }
+
+    void release() {
+        epoll_fd = -1;
+        event_fd = -1;
+    }
+
+    int epoll_fd;
+    int event_fd;
+
+private:
+    void close_noexcept(int fd) noexcept {
+        if (fd < 0) return;
+        try {
+            api_->close_fd(fd);
+        } catch (...) {
+        }
+    }
+
+    LinuxRuntimeApi* api_;
+};
+
 }  // namespace
 
 class LinuxEventLoop::Impl {
@@ -60,12 +90,48 @@ public:
 
     explicit Impl(std::unique_ptr<LinuxRuntimeApi> runtime_api)
         : api(std::move(runtime_api)), epoll_fd(-1), event_fd(-1), next_token(1U),
-          sources(), tokens(), registered_fds(), registered_sources() {}
+          invalidated(false), sources(), tokens(), registered_fds(),
+          registered_sources() {}
+
+    bool rollback_registration(const SourceRecord& record,
+                               std::size_t added_count) noexcept {
+        bool complete = true;
+        while (added_count > 0U) {
+            --added_count;
+            try {
+                if (api->epoll_remove(epoll_fd,
+                                      record.descriptors[added_count].fd) < 0) {
+                    complete = false;
+                }
+            } catch (...) {
+                complete = false;
+            }
+        }
+        if (!complete) invalidate_noexcept();
+        return complete;
+    }
+
+    void invalidate_noexcept() noexcept {
+        invalidated = true;
+        const int owned_event_fd = event_fd;
+        const int owned_epoll_fd = epoll_fd;
+        event_fd = -1;
+        epoll_fd = -1;
+        try {
+            if (owned_event_fd >= 0) api->close_fd(owned_event_fd);
+        } catch (...) {
+        }
+        try {
+            if (owned_epoll_fd >= 0) api->close_fd(owned_epoll_fd);
+        } catch (...) {
+        }
+    }
 
     std::unique_ptr<LinuxRuntimeApi> api;
     int epoll_fd;
     int event_fd;
     std::uint64_t next_token;
+    bool invalidated;
     std::vector<SourceRecord> sources;
     std::map<std::uint64_t, TokenTarget> tokens;
     std::set<int> registered_fds;
@@ -85,33 +151,40 @@ LinuxEventLoop::~LinuxEventLoop() noexcept {
 Status LinuxEventLoop::initialize() {
     try {
         if (!impl_->api.get()) return Status(StatusCode::kInvalidArgument);
+        if (impl_->invalidated) return Status(StatusCode::kInvalidState);
         if (impl_->epoll_fd >= 0 && impl_->event_fd >= 0) {
             return Status::ok_status();
         }
-
-        impl_->epoll_fd = impl_->api->epoll_create();
-        if (impl_->epoll_fd < 0) {
-            return system_error("无法创建 Linux epoll 实例", "epoll_create1",
-                                impl_->api->last_error());
+        if (impl_->epoll_fd >= 0 || impl_->event_fd >= 0) {
+            return Status(StatusCode::kInvalidState);
         }
 
-        impl_->event_fd = impl_->api->create_event_fd();
-        if (impl_->event_fd < 0) {
+        ScopedLoopFds owned(impl_->api.get());
+
+        owned.epoll_fd = impl_->api->epoll_create();
+        if (owned.epoll_fd < 0) {
             const int error = impl_->api->last_error();
-            const int epoll_fd = impl_->epoll_fd;
-            impl_->epoll_fd = -1;
-            impl_->api->close_fd(epoll_fd);
+            return system_error("无法创建 Linux epoll 实例", "epoll_create1",
+                                error);
+        }
+
+        owned.event_fd = impl_->api->create_event_fd();
+        if (owned.event_fd < 0) {
+            const int error = impl_->api->last_error();
             return system_error("无法创建 Linux eventfd", "eventfd", error);
         }
 
-        if (impl_->api->epoll_add(impl_->epoll_fd, impl_->event_fd, EPOLLIN,
+        if (impl_->api->epoll_add(owned.epoll_fd, owned.event_fd, EPOLLIN,
                                   kControlToken) < 0) {
+            const int error = impl_->api->last_error();
             const Status failure = system_error(
                 "无法向 Linux epoll 注册 eventfd", "epoll_ctl",
-                impl_->api->last_error());
-            close();
+                error);
             return failure;
         }
+        impl_->epoll_fd = owned.epoll_fd;
+        impl_->event_fd = owned.event_fd;
+        owned.release();
         return Status::ok_status();
     } catch (const std::bad_alloc&) {
         return allocation_error();
@@ -123,7 +196,7 @@ Status LinuxEventLoop::initialize() {
 Status LinuxEventLoop::register_source(MediaPipeline* pipeline,
                                        LinuxWaitSource* source) {
     try {
-        if (impl_->epoll_fd < 0 || impl_->event_fd < 0) {
+        if (impl_->invalidated || impl_->epoll_fd < 0 || impl_->event_fd < 0) {
             return Status(StatusCode::kInvalidState);
         }
         if (pipeline == NULL || source == NULL) {
@@ -159,37 +232,59 @@ Status LinuxEventLoop::register_source(MediaPipeline* pipeline,
         record.source = source;
         record.descriptors = descriptors;
         record.tokens.reserve(descriptors.size());
+        std::uint64_t staged_next_token = impl_->next_token;
         for (std::size_t index = 0U; index < descriptors.size(); ++index) {
-            record.tokens.push_back(impl_->next_token++);
+            record.tokens.push_back(staged_next_token++);
         }
 
-        const std::size_t source_index = impl_->sources.size();
-        impl_->sources.push_back(record);
+        // 先在副本中完成所有分配，内核注册成功后仅以无分配 swap 提交，
+        // 避免内核与内存状态因异常分叉。
+        std::vector<Impl::SourceRecord> staged_sources = impl_->sources;
+        std::map<std::uint64_t, Impl::TokenTarget> staged_tokens = impl_->tokens;
+        std::set<int> staged_registered_fds = impl_->registered_fds;
+        std::set<LinuxWaitSource*> staged_registered_sources =
+            impl_->registered_sources;
+
+        const std::size_t source_index = staged_sources.size();
+        staged_sources.push_back(record);
         for (std::size_t index = 0U; index < descriptors.size(); ++index) {
             const Impl::TokenTarget target = {source_index, index};
-            impl_->tokens.insert(std::make_pair(record.tokens[index], target));
-            impl_->registered_fds.insert(descriptors[index].fd);
+            staged_tokens.insert(std::make_pair(record.tokens[index], target));
+            staged_registered_fds.insert(descriptors[index].fd);
         }
-        impl_->registered_sources.insert(source);
+        staged_registered_sources.insert(source);
 
-        for (std::size_t index = 0U; index < descriptors.size(); ++index) {
-            if (impl_->api->epoll_add(impl_->epoll_fd, descriptors[index].fd,
-                                      epoll_interests(descriptors[index].events),
-                                      record.tokens[index]) < 0) {
-                const Status failure = system_error(
-                    "无法向 Linux epoll 注册 descriptor", "epoll_ctl",
-                    impl_->api->last_error());
-                for (std::size_t rollback = 0U; rollback < descriptors.size();
-                     ++rollback) {
-                    impl_->tokens.erase(record.tokens[rollback]);
-                    impl_->registered_fds.erase(descriptors[rollback].fd);
+        std::size_t added_count = 0U;
+        try {
+            for (std::size_t index = 0U; index < descriptors.size(); ++index) {
+                if (impl_->api->epoll_add(
+                        impl_->epoll_fd, descriptors[index].fd,
+                        epoll_interests(descriptors[index].events),
+                        record.tokens[index]) < 0) {
+                    const int error = impl_->api->last_error();
+                    impl_->rollback_registration(record, added_count);
+                    added_count = 0U;
+                    const Status failure = system_error(
+                        "无法向 Linux epoll 注册 descriptor", "epoll_ctl",
+                        error);
+                    return failure;
                 }
-                impl_->registered_sources.erase(source);
-                impl_->sources.pop_back();
-                return failure;
+                ++added_count;
             }
+
+            impl_->sources.swap(staged_sources);
+            impl_->tokens.swap(staged_tokens);
+            impl_->registered_fds.swap(staged_registered_fds);
+            impl_->registered_sources.swap(staged_registered_sources);
+            impl_->next_token = staged_next_token;
+            return Status::ok_status();
+        } catch (const std::bad_alloc&) {
+            impl_->rollback_registration(record, added_count);
+            return allocation_error();
+        } catch (...) {
+            impl_->rollback_registration(record, added_count);
+            return internal_error();
         }
-        return Status::ok_status();
     } catch (const std::bad_alloc&) {
         return allocation_error();
     } catch (...) {

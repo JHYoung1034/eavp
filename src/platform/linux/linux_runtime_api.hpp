@@ -16,6 +16,7 @@ public:
     virtual int epoll_create() = 0;
     virtual int epoll_add(int epoll_fd, int fd, std::uint32_t events,
                           std::uint64_t token) = 0;
+    virtual int epoll_remove(int epoll_fd, int fd) = 0;
     virtual int epoll_wait_events(int epoll_fd, struct epoll_event* events,
                                   int capacity, int timeout_ms) = 0;
     virtual int create_event_fd() = 0;

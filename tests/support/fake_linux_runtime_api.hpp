@@ -5,6 +5,9 @@
 #include <cstdint>
 #include <deque>
 #include <limits>
+#include <new>
+#include <set>
+#include <stdexcept>
 #include <vector>
 
 #include "../../src/platform/linux/linux_runtime_api.hpp"
@@ -38,18 +41,30 @@ public:
         std::uint64_t token;
     };
 
+    struct RemoveCall {
+        int epoll_fd;
+        int fd;
+    };
+
     explicit FakeLinuxRuntimeApi(std::vector<int>* external_closed_fds = NULL)
         : epoll_fd_result(40), event_fd_result(41), epoll_add_result(0),
+          epoll_remove_result(0), fail_epoll_add_call(0),
+          fail_epoll_add_error(EIO), epoll_remove_error(ENOENT),
+          throw_on_epoll_create(false), throw_on_create_event_fd(false),
+          throw_on_epoll_add_call(0), throw_bad_alloc_on_epoll_add_call(0),
           read_event_fd_result(0), write_event_fd_result(0), close_fd_result(0),
           monotonic_now_result(0), saved_error(EIO), event_fd_value(1U),
-          epoll_create_count(0), create_event_fd_count(0), epoll_wait_count(0),
+          epoll_create_count(0), create_event_fd_count(0), epoll_add_count(0),
+          epoll_wait_count(0),
           read_event_fd_count(0), write_event_fd_count(0),
           monotonic_now_count(0), written_event_fd(-1), written_value(0U),
-          add_calls(), closed_fds(), external_closed_fds_(external_closed_fds),
+          add_calls(), remove_calls(), closed_fds(),
+          external_closed_fds_(external_closed_fds), registered_fds_(),
           wait_steps() {}
 
     int epoll_create() {
         ++epoll_create_count;
+        if (throw_on_epoll_create) throw std::runtime_error("epoll_create");
         return epoll_fd_result;
     }
 
@@ -57,7 +72,35 @@ public:
                   std::uint64_t token) {
         AddCall call = {epoll_fd, fd, events, token};
         add_calls.push_back(call);
+        ++epoll_add_count;
+        if (epoll_add_count == throw_bad_alloc_on_epoll_add_call) {
+            throw std::bad_alloc();
+        }
+        if (epoll_add_count == throw_on_epoll_add_call) {
+            throw std::runtime_error("epoll_add");
+        }
+        if (epoll_add_count == fail_epoll_add_call) {
+            saved_error = fail_epoll_add_error;
+            return -1;
+        }
+        if (epoll_add_result < 0) return epoll_add_result;
+        if (registered_fds_.count(fd) != 0U) {
+            saved_error = EEXIST;
+            return -1;
+        }
+        registered_fds_.insert(fd);
         return epoll_add_result;
+    }
+
+    int epoll_remove(int epoll_fd, int fd) {
+        const RemoveCall call = {epoll_fd, fd};
+        remove_calls.push_back(call);
+        if (epoll_remove_result < 0) {
+            saved_error = epoll_remove_error;
+            return -1;
+        }
+        registered_fds_.erase(fd);
+        return 0;
     }
 
     int epoll_wait_events(int, struct epoll_event* events, int capacity, int) {
@@ -80,6 +123,7 @@ public:
 
     int create_event_fd() {
         ++create_event_fd_count;
+        if (throw_on_create_event_fd) throw std::bad_alloc();
         return event_fd_result;
     }
 
@@ -98,6 +142,7 @@ public:
 
     int close_fd(int fd) {
         closed_fds.push_back(fd);
+        if (fd == epoll_fd_result) registered_fds_.clear();
         if (external_closed_fds_ != NULL) external_closed_fds_->push_back(fd);
         return close_fd_result;
     }
@@ -147,6 +192,14 @@ public:
     int epoll_fd_result;
     int event_fd_result;
     int epoll_add_result;
+    int epoll_remove_result;
+    int fail_epoll_add_call;
+    int fail_epoll_add_error;
+    int epoll_remove_error;
+    bool throw_on_epoll_create;
+    bool throw_on_create_event_fd;
+    int throw_on_epoll_add_call;
+    int throw_bad_alloc_on_epoll_add_call;
     int read_event_fd_result;
     int write_event_fd_result;
     int close_fd_result;
@@ -155,6 +208,7 @@ public:
     std::uint64_t event_fd_value;
     int epoll_create_count;
     int create_event_fd_count;
+    int epoll_add_count;
     int epoll_wait_count;
     int read_event_fd_count;
     int write_event_fd_count;
@@ -162,6 +216,7 @@ public:
     int written_event_fd;
     std::uint64_t written_value;
     std::vector<AddCall> add_calls;
+    std::vector<RemoveCall> remove_calls;
     std::vector<int> closed_fds;
 
 private:
@@ -180,6 +235,7 @@ private:
     }
 
     std::vector<int>* external_closed_fds_;
+    std::set<int> registered_fds_;
     std::deque<WaitStep> wait_steps;
 };
 

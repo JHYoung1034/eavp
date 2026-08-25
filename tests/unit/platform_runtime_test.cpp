@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
 #include <cerrno>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <sys/epoll.h>
+#include <thread>
 #include <vector>
 
 #include "eavp/platform/linux/platform_runtime.hpp"
@@ -161,6 +164,139 @@ TEST(LinuxEventLoopTest, RejectsEmptyInvalidAndDuplicateDescriptors) {
     EXPECT_EQ(eavp::StatusCode::kAlreadyExists,
               fixture.loop->register_source(
                   &fixture.pipeline, &fixture.source_b).code());
+}
+
+TEST(LinuxEventLoopTest, RejectsEveryInvalidAndDuplicateDescriptorShape) {
+    RuntimeFixture fixture;
+    ASSERT_TRUE(fixture.loop->initialize().ok());
+
+    const struct pollfd negative = {-1, static_cast<short>(POLLIN), 0};
+    fixture.source_a.set_descriptors(std::vector<pollfd>(1, negative));
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              fixture.loop->register_source(
+                  &fixture.pipeline, &fixture.source_a).code());
+
+    const struct pollfd no_events = {10, 0, 0};
+    fixture.source_a.set_descriptors(std::vector<pollfd>(1, no_events));
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              fixture.loop->register_source(
+                  &fixture.pipeline, &fixture.source_a).code());
+
+    fixture.source_a.set_descriptors(
+        std::vector<pollfd>{readable_fd(10), readable_fd(10)});
+    EXPECT_EQ(eavp::StatusCode::kAlreadyExists,
+              fixture.loop->register_source(
+                  &fixture.pipeline, &fixture.source_a).code());
+
+    fixture.source_a.set_descriptors(std::vector<pollfd>(1, readable_fd(10)));
+    ASSERT_TRUE(fixture.loop->register_source(
+        &fixture.pipeline, &fixture.source_a).ok());
+    EXPECT_EQ(eavp::StatusCode::kAlreadyExists,
+              fixture.loop->register_source(
+                  &fixture.pipeline, &fixture.source_a).code());
+}
+
+TEST(LinuxEventLoopTest, RemovesPartialKernelRegistrationAndAllowsRetry) {
+    RuntimeFixture fixture;
+    fixture.source_a.set_descriptors(std::vector<pollfd>{
+        readable_fd(10), readable_fd(11), readable_fd(12)});
+    ASSERT_TRUE(fixture.loop->initialize().ok());
+    fixture.api->fail_epoll_add_call = 4;
+    fixture.api->fail_epoll_add_error = EIO;
+
+    const eavp::Status failed = fixture.loop->register_source(
+        &fixture.pipeline, &fixture.source_a);
+
+    EXPECT_EQ(eavp::StatusCode::kIoError, failed.code());
+    EXPECT_EQ(EIO, failed.native_code());
+    ASSERT_EQ(2U, fixture.api->remove_calls.size());
+    EXPECT_EQ(11, fixture.api->remove_calls[0].fd);
+    EXPECT_EQ(10, fixture.api->remove_calls[1].fd);
+    EXPECT_TRUE(fixture.loop->register_source(
+        &fixture.pipeline, &fixture.source_a).ok());
+}
+
+TEST(LinuxEventLoopTest, InvalidatesLoopWhenRegistrationRollbackFails) {
+    RuntimeFixture fixture;
+    fixture.source_a.set_descriptors(
+        std::vector<pollfd>{readable_fd(10), readable_fd(11)});
+    ASSERT_TRUE(fixture.loop->initialize().ok());
+    fixture.api->fail_epoll_add_call = 3;
+    fixture.api->fail_epoll_add_error = EIO;
+    fixture.api->epoll_remove_result = -1;
+    fixture.api->epoll_remove_error = EBADF;
+
+    const eavp::Status failed = fixture.loop->register_source(
+        &fixture.pipeline, &fixture.source_a);
+
+    EXPECT_EQ(eavp::StatusCode::kIoError, failed.code());
+    EXPECT_EQ(EIO, failed.native_code());
+    ASSERT_EQ(1U, fixture.api->remove_calls.size());
+    EXPECT_EQ(10, fixture.api->remove_calls[0].fd);
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              fixture.loop->wait_once().status().code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              fixture.loop->initialize().code());
+    EXPECT_EQ(1, fixture.api->close_count_for(40));
+    EXPECT_EQ(1, fixture.api->close_count_for(41));
+}
+
+TEST(LinuxEventLoopTest, RestoresUninitializedStateWhenInitializationThrows) {
+    RuntimeFixture create_fixture;
+    create_fixture.api->throw_on_epoll_create = true;
+    EXPECT_EQ(eavp::StatusCode::kInternal,
+              create_fixture.loop->initialize().code());
+    EXPECT_TRUE(create_fixture.api->closed_fds.empty());
+    create_fixture.api->throw_on_epoll_create = false;
+    EXPECT_TRUE(create_fixture.loop->initialize().ok());
+
+    RuntimeFixture event_fixture;
+    event_fixture.api->throw_on_create_event_fd = true;
+
+    const eavp::Status failed = event_fixture.loop->initialize();
+
+    EXPECT_EQ(eavp::StatusCode::kResourceExhausted, failed.code());
+    EXPECT_EQ(1, event_fixture.api->close_count_for(40));
+    event_fixture.api->throw_on_create_event_fd = false;
+    EXPECT_TRUE(event_fixture.loop->initialize().ok());
+
+    RuntimeFixture add_fixture;
+    add_fixture.api->throw_on_epoll_add_call = 1;
+    EXPECT_EQ(eavp::StatusCode::kInternal,
+              add_fixture.loop->initialize().code());
+    EXPECT_EQ(1, add_fixture.api->close_count_for(40));
+    EXPECT_EQ(1, add_fixture.api->close_count_for(41));
+    EXPECT_TRUE(add_fixture.loop->initialize().ok());
+}
+
+TEST(LinuxEventLoopTest, RollsBackRegistrationWhenApiThrows) {
+    RuntimeFixture allocation_fixture;
+    allocation_fixture.source_a.set_descriptors(
+        std::vector<pollfd>{readable_fd(10), readable_fd(11)});
+    ASSERT_TRUE(allocation_fixture.loop->initialize().ok());
+    allocation_fixture.api->throw_bad_alloc_on_epoll_add_call = 3;
+
+    const eavp::Status failed = allocation_fixture.loop->register_source(
+        &allocation_fixture.pipeline, &allocation_fixture.source_a);
+
+    EXPECT_EQ(eavp::StatusCode::kResourceExhausted, failed.code());
+    ASSERT_EQ(1U, allocation_fixture.api->remove_calls.size());
+    EXPECT_EQ(10, allocation_fixture.api->remove_calls[0].fd);
+    EXPECT_TRUE(allocation_fixture.loop->register_source(
+        &allocation_fixture.pipeline, &allocation_fixture.source_a).ok());
+
+    RuntimeFixture unknown_fixture;
+    unknown_fixture.source_a.set_descriptors(
+        std::vector<pollfd>{readable_fd(20), readable_fd(21)});
+    ASSERT_TRUE(unknown_fixture.loop->initialize().ok());
+    unknown_fixture.api->throw_on_epoll_add_call = 3;
+    const eavp::Status unknown = unknown_fixture.loop->register_source(
+        &unknown_fixture.pipeline, &unknown_fixture.source_a);
+    EXPECT_EQ(eavp::StatusCode::kInternal, unknown.code());
+    ASSERT_EQ(1U, unknown_fixture.api->remove_calls.size());
+    EXPECT_EQ(20, unknown_fixture.api->remove_calls[0].fd);
+    EXPECT_TRUE(unknown_fixture.loop->register_source(
+        &unknown_fixture.pipeline, &unknown_fixture.source_a).ok());
 }
 
 TEST(LinuxEventLoopTest, EvaluatesEachSourceOnceAndHonorsFalseReadiness) {
@@ -364,6 +500,66 @@ TEST(LinuxEventLoopTest, ClosesPartiallyAndFullyInitializedResourcesExactlyOnce)
         ASSERT_TRUE(loop.initialize().ok());
     }
     EXPECT_EQ(2U, destructor_closed_fds.size());
+}
+
+TEST(LinuxEventLoopTest, ClosesBothDescriptorsWhenControlRegistrationFails) {
+    std::vector<int> closed_fds;
+    FakeLinuxRuntimeApi* api = new FakeLinuxRuntimeApi(&closed_fds);
+    api->epoll_add_result = -1;
+    api->saved_error = EIO;
+    {
+        eavp::detail::LinuxEventLoop loop((
+            std::unique_ptr<eavp::detail::LinuxRuntimeApi>(api)));
+        const eavp::Status status = loop.initialize();
+        EXPECT_EQ(eavp::StatusCode::kIoError, status.code());
+        EXPECT_EQ("epoll_ctl", status.operation());
+    }
+    ASSERT_EQ(2U, closed_fds.size());
+    EXPECT_EQ(41, closed_fds[0]);
+    EXPECT_EQ(40, closed_fds[1]);
+}
+
+TEST(LinuxRuntimeApiTest, LastErrorRemainsPairedWithTheCallingThread) {
+    std::unique_ptr<eavp::detail::LinuxRuntimeApi> api =
+        eavp::detail::create_linux_runtime_api();
+    const int epoll_fd = api->epoll_create();
+    ASSERT_GE(epoll_fd, 0);
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    int failed_threads = 0;
+    int invalid_capacity_result = 0;
+    int invalid_fd_result = 0;
+    int invalid_capacity_error = 0;
+    int invalid_fd_error = 0;
+    struct epoll_event first_event;
+    struct epoll_event second_event;
+
+    std::thread invalid_capacity([&]() {
+        invalid_capacity_result =
+            api->epoll_wait_events(epoll_fd, &first_event, 0, 0);
+        std::unique_lock<std::mutex> lock(mutex);
+        ++failed_threads;
+        condition.notify_all();
+        condition.wait(lock, [&]() { return failed_threads == 2; });
+        invalid_capacity_error = api->last_error();
+    });
+    std::thread invalid_fd([&]() {
+        invalid_fd_result = api->epoll_wait_events(-1, &second_event, 1, 0);
+        std::unique_lock<std::mutex> lock(mutex);
+        ++failed_threads;
+        condition.notify_all();
+        condition.wait(lock, [&]() { return failed_threads == 2; });
+        invalid_fd_error = api->last_error();
+    });
+    invalid_capacity.join();
+    invalid_fd.join();
+
+    EXPECT_EQ(-1, invalid_capacity_result);
+    EXPECT_EQ(-1, invalid_fd_result);
+    EXPECT_EQ(EINVAL, invalid_capacity_error);
+    EXPECT_EQ(EBADF, invalid_fd_error);
+    EXPECT_EQ(0, api->close_fd(epoll_fd));
 }
 
 }  // namespace
