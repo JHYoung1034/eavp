@@ -1,15 +1,24 @@
 #include <gtest/gtest.h>
 
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
+#include <fcntl.h>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <sys/epoll.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
+#include "eavp/management/metrics.hpp"
+#include "eavp/media/node.hpp"
+#include "eavp/media/pipeline.hpp"
 #include "eavp/platform/linux/platform_runtime.hpp"
 #include "eavp/platform/linux/wait_source.hpp"
+#include "../../src/platform/linux/platform_runtime_internal.hpp"
 #include "../support/runtime_test_utils.hpp"
 
 namespace {
@@ -41,6 +50,298 @@ private:
 using eavp_test::FakeLinuxRuntimeApi;
 using eavp_test::RuntimeFixture;
 using eavp_test::readable_fd;
+
+class ScopedTestAlarm {
+public:
+    ScopedTestAlarm() { ::alarm(5U); }
+    ~ScopedTestAlarm() { ::alarm(0U); }
+
+private:
+    ScopedTestAlarm(const ScopedTestAlarm&);
+    ScopedTestAlarm& operator=(const ScopedTestAlarm&);
+};
+
+class PipeWaitSource : public eavp::LinuxWaitSource {
+public:
+    PipeWaitSource() : read_fd_(-1), write_fd_(-1) {
+        int descriptors[2] = {-1, -1};
+        if (::pipe(descriptors) != 0) {
+            throw std::runtime_error("pipe");
+        }
+        read_fd_ = descriptors[0];
+        write_fd_ = descriptors[1];
+        if (::fcntl(read_fd_, F_SETFL, O_NONBLOCK) != 0 ||
+            ::fcntl(write_fd_, F_SETFL, O_NONBLOCK) != 0) {
+            ::close(read_fd_);
+            ::close(write_fd_);
+            throw std::runtime_error("fcntl");
+        }
+    }
+
+    ~PipeWaitSource() {
+        if (write_fd_ >= 0) ::close(write_fd_);
+        if (read_fd_ >= 0) ::close(read_fd_);
+    }
+
+    eavp::Result<std::vector<struct pollfd> > poll_descriptors() override {
+        const struct pollfd descriptor = {
+            read_fd_, static_cast<short>(POLLIN), 0};
+        return eavp::Result<std::vector<struct pollfd> >(
+            std::vector<struct pollfd>(1U, descriptor));
+    }
+
+    eavp::Result<bool> evaluate_poll_events(
+        const std::vector<struct pollfd>& descriptors) override {
+        if (descriptors.size() != 1U) {
+            return eavp::Result<bool>(
+                eavp::Status(eavp::StatusCode::kInvalidArgument));
+        }
+        return eavp::Result<bool>(
+            (descriptors[0].revents & static_cast<short>(POLLIN | POLLERR |
+                                                        POLLHUP)) != 0);
+    }
+
+    bool signal() {
+        const char value = 'x';
+        return ::write(write_fd_, &value, sizeof(value)) == sizeof(value);
+    }
+
+    int read_fd() const { return read_fd_; }
+
+private:
+    int read_fd_;
+    int write_fd_;
+};
+
+class RecordingNode : public eavp::MediaNode {
+public:
+    RecordingNode(const std::string& id, int ready_fd,
+                  const eavp::Status& start_status = eavp::Status::ok_status(),
+                  const eavp::Status& tick_status = eavp::Status::ok_status(),
+                  bool drain_forever = false,
+                  std::vector<std::string>* external_log = NULL)
+        : eavp::MediaNode(id), ready_fd_(ready_fd),
+          start_status_(start_status), tick_status_(tick_status),
+          drain_forever_(drain_forever), external_log_(external_log),
+          additional_ready_fd_(-1),
+          tick_count_(0), stop_count_(0), reset_count_(0),
+          tick_in_progress_(false), concurrent_tick_observed_(false),
+          calls_() {}
+
+    bool wait_for_ticks(int expected) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2),
+                                   [this, expected]() {
+                                       return tick_count_ >= expected;
+                                   });
+    }
+
+    bool all_calls_share_one_thread() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (calls_.empty()) return false;
+        for (std::size_t index = 1U; index < calls_.size(); ++index) {
+            if (calls_[index] != calls_[0]) return false;
+        }
+        return true;
+    }
+
+    std::thread::id execution_thread() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return calls_.empty() ? std::thread::id() : calls_[0];
+    }
+
+    bool concurrent_tick_observed() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return concurrent_tick_observed_;
+    }
+
+    int tick_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return tick_count_;
+    }
+
+    int stop_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return stop_count_;
+    }
+
+    int reset_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return reset_count_;
+    }
+
+    void set_additional_ready_fd(int fd) { additional_ready_fd_ = fd; }
+
+protected:
+    eavp::Status on_prepare() override {
+        record("prepare");
+        return eavp::Status::ok_status();
+    }
+
+    eavp::Status on_start() override {
+        record("start");
+        return start_status_;
+    }
+
+    eavp::Status on_stop() override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++stop_count_;
+        }
+        record("stop");
+        return drain_forever_
+                   ? eavp::Status(eavp::StatusCode::kWouldBlock)
+                   : eavp::Status::ok_status();
+    }
+
+    eavp::Status on_reset() override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++reset_count_;
+        }
+        record("reset");
+        return eavp::Status::ok_status();
+    }
+
+    eavp::Status on_tick() override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (tick_in_progress_) concurrent_tick_observed_ = true;
+            tick_in_progress_ = true;
+            ++tick_count_;
+            calls_.push_back(std::this_thread::get_id());
+            if (external_log_ != NULL) external_log_->push_back(id() + ".tick");
+            condition_.notify_all();
+        }
+        char value = 0;
+        if (ready_fd_ >= 0) (void)::read(ready_fd_, &value, sizeof(value));
+        if (additional_ready_fd_ >= 0) {
+            (void)::read(additional_ready_fd_, &value, sizeof(value));
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            tick_in_progress_ = false;
+            condition_.notify_all();
+        }
+        return tick_status_;
+    }
+
+private:
+    void record(const std::string& operation) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        calls_.push_back(std::this_thread::get_id());
+        if (external_log_ != NULL) external_log_->push_back(id() + "." + operation);
+        condition_.notify_all();
+    }
+
+    int ready_fd_;
+    eavp::Status start_status_;
+    eavp::Status tick_status_;
+    bool drain_forever_;
+    std::vector<std::string>* external_log_;
+    int additional_ready_fd_;
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    int tick_count_;
+    int stop_count_;
+    int reset_count_;
+    bool tick_in_progress_;
+    bool concurrent_tick_observed_;
+    std::vector<std::thread::id> calls_;
+};
+
+struct RuntimePipelineHarness {
+    RuntimePipelineHarness(
+        const std::string& id,
+        const eavp::Status& start_status = eavp::Status::ok_status(),
+        const eavp::Status& tick_status = eavp::Status::ok_status(),
+        bool drain_forever = false,
+        std::vector<std::string>* external_log = NULL)
+        : deadline(), source(), node(NULL), pipeline(id) {
+        std::unique_ptr<RecordingNode> owned_node(new RecordingNode(
+            id + "-node", source.read_fd(), start_status, tick_status,
+            drain_forever, external_log));
+        node = owned_node.get();
+        const eavp::Status added = pipeline.add_node(std::move(owned_node));
+        if (!added.ok()) throw std::runtime_error("add_node");
+    }
+
+    std::vector<eavp::LinuxWaitSource*> wait_sources() {
+        return std::vector<eavp::LinuxWaitSource*>(1U, &source);
+    }
+
+    ScopedTestAlarm deadline;
+    PipeWaitSource source;
+    RecordingNode* node;
+    eavp::MediaPipeline pipeline;
+};
+
+std::unique_ptr<eavp::LinuxPlatformRuntime> create_runtime(
+    int stop_timeout_ms = 100, eavp::MetricRegistry* metrics = NULL) {
+    const eavp::LinuxPlatformRuntimeConfig config =
+        eavp::LinuxPlatformRuntimeConfig::create(1, stop_timeout_ms).take_value();
+    eavp::Result<std::unique_ptr<eavp::LinuxPlatformRuntime> > created =
+        eavp::LinuxPlatformRuntime::create(config, metrics);
+    if (!created.ok()) throw std::runtime_error("runtime create");
+    return created.take_value();
+}
+
+class FakeRuntimeObserver : public eavp::detail::RuntimeObserver {
+public:
+    FakeRuntimeObserver()
+        : poll_status_(), turn_status_(), failure_status_(),
+          running_status_(), throw_on_turn_(false), poll_count_(0),
+          turn_count_(0), failure_count_(0), running_true_count_(0),
+          running_false_count_(0) {}
+
+    eavp::Status on_poll(std::uint64_t, std::uint64_t) override {
+        ++poll_count_;
+        return poll_status_;
+    }
+
+    eavp::Status on_pipeline_turn() override {
+        ++turn_count_;
+        if (throw_on_turn_) throw std::runtime_error("observer turn");
+        return turn_status_;
+    }
+
+    eavp::Status on_pipeline_failure() override {
+        ++failure_count_;
+        return failure_status_;
+    }
+
+    eavp::Status on_reactor_running(bool running) override {
+        if (running) {
+            ++running_true_count_;
+            return running_status_;
+        }
+        ++running_false_count_;
+        return eavp::Status::ok_status();
+    }
+
+    eavp::Status poll_status_;
+    eavp::Status turn_status_;
+    eavp::Status failure_status_;
+    eavp::Status running_status_;
+    bool throw_on_turn_;
+    int poll_count_;
+    int turn_count_;
+    int failure_count_;
+    int running_true_count_;
+    int running_false_count_;
+};
+
+std::unique_ptr<eavp::LinuxPlatformRuntime> create_test_runtime(
+    eavp::detail::RuntimeObserver* observer, int stop_timeout_ms = 100) {
+    const eavp::LinuxPlatformRuntimeConfig config =
+        eavp::LinuxPlatformRuntimeConfig::create(
+            1, stop_timeout_ms).take_value();
+    eavp::Result<std::unique_ptr<eavp::LinuxPlatformRuntime> > created =
+        eavp::detail::LinuxPlatformRuntimeTestPeer::create(
+            config, eavp::detail::create_linux_runtime_api(), observer);
+    if (!created.ok()) throw std::runtime_error("test runtime create");
+    return created.take_value();
+}
 
 TEST(LinuxPlatformRuntimeConfigTest, AcceptsSingleReactorAndPositiveStopTimeout) {
     eavp::Result<eavp::LinuxPlatformRuntimeConfig> result =
@@ -82,20 +383,297 @@ TEST(LinuxWaitSourceTest, PreservesTheCompletePollDescriptorArray) {
     EXPECT_EQ(POLLPRI, source.evaluated_descriptors()[1].revents);
 }
 
-TEST(LinuxPlatformRuntimeTest, CreatesTheCreatedStateButDefersRuntimeOperations) {
-    const eavp::LinuxPlatformRuntimeConfig config =
-        eavp::LinuxPlatformRuntimeConfig::create(1, 2000).take_value();
-    eavp::Result<std::unique_ptr<eavp::LinuxPlatformRuntime> > created =
-        eavp::LinuxPlatformRuntime::create(config, NULL);
+TEST(LinuxPlatformRuntimeTest, RejectsInvalidAndDuplicatePipelineRegistration) {
+    RuntimePipelineHarness harness("registered");
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime = create_runtime();
 
-    ASSERT_TRUE(created.ok());
-    const std::unique_ptr<eavp::LinuxPlatformRuntime> runtime = created.take_value();
-    EXPECT_EQ(eavp::PlatformRuntimeState::kCreated, runtime->state());
-    EXPECT_EQ(eavp::StatusCode::kInvalidState, runtime->last_failure().code());
-    EXPECT_EQ(eavp::StatusCode::kInvalidState,
-              runtime->register_pipeline(NULL, std::vector<eavp::LinuxWaitSource*>()).code());
-    EXPECT_EQ(eavp::StatusCode::kInvalidState, runtime->start().code());
-    EXPECT_EQ(eavp::StatusCode::kInvalidState, runtime->stop().code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              runtime->register_pipeline(
+                  NULL, std::vector<eavp::LinuxWaitSource*>()).code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              runtime->register_pipeline(
+                  &harness.pipeline,
+                  std::vector<eavp::LinuxWaitSource*>()).code());
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    EXPECT_EQ(eavp::StatusCode::kAlreadyExists,
+              runtime->register_pipeline(
+                  &harness.pipeline, harness.wait_sources()).code());
+}
+
+TEST(LinuxPlatformRuntimeTest, RunsAllPipelineOperationsOnOneReactorThread) {
+    RuntimePipelineHarness harness("affinity");
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime = create_runtime();
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+
+    ASSERT_TRUE(runtime->start().ok());
+    ASSERT_TRUE(harness.source.signal());
+    ASSERT_TRUE(harness.node->wait_for_ticks(1));
+    ASSERT_TRUE(runtime->stop().ok());
+
+    EXPECT_TRUE(harness.node->all_calls_share_one_thread());
+    EXPECT_NE(std::this_thread::get_id(), harness.node->execution_thread());
+    EXPECT_FALSE(harness.node->concurrent_tick_observed());
+    EXPECT_EQ(1, harness.node->tick_count());
+    EXPECT_EQ(1, harness.node->stop_count());
+    EXPECT_EQ(1, harness.node->reset_count());
+}
+
+TEST(LinuxPlatformRuntimeTest, RollsBackStartedPipelinesInReverseOrder) {
+    std::vector<std::string> calls;
+    RuntimePipelineHarness first("first", eavp::Status::ok_status(),
+                                 eavp::Status::ok_status(), false, &calls);
+    RuntimePipelineHarness second(
+        "second",
+        eavp::Status(eavp::StatusCode::kDeviceLost, "second start failed"),
+        eavp::Status::ok_status(), false, &calls);
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime = create_runtime();
+    ASSERT_TRUE(runtime->register_pipeline(
+        &first.pipeline, first.wait_sources()).ok());
+    ASSERT_TRUE(runtime->register_pipeline(
+        &second.pipeline, second.wait_sources()).ok());
+
+    const eavp::Status started = runtime->start();
+
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, started.code());
+    EXPECT_EQ(eavp::PlatformRuntimeState::kError, runtime->state());
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost,
+              runtime->last_failure().code());
+    ASSERT_GE(calls.size(), 7U);
+    EXPECT_EQ("second-node.reset", calls[calls.size() - 2U]);
+    EXPECT_EQ("first-node.reset", calls[calls.size() - 1U]);
+    EXPECT_TRUE(first.node->all_calls_share_one_thread());
+    EXPECT_TRUE(second.node->all_calls_share_one_thread());
+    EXPECT_EQ(first.node->execution_thread(), second.node->execution_thread());
+    EXPECT_NE(std::this_thread::get_id(), first.node->execution_thread());
+}
+
+TEST(LinuxPlatformRuntimeTest, JoinsTheReactorBeforeStartFailureReturns) {
+    RuntimePipelineHarness harness(
+        "start-failure",
+        eavp::Status(eavp::StatusCode::kDeviceLost, "camera disappeared"));
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime = create_runtime();
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, runtime->start().code());
+    const int resets_after_return = harness.node->reset_count();
+    EXPECT_GE(resets_after_return, 1);
+    EXPECT_EQ(resets_after_return, harness.node->reset_count());
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, runtime->stop().code());
+}
+
+TEST(LinuxPlatformRuntimeTest, StopWakesAReactorBlockedInEpoll) {
+    RuntimePipelineHarness harness("blocked-stop");
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime = create_runtime();
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+
+    const std::chrono::steady_clock::time_point before =
+        std::chrono::steady_clock::now();
+    const eavp::Status stopped = runtime->stop();
+    const std::chrono::milliseconds elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - before);
+
+    EXPECT_TRUE(stopped.ok());
+    EXPECT_LT(elapsed.count(), 1000);
+    EXPECT_EQ(eavp::PlatformRuntimeState::kStopped, runtime->state());
+}
+
+TEST(LinuxPlatformRuntimeTest, StartAndStopAreIdempotent) {
+    RuntimePipelineHarness harness("idempotent");
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime = create_runtime();
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+
+    ASSERT_TRUE(runtime->start().ok());
+    EXPECT_TRUE(runtime->start().ok());
+    ASSERT_TRUE(runtime->stop().ok());
+    EXPECT_TRUE(runtime->stop().ok());
+    EXPECT_EQ(1, harness.node->stop_count());
+    EXPECT_EQ(1, harness.node->reset_count());
+}
+
+TEST(LinuxPlatformRuntimeTest, PreservesFatalPipelineFailureAndStopsScheduling) {
+    const eavp::Status fatal(
+        eavp::StatusCode::kDeviceLost, "capture lost", "camera", "tick", 19);
+    RuntimePipelineHarness harness(
+        "fatal", eavp::Status::ok_status(), fatal);
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime = create_runtime();
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+
+    ASSERT_TRUE(harness.source.signal());
+    ASSERT_TRUE(harness.node->wait_for_ticks(1));
+    const eavp::Status stopped = runtime->stop();
+
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, stopped.code());
+    EXPECT_EQ(eavp::PlatformRuntimeState::kError, runtime->state());
+    const eavp::Status observed = runtime->last_failure();
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, observed.code());
+    EXPECT_EQ("camera", observed.provider_id());
+    EXPECT_EQ("tick", observed.operation());
+    EXPECT_EQ(19, observed.native_code());
+    EXPECT_EQ(1, harness.node->tick_count());
+    EXPECT_GE(harness.node->reset_count(), 1);
+}
+
+TEST(LinuxPlatformRuntimeTest, CancelsDrainAndReturnsTimeoutAtTheDeadline) {
+    RuntimePipelineHarness harness(
+        "timeout", eavp::Status::ok_status(),
+        eavp::Status::ok_status(), true);
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime = create_runtime(1);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+
+    const eavp::Status stopped = runtime->stop();
+
+    EXPECT_EQ(eavp::StatusCode::kTimeout, stopped.code());
+    EXPECT_EQ(eavp::PlatformRuntimeState::kError, runtime->state());
+    EXPECT_EQ(eavp::StatusCode::kTimeout,
+              runtime->last_failure().code());
+    EXPECT_GT(harness.node->stop_count(), 0);
+    EXPECT_GE(harness.node->reset_count(), 1);
+    EXPECT_EQ(stopped.code(), runtime->stop().code());
+}
+
+TEST(LinuxPlatformRuntimeTest, DestructorStopsAndJoinsTheOwnedReactor) {
+    RuntimePipelineHarness harness("destructor");
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime = create_runtime();
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+
+    runtime.reset();
+
+    EXPECT_EQ(eavp::PipelineState::kStopped, harness.pipeline.state());
+    EXPECT_EQ(1, harness.node->stop_count());
+    EXPECT_EQ(1, harness.node->reset_count());
+}
+
+TEST(LinuxPlatformRuntimeTest, TicksOnceWhenTwoSourcesForOnePipelineAreReady) {
+    RuntimePipelineHarness harness("coalesced-runtime");
+    PipeWaitSource second_source;
+    harness.node->set_additional_ready_fd(second_source.read_fd());
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime = create_runtime();
+    std::vector<eavp::LinuxWaitSource*> sources;
+    sources.push_back(&harness.source);
+    sources.push_back(&second_source);
+    ASSERT_TRUE(runtime->register_pipeline(&harness.pipeline, sources).ok());
+    ASSERT_TRUE(harness.source.signal());
+    ASSERT_TRUE(second_source.signal());
+
+    ASSERT_TRUE(runtime->start().ok());
+    ASSERT_TRUE(harness.node->wait_for_ticks(1));
+    ASSERT_TRUE(runtime->stop().ok());
+
+    EXPECT_EQ(1, harness.node->tick_count());
+}
+
+TEST(LinuxPlatformRuntimeTest, PublishesStableRuntimeMetrics) {
+    eavp::MetricRegistry metrics;
+    const eavp::Status fatal(
+        eavp::StatusCode::kDeviceLost, "metrics fatal", "camera", "tick", 7);
+    RuntimePipelineHarness harness(
+        "metrics", eavp::Status::ok_status(), fatal);
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_runtime(100, &metrics);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+
+    ASSERT_TRUE(harness.source.signal());
+    ASSERT_TRUE(harness.node->wait_for_ticks(1));
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, runtime->stop().code());
+
+    ASSERT_TRUE(metrics.counter("runtime.poll.wakeups").ok());
+    EXPECT_GE(metrics.counter("runtime.poll.wakeups").value(), 1U);
+    ASSERT_TRUE(metrics.counter("runtime.poll.interrupted").ok());
+    EXPECT_EQ(0U, metrics.counter("runtime.poll.interrupted").value());
+    ASSERT_TRUE(metrics.counter("runtime.pipeline.turns").ok());
+    EXPECT_EQ(1U, metrics.counter("runtime.pipeline.turns").value());
+    ASSERT_TRUE(metrics.counter("runtime.pipeline.failures").ok());
+    EXPECT_EQ(1U, metrics.counter("runtime.pipeline.failures").value());
+    ASSERT_TRUE(metrics.gauge("runtime.reactor.running").ok());
+    EXPECT_DOUBLE_EQ(0.0,
+                     metrics.gauge("runtime.reactor.running").value());
+}
+
+TEST(LinuxPlatformRuntimeTest, ReturnsAnObserverFailureWithoutThreadException) {
+    FakeRuntimeObserver observer;
+    observer.throw_on_turn_ = true;
+    RuntimePipelineHarness harness("observer-only");
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_test_runtime(&observer);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+
+    ASSERT_TRUE(harness.source.signal());
+    ASSERT_TRUE(harness.node->wait_for_ticks(1));
+    const eavp::Status stopped = runtime->stop();
+
+    EXPECT_EQ(eavp::StatusCode::kInternal, stopped.code());
+    EXPECT_EQ(eavp::PlatformRuntimeState::kError, runtime->state());
+    EXPECT_EQ(eavp::StatusCode::kInternal,
+              runtime->last_failure().code());
+    EXPECT_EQ(1, observer.turn_count_);
+    EXPECT_EQ(1, observer.running_true_count_);
+    EXPECT_EQ(1, observer.running_false_count_);
+}
+
+TEST(LinuxPlatformRuntimeTest, PreservesMediaFailureOverObserverFailure) {
+    FakeRuntimeObserver observer;
+    observer.turn_status_ = eavp::Status(
+        eavp::StatusCode::kResourceExhausted, "observer failed");
+    observer.failure_status_ = eavp::Status(
+        eavp::StatusCode::kInternal, "failure metric failed");
+    const eavp::Status media_failure(
+        eavp::StatusCode::kDeviceLost, "camera lost", "camera", "tick", 23);
+    RuntimePipelineHarness harness(
+        "priority", eavp::Status::ok_status(), media_failure);
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_test_runtime(&observer);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+
+    ASSERT_TRUE(harness.source.signal());
+    ASSERT_TRUE(harness.node->wait_for_ticks(1));
+    const eavp::Status stopped = runtime->stop();
+
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, stopped.code());
+    EXPECT_EQ("camera", stopped.provider_id());
+    EXPECT_EQ("tick", stopped.operation());
+    EXPECT_EQ(23, stopped.native_code());
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost,
+              runtime->last_failure().code());
+    EXPECT_EQ(1, observer.failure_count_);
+}
+
+TEST(LinuxPlatformRuntimeTest, JoinsWhenTheRunningMetricFailsDuringStart) {
+    FakeRuntimeObserver observer;
+    observer.running_status_ = eavp::Status(
+        eavp::StatusCode::kResourceExhausted, "running metric failed");
+    RuntimePipelineHarness harness("running-observer");
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_test_runtime(&observer);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+
+    const eavp::Status started = runtime->start();
+
+    EXPECT_EQ(eavp::StatusCode::kResourceExhausted, started.code());
+    EXPECT_EQ(eavp::PlatformRuntimeState::kError, runtime->state());
+    EXPECT_EQ(1, harness.node->reset_count());
+    EXPECT_EQ(1, observer.running_true_count_);
+    EXPECT_EQ(1, observer.running_false_count_);
+    EXPECT_EQ(started.code(), runtime->stop().code());
 }
 
 TEST(LinuxEventLoopTest, CoalescesReadySourcesForTheSamePipeline) {
