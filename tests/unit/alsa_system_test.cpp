@@ -1,6 +1,8 @@
 #include <cerrno>
 #include <limits>
 #include <memory>
+#include <poll.h>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -12,6 +14,244 @@ namespace {
 
 using eavp_test::FakeAlsaApi;
 using eavp_test::make_alsa_config;
+
+struct pollfd descriptor(int fd, short events) {
+    const struct pollfd value = {fd, events, 0};
+    return value;
+}
+
+TEST(AlsaSystemTest, PreservesCompletePollDescriptorArrayAndDecodesEvents) {
+    std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+    FakeAlsaApi* observed = fake.get();
+    observed->poll_descriptor_values.push_back(descriptor(20, POLLIN));
+    observed->poll_descriptor_values.push_back(descriptor(21, POLLOUT));
+    observed->poll_revents_value = POLLIN;
+    eavp::detail::AlsaSystem system(std::move(fake));
+    ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+    ASSERT_TRUE(system.start().ok());
+
+    eavp::Result<std::vector<struct pollfd> > descriptors =
+        system.poll_descriptors();
+
+    ASSERT_TRUE(descriptors.ok());
+    ASSERT_EQ(2U, descriptors.value().size());
+    EXPECT_EQ(20, descriptors.value()[0].fd);
+    EXPECT_EQ(POLLIN, descriptors.value()[0].events);
+    EXPECT_EQ(21, descriptors.value()[1].fd);
+    EXPECT_EQ(POLLOUT, descriptors.value()[1].events);
+    descriptors.value()[0].revents = POLLIN;
+    eavp::Result<bool> ready =
+        system.evaluate_poll_events(descriptors.value());
+    ASSERT_TRUE(ready.ok());
+    EXPECT_TRUE(ready.value());
+    EXPECT_EQ(1, observed->poll_descriptors_count_calls);
+    EXPECT_EQ(1, observed->poll_descriptors_calls);
+    EXPECT_EQ(1, observed->poll_revents_calls);
+    ASSERT_EQ(2U, observed->last_poll_revents_descriptors.size());
+    EXPECT_EQ(POLLIN, observed->last_poll_revents_descriptors[0].revents);
+    EXPECT_EQ(21, observed->last_poll_revents_descriptors[1].fd);
+}
+
+TEST(AlsaSystemTest, RejectsZeroAndMapsNegativePollDescriptorCounts) {
+    {
+        std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+        fake->poll_descriptor_count_results.push_back(0);
+        eavp::detail::AlsaSystem system(std::move(fake));
+        ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+        ASSERT_TRUE(system.start().ok());
+
+        const eavp::Result<std::vector<struct pollfd> > result =
+            system.poll_descriptors();
+        ASSERT_FALSE(result.ok());
+        EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch,
+                  result.status().code());
+        EXPECT_EQ("alsa", result.status().provider_id());
+        EXPECT_EQ("snd_pcm_poll_descriptors_count",
+                  result.status().operation());
+        EXPECT_EQ(0, result.status().native_code());
+    }
+    {
+        std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+        fake->poll_descriptor_count_results.push_back(-ENODEV);
+        eavp::detail::AlsaSystem system(std::move(fake));
+        ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+        ASSERT_TRUE(system.start().ok());
+
+        const eavp::Result<std::vector<struct pollfd> > result =
+            system.poll_descriptors();
+        ASSERT_FALSE(result.ok());
+        EXPECT_EQ(eavp::StatusCode::kDeviceLost, result.status().code());
+        EXPECT_EQ("alsa", result.status().provider_id());
+        EXPECT_EQ("snd_pcm_poll_descriptors_count",
+                  result.status().operation());
+        EXPECT_EQ(-ENODEV, result.status().native_code());
+    }
+}
+
+TEST(AlsaSystemTest, RejectsPollDescriptorArrayLengthChangesAndApiFailures) {
+    {
+        std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+        fake->poll_descriptor_values.push_back(descriptor(20, POLLIN));
+        fake->poll_descriptor_values.push_back(descriptor(21, POLLOUT));
+        fake->poll_descriptor_results.push_back(1);
+        eavp::detail::AlsaSystem system(std::move(fake));
+        ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+        ASSERT_TRUE(system.start().ok());
+
+        const eavp::Result<std::vector<struct pollfd> > result =
+            system.poll_descriptors();
+        ASSERT_FALSE(result.ok());
+        EXPECT_EQ(eavp::StatusCode::kCorruptData, result.status().code());
+        EXPECT_EQ("alsa", result.status().provider_id());
+        EXPECT_EQ("snd_pcm_poll_descriptors", result.status().operation());
+        EXPECT_EQ(1, result.status().native_code());
+    }
+    {
+        std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+        fake->poll_descriptor_values.push_back(descriptor(20, POLLIN));
+        fake->poll_descriptor_results.push_back(-EIO);
+        eavp::detail::AlsaSystem system(std::move(fake));
+        ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+        ASSERT_TRUE(system.start().ok());
+
+        const eavp::Result<std::vector<struct pollfd> > result =
+            system.poll_descriptors();
+        ASSERT_FALSE(result.ok());
+        EXPECT_EQ(eavp::StatusCode::kIoError, result.status().code());
+        EXPECT_EQ("snd_pcm_poll_descriptors", result.status().operation());
+        EXPECT_EQ(-EIO, result.status().native_code());
+    }
+}
+
+TEST(AlsaSystemTest, RequiresTheRegisteredDescriptorCountWhenDecodingEvents) {
+    std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+    FakeAlsaApi* observed = fake.get();
+    observed->poll_descriptor_values.push_back(descriptor(20, POLLIN));
+    observed->poll_descriptor_values.push_back(descriptor(21, POLLOUT));
+    eavp::detail::AlsaSystem system(std::move(fake));
+    ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+    ASSERT_TRUE(system.start().ok());
+    ASSERT_TRUE(system.poll_descriptors().ok());
+
+    const std::vector<struct pollfd> changed(1U, descriptor(20, POLLIN));
+    const eavp::Result<bool> result = system.evaluate_poll_events(changed);
+
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument, result.status().code());
+    EXPECT_EQ(0, observed->poll_revents_calls);
+}
+
+TEST(AlsaSystemTest, RejectsDescriptorCountChangesAfterTheFirstFetch) {
+    std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+    FakeAlsaApi* observed = fake.get();
+    observed->poll_descriptor_values.push_back(descriptor(20, POLLIN));
+    observed->poll_descriptor_values.push_back(descriptor(21, POLLOUT));
+    eavp::detail::AlsaSystem system(std::move(fake));
+    ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+    ASSERT_TRUE(system.start().ok());
+    ASSERT_TRUE(system.poll_descriptors().ok());
+    observed->poll_descriptor_values.resize(1U);
+
+    const eavp::Result<std::vector<struct pollfd> > changed =
+        system.poll_descriptors();
+
+    ASSERT_FALSE(changed.ok());
+    EXPECT_EQ(eavp::StatusCode::kCorruptData, changed.status().code());
+    EXPECT_EQ("alsa", changed.status().provider_id());
+    EXPECT_EQ("snd_pcm_poll_descriptors_count", changed.status().operation());
+    EXPECT_EQ(1, changed.status().native_code());
+}
+
+TEST(AlsaSystemTest, MapsPollReventsErrorsAndDeviceLossWithoutGuessingBits) {
+    {
+        std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+        fake->poll_descriptor_values.push_back(descriptor(20, POLLIN));
+        fake->poll_revents_results.push_back(-EIO);
+        eavp::detail::AlsaSystem system(std::move(fake));
+        ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+        ASSERT_TRUE(system.start().ok());
+        eavp::Result<std::vector<struct pollfd> > descriptors =
+            system.poll_descriptors();
+        ASSERT_TRUE(descriptors.ok());
+
+        const eavp::Result<bool> result =
+            system.evaluate_poll_events(descriptors.value());
+        ASSERT_FALSE(result.ok());
+        EXPECT_EQ(eavp::StatusCode::kIoError, result.status().code());
+        EXPECT_EQ("alsa", result.status().provider_id());
+        EXPECT_EQ("snd_pcm_poll_descriptors_revents",
+                  result.status().operation());
+        EXPECT_EQ(-EIO, result.status().native_code());
+    }
+
+    const unsigned short lost_events[] = {POLLHUP, POLLNVAL};
+    for (std::size_t index = 0U; index < 2U; ++index) {
+        std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+        fake->poll_descriptor_values.push_back(descriptor(20, POLLIN));
+        fake->poll_revents_value = static_cast<unsigned short>(
+            lost_events[index] | POLLIN | POLLERR);
+        eavp::detail::AlsaSystem system(std::move(fake));
+        ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+        ASSERT_TRUE(system.start().ok());
+        eavp::Result<std::vector<struct pollfd> > descriptors =
+            system.poll_descriptors();
+        ASSERT_TRUE(descriptors.ok());
+
+        const eavp::Result<bool> result =
+            system.evaluate_poll_events(descriptors.value());
+        ASSERT_FALSE(result.ok());
+        EXPECT_EQ(eavp::StatusCode::kDeviceLost, result.status().code());
+        EXPECT_EQ("alsa", result.status().provider_id());
+        EXPECT_EQ("snd_pcm_poll_descriptors_revents",
+                  result.status().operation());
+        EXPECT_EQ(static_cast<int>(lost_events[index] | POLLIN | POLLERR),
+                  result.status().native_code());
+    }
+}
+
+TEST(AlsaSystemTest, TreatsDecodedReadWriteOrErrorBitsAsReady) {
+    const unsigned short ready_events[] = {POLLIN, POLLOUT, POLLERR};
+    for (std::size_t index = 0U; index < 3U; ++index) {
+        std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+        fake->poll_descriptor_values.push_back(descriptor(20, POLLIN));
+        fake->poll_revents_value = ready_events[index];
+        eavp::detail::AlsaSystem system(std::move(fake));
+        ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+        ASSERT_TRUE(system.start().ok());
+        eavp::Result<std::vector<struct pollfd> > descriptors =
+            system.poll_descriptors();
+        ASSERT_TRUE(descriptors.ok());
+
+        const eavp::Result<bool> result =
+            system.evaluate_poll_events(descriptors.value());
+        ASSERT_TRUE(result.ok());
+        EXPECT_TRUE(result.value());
+    }
+}
+
+TEST(AlsaSystemTest, ReadinessRequiresRunningStateAndSuccessfulDescriptorFetch) {
+    std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());
+    fake->poll_descriptor_values.push_back(descriptor(20, POLLIN));
+    eavp::detail::AlsaSystem system(std::move(fake));
+    const std::vector<struct pollfd> descriptors(1U, descriptor(20, POLLIN));
+
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              system.poll_descriptors().status().code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              system.evaluate_poll_events(descriptors).status().code());
+    ASSERT_TRUE(system.prepare(make_alsa_config()).ok());
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              system.poll_descriptors().status().code());
+    ASSERT_TRUE(system.start().ok());
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              system.evaluate_poll_events(descriptors).status().code());
+    ASSERT_TRUE(system.poll_descriptors().ok());
+    ASSERT_TRUE(system.stop().ok());
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              system.poll_descriptors().status().code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              system.evaluate_poll_events(descriptors).status().code());
+}
 
 TEST(AlsaSystemTest, ConfiguresExactInterleavedCaptureAndReadsBackValues) {
     std::unique_ptr<FakeAlsaApi> fake(new FakeAlsaApi());

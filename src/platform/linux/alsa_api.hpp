@@ -68,6 +68,13 @@ public:
     virtual int pcm_htimestamp(snd_pcm_t* pcm, snd_pcm_uframes_t* available,
                                snd_htimestamp_t* timestamp) = 0;
     virtual snd_pcm_sframes_t pcm_avail_update(snd_pcm_t* pcm) = 0;
+    virtual int pcm_poll_descriptors_count(snd_pcm_t* pcm) = 0;
+    virtual int pcm_poll_descriptors(snd_pcm_t* pcm,
+                                     struct pollfd* descriptors,
+                                     unsigned int count) = 0;
+    virtual int pcm_poll_descriptors_revents(
+        snd_pcm_t* pcm, struct pollfd* descriptors, unsigned int count,
+        unsigned short* revents) = 0;
     virtual int monotonic_now(struct timespec* value) = 0;
     virtual const char* error_string(int error) const = 0;
 };

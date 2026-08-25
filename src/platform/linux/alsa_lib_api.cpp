@@ -117,6 +117,19 @@ public:
     snd_pcm_sframes_t pcm_avail_update(snd_pcm_t* pcm) {
         return ::snd_pcm_avail_update(pcm);
     }
+    int pcm_poll_descriptors_count(snd_pcm_t* pcm) {
+        return ::snd_pcm_poll_descriptors_count(pcm);
+    }
+    int pcm_poll_descriptors(snd_pcm_t* pcm, struct pollfd* descriptors,
+                             unsigned int count) {
+        return ::snd_pcm_poll_descriptors(pcm, descriptors, count);
+    }
+    int pcm_poll_descriptors_revents(
+        snd_pcm_t* pcm, struct pollfd* descriptors, unsigned int count,
+        unsigned short* revents) {
+        return ::snd_pcm_poll_descriptors_revents(
+            pcm, descriptors, count, revents);
+    }
     int monotonic_now(struct timespec* value) {
         return ::clock_gettime(CLOCK_MONOTONIC, value);
     }

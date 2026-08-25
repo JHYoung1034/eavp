@@ -5,8 +5,11 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <poll.h>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <vector>
 
 #include "eavp/management/health.hpp"
 #include "eavp/management/metrics.hpp"
@@ -106,7 +109,15 @@ private:
 
 class ThrowingOperationAlsaApi : public eavp_test::FakeAlsaApi {
 public:
-    enum Operation { kNone, kOpen, kStart, kDrop, kTimestamp };
+    enum Operation {
+        kNone,
+        kOpen,
+        kStart,
+        kDrop,
+        kTimestamp,
+        kPollDescriptorsCount,
+        kPollRevents
+    };
     enum Failure { kBadAlloc, kUnexpected };
 
     ThrowingOperationAlsaApi()
@@ -130,6 +141,17 @@ public:
         maybe_throw(kTimestamp);
         return FakeAlsaApi::pcm_htimestamp(pcm, available, timestamp);
     }
+    int pcm_poll_descriptors_count(snd_pcm_t* pcm) override {
+        maybe_throw(kPollDescriptorsCount);
+        return FakeAlsaApi::pcm_poll_descriptors_count(pcm);
+    }
+    int pcm_poll_descriptors_revents(
+        snd_pcm_t* pcm, struct pollfd* descriptors, unsigned int count,
+        unsigned short* revents) override {
+        maybe_throw(kPollRevents);
+        return FakeAlsaApi::pcm_poll_descriptors_revents(
+            pcm, descriptors, count, revents);
+    }
 
     Operation operation;
     Failure failure;
@@ -141,6 +163,10 @@ private:
         throw std::runtime_error("ALSA API threw");
     }
 };
+
+static_assert(std::is_base_of<eavp::LinuxWaitSource,
+                              eavp::AlsaSourceNode>::value,
+              "ALSA source must expose Linux readiness without ALSA types");
 
 class TimestampFallbackWouldBlockObserver : public FailingAlsaObserver {
 public:
@@ -178,6 +204,86 @@ std::uint64_t counter_or_zero(const eavp::MetricRegistry& metrics,
                               const std::string& name) {
     const eavp::Result<std::uint64_t> counter = metrics.counter(name);
     return counter.ok() ? counter.value() : 0U;
+}
+
+TEST(AlsaSourceNodeTest, DelegatesLinuxReadinessToAlsaSystem) {
+    std::unique_ptr<eavp_test::FakeAlsaApi> fake(
+        new eavp_test::FakeAlsaApi());
+    eavp_test::FakeAlsaApi* observed = fake.get();
+    const struct pollfd source_descriptor = {
+        20, static_cast<short>(POLLIN), 0};
+    observed->poll_descriptor_values.push_back(source_descriptor);
+    observed->poll_revents_value = POLLIN;
+    std::unique_ptr<eavp::detail::AlsaSystem> system(
+        new eavp::detail::AlsaSystem(
+            std::unique_ptr<eavp::detail::AlsaApi>(fake.release())));
+    NodeFixture fixture(std::move(system), eavp_test::make_alsa_config());
+    ASSERT_TRUE(fixture.start());
+
+    eavp::Result<std::vector<struct pollfd> > descriptors =
+        fixture.node->poll_descriptors();
+    ASSERT_TRUE(descriptors.ok());
+    ASSERT_EQ(1U, descriptors.value().size());
+    descriptors.value()[0].revents = POLLIN;
+    eavp::Result<bool> ready =
+        fixture.node->evaluate_poll_events(descriptors.value());
+
+    ASSERT_TRUE(ready.ok());
+    EXPECT_TRUE(ready.value());
+    EXPECT_EQ(1, observed->poll_descriptors_count_calls);
+    EXPECT_EQ(1, observed->poll_descriptors_calls);
+    EXPECT_EQ(1, observed->poll_revents_calls);
+}
+
+TEST(AlsaSourceNodeTest, ReadinessOverridesContainDependencyExceptions) {
+    {
+        std::unique_ptr<ThrowingOperationAlsaApi> fake(
+            new ThrowingOperationAlsaApi());
+        ThrowingOperationAlsaApi* observed = fake.get();
+        const struct pollfd source_descriptor = {
+            20, static_cast<short>(POLLIN), 0};
+        observed->poll_descriptor_values.push_back(source_descriptor);
+        std::unique_ptr<eavp::detail::AlsaSystem> system(
+            new eavp::detail::AlsaSystem(
+                std::unique_ptr<eavp::detail::AlsaApi>(fake.release())));
+        NodeFixture fixture(std::move(system), eavp_test::make_alsa_config());
+        ASSERT_TRUE(fixture.start());
+        observed->operation = ThrowingOperationAlsaApi::kPollDescriptorsCount;
+        observed->failure = ThrowingOperationAlsaApi::kBadAlloc;
+
+        const eavp::Result<std::vector<struct pollfd> > result =
+            fixture.node->poll_descriptors();
+
+        ASSERT_FALSE(result.ok());
+        EXPECT_EQ(eavp::StatusCode::kResourceExhausted,
+                  result.status().code());
+        EXPECT_TRUE(result.status().message().empty());
+    }
+    {
+        std::unique_ptr<ThrowingOperationAlsaApi> fake(
+            new ThrowingOperationAlsaApi());
+        ThrowingOperationAlsaApi* observed = fake.get();
+        const struct pollfd source_descriptor = {
+            20, static_cast<short>(POLLIN), 0};
+        observed->poll_descriptor_values.push_back(source_descriptor);
+        std::unique_ptr<eavp::detail::AlsaSystem> system(
+            new eavp::detail::AlsaSystem(
+                std::unique_ptr<eavp::detail::AlsaApi>(fake.release())));
+        NodeFixture fixture(std::move(system), eavp_test::make_alsa_config());
+        ASSERT_TRUE(fixture.start());
+        eavp::Result<std::vector<struct pollfd> > descriptors =
+            fixture.node->poll_descriptors();
+        ASSERT_TRUE(descriptors.ok());
+        observed->operation = ThrowingOperationAlsaApi::kPollRevents;
+        observed->failure = ThrowingOperationAlsaApi::kUnexpected;
+
+        const eavp::Result<bool> result =
+            fixture.node->evaluate_poll_events(descriptors.value());
+
+        ASSERT_FALSE(result.ok());
+        EXPECT_EQ(eavp::StatusCode::kInternal, result.status().code());
+        EXPECT_TRUE(result.status().message().empty());
+    }
 }
 
 TEST(AlsaSourceNodeTest, AggregatesShortReadsIntoOneExactFrame) {
