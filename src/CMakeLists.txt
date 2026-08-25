@@ -102,6 +102,8 @@ add_library(eavp_platform STATIC
     platform/linux/linux_runtime_api.cpp
     platform/linux/platform_runtime.cpp
     platform/linux/v4l2_capture_config.cpp
+    platform/linux/v4l2_linux_api.cpp
+    platform/linux/v4l2_system.cpp
     platform/reference_media_platform.cpp
     platform/simulated_platform.cpp
 )
@@ -124,10 +126,8 @@ target_include_directories(
     PUBLIC
         $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    PRIVATE ${PROJECT_SOURCE_DIR}/src
 )
-if(EAVP_ENABLE_ALSA)
-    target_include_directories(eavp_platform PRIVATE ${PROJECT_SOURCE_DIR}/src)
-endif()
 set_target_properties(eavp_platform PROPERTIES EXPORT_NAME platform)
 install(TARGETS eavp_platform EXPORT EAVPTargets)
 install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/eavp/platform

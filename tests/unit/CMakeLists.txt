@@ -39,6 +39,14 @@ target_include_directories(eavp_v4l2_capture_config_tests
                            PRIVATE ${PROJECT_SOURCE_DIR}/tests)
 gtest_discover_tests(eavp_v4l2_capture_config_tests)
 
+add_executable(eavp_v4l2_system_tests v4l2_system_test.cpp)
+target_link_libraries(eavp_v4l2_system_tests
+                      PRIVATE EAVP::platform GTest::gtest_main)
+target_include_directories(eavp_v4l2_system_tests
+                           PRIVATE ${PROJECT_SOURCE_DIR}/src
+                                   ${PROJECT_SOURCE_DIR}/tests)
+gtest_discover_tests(eavp_v4l2_system_tests)
+
 if(EAVP_ENABLE_ALSA)
     add_executable(eavp_alsa_capture_tests alsa_capture_test.cpp)
     target_link_libraries(eavp_alsa_capture_tests
