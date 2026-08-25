@@ -23,6 +23,10 @@ add_executable(eavp_management_tests management_test.cpp)
 target_link_libraries(eavp_management_tests PRIVATE EAVP::management GTest::gtest_main)
 gtest_discover_tests(eavp_management_tests)
 
+add_executable(eavp_platform_runtime_tests platform_runtime_test.cpp)
+target_link_libraries(eavp_platform_runtime_tests PRIVATE EAVP::platform GTest::gtest_main)
+gtest_discover_tests(eavp_platform_runtime_tests)
+
 add_executable(eavp_alsa_capture_config_tests alsa_capture_config_test.cpp)
 target_link_libraries(eavp_alsa_capture_config_tests
                       PRIVATE EAVP::platform GTest::gtest_main)
