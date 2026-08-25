@@ -8,7 +8,7 @@ Node 或后端实现不得创建 EAVP 不可见的控制线程。确定性 Execu
 
 首期 Runtime 只创建一个 I/O Reactor。未来多 Reactor 由产品配置并按完整 Pipeline 分片，运行期间不迁移；0.3c 的 CPU 密集工作进入 Runtime 管理的 ComputeWorkerPool，并通过 serial lane 保证同一 Node 不并发执行。厂商 SDK 的内部线程可以存在，但完成事件必须通过非阻塞 `submit`/`receive`、完成 fd 或 eventfd 进入 EAVP；只有无法非阻塞适配时才允许使用 Runtime 显式管理的专用 worker lane。
 
-有界 Queue 支持 `BLOCK`、`DROP_OLDEST`、`DROP_NEWEST`。`BLOCK` 不执行线程阻塞，而是返回 `WOULD_BLOCK`；调度器停止推进对应上游。摄像头和麦克风是不可反压实时源，live capture 的直接下游默认使用 `DROP_OLDEST`；显式选择 `BLOCK` 只提供短暂缓冲，最终可能导致 V4L2 丢帧或 ALSA XRUN。视频特有的 `DROP_NON_KEY` 和 `FLUSH_TO_KEYFRAME` 在真实编码 Packet 接入时实现。
+有界 Queue 支持 `BLOCK`、`DROP_OLDEST`、`DROP_NEWEST`。`BLOCK` 不执行线程阻塞，而是返回 `WOULD_BLOCK`；调度器停止推进对应上游。摄像头和麦克风是不可反压实时源：live 视频直接下游默认使用 `DROP_OLDEST`；0.3a 单执行域音频继续使用 `BLOCK`，依靠 Reactor 及时调度，避免现有 Queue 无感知丢弃后无法标记 discontinuity。0.3c 的音频感知 SPSC Queue 必须把跨域丢弃传播为下一 AudioFrame discontinuity。显式 `BLOCK` 只能提供短暂缓冲，持续过载最终仍会导致 V4L2 丢帧或 ALSA XRUN。视频特有的 `DROP_NON_KEY` 和 `FLUSH_TO_KEYFRAME` 在真实编码 Packet 接入时实现。
 
 Node 合法主路径是 `Created -> Prepared -> Running -> Stopped`。执行错误进入 `Error`，只有 `reset` 可以返回 `Created`。Pipeline 先验证图，再按拓扑 prepare/start；部分启动失败时逆序 stop 已启动节点。重复 start 和 stop 不重复产生副作用。
 

@@ -154,10 +154,11 @@ public:
 0.3a 规则如下：
 
 - 单执行域轻量管线沿用现有有界 Queue；
-- live capture 的直接下游默认使用 `kDropOldest`；
+- live 视频采集的直接下游默认使用 `kDropOldest`，并通过 Queue drop count 观测应用层丢帧；
+- 0.3a 单执行域音频继续使用 `kBlock`，依靠 Reactor 及时调度避免积压；现有 Queue 无法在丢弃后回写下一 AudioFrame 的 discontinuity，因此不得对音频使用无感知的 `kDropOldest/kDropNewest`；
 - 显式选择 `kBlock` 时允许短暂 pending，但产品必须接受硬件层最终丢帧/XRUN；
 - V4L2 丢帧通过 queue drop、sequence gap 和 overrun 指标报告；
-- ALSA XRUN 或应用层音频丢弃后，下一完整 AudioFrame 必须标记 discontinuity；
+- ALSA XRUN 后，下一完整 AudioFrame 必须标记 discontinuity；应用层音频丢弃和 discontinuity 传播由 0.3c 的音频感知 SPSC Queue 一并实现；
 - 持续处理吞吐低于输入速率时必须按策略丢弃并发布告警，不能无限扩容。
 
 0.3c 引入 ComputeWorkerPool 时，I/O Reactor 与计算线程之间使用线程安全的有界 SPSC Queue。每个 Node 实例由 serial lane/strand 保证同一时刻最多执行一个任务；I/O 任务不得被软件编码等 CPU 密集任务长期阻塞。
