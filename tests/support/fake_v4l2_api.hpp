@@ -34,6 +34,25 @@ struct FakeV4L2Buffer {
     std::uint32_t memory;
 };
 
+struct FakeV4L2DequeuedBuffer {
+    FakeV4L2DequeuedBuffer(std::uint32_t index_value,
+                           std::uint32_t bytes_used_value,
+                           std::uint32_t flags_value,
+                           std::uint32_t sequence_value,
+                           long seconds_value,
+                           long microseconds_value)
+        : index(index_value), bytes_used(bytes_used_value), flags(flags_value),
+          sequence(sequence_value), seconds(seconds_value),
+          microseconds(microseconds_value) {}
+
+    std::uint32_t index;
+    std::uint32_t bytes_used;
+    std::uint32_t flags;
+    std::uint32_t sequence;
+    long seconds;
+    long microseconds;
+};
+
 struct FakeV4L2MapCall {
     FakeV4L2MapCall(void* address_value, std::size_t length_value,
                     int protection_value, int flags_value, int fd_value,
@@ -62,6 +81,7 @@ struct FakeV4L2Trace {
           requested_memory_type(0U) {}
 
     std::vector<std::string> operations;
+    std::vector<std::string> streaming_calls;
     std::vector<unsigned long> ioctl_requests;
     std::vector<FakeV4L2MapCall> mmap_calls;
     std::vector<FakeV4L2MapCall> munmap_calls;
@@ -86,6 +106,10 @@ struct FakeV4L2Trace {
     std::vector<std::uint32_t> queried_indices;
     std::vector<std::uint32_t> queried_buffer_types;
     std::vector<std::uint32_t> queried_memory_types;
+    std::vector<std::uint32_t> queued_buffer_types;
+    std::vector<std::uint32_t> queued_memory_types;
+    std::vector<std::uint32_t> dequeued_buffer_types;
+    std::vector<std::uint32_t> dequeued_memory_types;
     std::vector<std::uint32_t> stream_on_types;
     std::vector<std::uint32_t> stream_off_types;
 };
@@ -169,6 +193,13 @@ public:
         maximum_mappable_offset_ = value;
     }
 
+    void script_dequeued_buffer(std::uint32_t index, std::uint32_t bytes_used,
+                                std::uint32_t flags, std::uint32_t sequence,
+                                long seconds, long microseconds) {
+        dequeued_buffers_.push_back(FakeV4L2DequeuedBuffer(
+            index, bytes_used, flags, sequence, seconds, microseconds));
+    }
+
     std::uint64_t maximum_mappable_offset() const override {
         return maximum_mappable_offset_;
     }
@@ -203,6 +234,10 @@ public:
         trace_->ioctl_requests.push_back(request);
         const std::string operation = ioctl_operation(request, argument);
         trace_->operations.push_back(operation);
+        if (request == VIDIOC_QBUF || request == VIDIOC_DQBUF ||
+            request == VIDIOC_STREAMON || request == VIDIOC_STREAMOFF) {
+            trace_->streaming_calls.push_back(operation);
+        }
         if (operation == "VIDIOC_REQBUFS(0)") {
             ++trace_->request_buffers_zero_calls;
         } else if (request == VIDIOC_REQBUFS) {
@@ -217,6 +252,16 @@ public:
             trace_->queried_indices.push_back(buffer->index);
             trace_->queried_buffer_types.push_back(buffer->type);
             trace_->queried_memory_types.push_back(buffer->memory);
+        } else if (request == VIDIOC_QBUF) {
+            const struct v4l2_buffer* buffer =
+                static_cast<const struct v4l2_buffer*>(argument);
+            trace_->queued_buffer_types.push_back(buffer->type);
+            trace_->queued_memory_types.push_back(buffer->memory);
+        } else if (request == VIDIOC_DQBUF) {
+            const struct v4l2_buffer* buffer =
+                static_cast<const struct v4l2_buffer*>(argument);
+            trace_->dequeued_buffer_types.push_back(buffer->type);
+            trace_->dequeued_memory_types.push_back(buffer->memory);
         } else if (request == VIDIOC_STREAMON) {
             ++trace_->stream_on_calls;
             trace_->stream_on_types.push_back(
@@ -290,6 +335,21 @@ public:
             buffer->index = value.index;
             buffer->length = value.length;
             buffer->m.offset = value.offset;
+        } else if (request == VIDIOC_DQBUF) {
+            if (dequeued_buffers_.empty()) {
+                last_error_ = EAGAIN;
+                return -1;
+            }
+            const FakeV4L2DequeuedBuffer value = dequeued_buffers_.front();
+            dequeued_buffers_.pop_front();
+            struct v4l2_buffer* buffer =
+                static_cast<struct v4l2_buffer*>(argument);
+            buffer->index = value.index;
+            buffer->bytesused = value.bytes_used;
+            buffer->flags = value.flags;
+            buffer->sequence = value.sequence;
+            buffer->timestamp.tv_sec = value.seconds;
+            buffer->timestamp.tv_usec = value.microseconds;
         }
         return 0;
     }
@@ -366,6 +426,13 @@ private:
                                                 : "VIDIOC_REQBUFS";
         }
         if (request == VIDIOC_QUERYBUF) return "VIDIOC_QUERYBUF";
+        if (request == VIDIOC_QBUF) {
+            const struct v4l2_buffer* buffer =
+                static_cast<const struct v4l2_buffer*>(argument);
+            return std::string("VIDIOC_QBUF:") +
+                   std::to_string(buffer->index);
+        }
+        if (request == VIDIOC_DQBUF) return "VIDIOC_DQBUF";
         if (request == VIDIOC_STREAMON) return "VIDIOC_STREAMON";
         if (request == VIDIOC_STREAMOFF) return "VIDIOC_STREAMOFF";
         return "ioctl";
@@ -388,6 +455,7 @@ private:
     std::uint32_t returned_memory_type_;
     std::uint64_t maximum_mappable_offset_;
     std::vector<FakeV4L2Buffer> buffers_;
+    std::deque<FakeV4L2DequeuedBuffer> dequeued_buffers_;
     std::map<std::string, std::deque<int> > errors_;
     std::map<std::string, std::size_t> throws_;
     int monotonic_now_result_;

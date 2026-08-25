@@ -25,6 +25,14 @@ StatusCode system_error_code(int native_code) {
     return StatusCode::kIoError;
 }
 
+StatusCode dequeue_error_code(int native_code) {
+    if (native_code == EAGAIN) return StatusCode::kWouldBlock;
+    if (native_code == ENODEV || native_code == ENXIO || native_code == EIO) {
+        return StatusCode::kDeviceLost;
+    }
+    return system_error_code(native_code);
+}
+
 Status v4l2_failure(StatusCode code, const char* message,
                     const char* operation, int native_code) {
     return Status(code, message, "v4l2", operation, native_code);
@@ -38,6 +46,12 @@ Status syscall_failure(const char* operation, int native_code) {
 Status contract_failure(const char* operation, const char* message) {
     return v4l2_failure(StatusCode::kCapabilityMismatch, message,
                         operation, 0);
+}
+
+Status dequeue_failure(int native_code) {
+    return v4l2_failure(dequeue_error_code(native_code),
+                        std::strerror(native_code),
+                        "VIDIOC_DQBUF", native_code);
 }
 
 void remember_first(Status* first, const Status& candidate) {
@@ -568,12 +582,74 @@ Status V4L2System::start() {
                             "V4L2 device is not prepared",
                             "VIDIOC_STREAMON", 0);
     }
+    for (std::size_t index = 0U; index < regions_.size(); ++index) {
+        const Status queue_status = queue_buffer(
+            static_cast<std::uint32_t>(index));
+        if (!queue_status.ok()) return queue_status;
+    }
+
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (bounded_ioctl(VIDIOC_STREAMON, &type) < 0) {
         return syscall_failure("VIDIOC_STREAMON", api_->last_error());
     }
     state_ = kRunning;
     return Status::ok_status();
+}
+
+Status V4L2System::queue_buffer(std::uint32_t index) {
+    struct v4l2_buffer buffer;
+    std::memset(&buffer, 0, sizeof(buffer));
+    buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buffer.memory = V4L2_MEMORY_MMAP;
+    buffer.index = index;
+    if (bounded_ioctl(VIDIOC_QBUF, &buffer) < 0) {
+        return syscall_failure("VIDIOC_QBUF", api_->last_error());
+    }
+    return Status::ok_status();
+}
+
+Result<V4L2DequeuedBuffer> V4L2System::dequeue() {
+    if (state_ != kRunning || fd_ < 0 || !api_) {
+        return Result<V4L2DequeuedBuffer>(v4l2_failure(
+            StatusCode::kInvalidState,
+            "V4L2 dequeue requires a running device",
+            "VIDIOC_DQBUF", 0));
+    }
+
+    struct v4l2_buffer buffer;
+    std::memset(&buffer, 0, sizeof(buffer));
+    buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buffer.memory = V4L2_MEMORY_MMAP;
+    if (bounded_ioctl(VIDIOC_DQBUF, &buffer) < 0) {
+        return Result<V4L2DequeuedBuffer>(
+            dequeue_failure(api_->last_error()));
+    }
+    if (static_cast<std::size_t>(buffer.index) >= regions_.size()) {
+        return Result<V4L2DequeuedBuffer>(v4l2_failure(
+            StatusCode::kCorruptData,
+            "V4L2 dequeued an unknown buffer index",
+            "VIDIOC_DQBUF", 0));
+    }
+
+    const MappedRegion& region = regions_[buffer.index];
+    return Result<V4L2DequeuedBuffer>(V4L2DequeuedBuffer(
+        buffer.index, static_cast<const std::uint8_t*>(region.address),
+        region.length, buffer.bytesused, buffer.flags, buffer.sequence,
+        buffer.timestamp));
+}
+
+Status V4L2System::requeue(std::uint32_t index) {
+    if (state_ != kRunning || fd_ < 0 || !api_) {
+        return v4l2_failure(StatusCode::kInvalidState,
+                            "V4L2 requeue requires a running device",
+                            "VIDIOC_QBUF", 0);
+    }
+    if (static_cast<std::size_t>(index) >= regions_.size()) {
+        return v4l2_failure(StatusCode::kInvalidArgument,
+                            "V4L2 requeue index is out of range",
+                            "VIDIOC_QBUF", 0);
+    }
+    return queue_buffer(index);
 }
 
 Status V4L2System::stop() {
@@ -694,7 +770,8 @@ Result<std::vector<struct pollfd> > V4L2System::poll_descriptors() const {
             "poll_descriptors", 0));
     }
     try {
-        const struct pollfd descriptor = {fd_, POLLIN, 0};
+        const struct pollfd descriptor = {
+            fd_, static_cast<short>(POLLIN | POLLRDNORM | POLLPRI), 0};
         return Result<std::vector<struct pollfd> >(
             std::vector<struct pollfd>(1U, descriptor));
     } catch (const std::bad_alloc&) {
@@ -708,6 +785,38 @@ Result<std::vector<struct pollfd> > V4L2System::poll_descriptors() const {
             "failed to create V4L2 poll descriptors",
             "poll_descriptors", 0));
     }
+}
+
+Result<bool> V4L2System::evaluate_poll_events(
+    const std::vector<struct pollfd>& descriptors) const {
+    if (state_ != kRunning || fd_ < 0 || !api_) {
+        return Result<bool>(v4l2_failure(
+            StatusCode::kInvalidState,
+            "V4L2 poll events require a running device",
+            "poll", 0));
+    }
+    if (descriptors.size() != 1U || descriptors[0].fd != fd_) {
+        return Result<bool>(v4l2_failure(
+            StatusCode::kInvalidArgument,
+            "V4L2 poll descriptor changed before event evaluation",
+            "poll", 0));
+    }
+
+    const short revents = descriptors[0].revents;
+    if ((revents & static_cast<short>(POLLHUP | POLLNVAL)) != 0) {
+        return Result<bool>(v4l2_failure(
+            StatusCode::kDeviceLost,
+            "V4L2 poll descriptor reports device loss",
+            "poll", revents));
+    }
+    if ((revents & POLLERR) != 0) {
+        return Result<bool>(v4l2_failure(
+            StatusCode::kIoError,
+            "V4L2 poll descriptor reports an I/O error",
+            "poll", revents));
+    }
+    return Result<bool>(
+        (revents & static_cast<short>(POLLIN | POLLRDNORM | POLLPRI)) != 0);
 }
 
 }  // namespace detail

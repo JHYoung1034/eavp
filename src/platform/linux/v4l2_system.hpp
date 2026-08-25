@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <poll.h>
+#include <sys/time.h>
 #include <utility>
 #include <vector>
 
@@ -34,6 +35,28 @@ struct V4L2NegotiatedFormat {
     std::vector<std::size_t> source_offsets;
 };
 
+struct V4L2DequeuedBuffer {
+    V4L2DequeuedBuffer(std::uint32_t index_value,
+                       const std::uint8_t* data_value,
+                       std::size_t mapped_length_value,
+                       std::uint32_t bytesused_value,
+                       std::uint32_t flags_value,
+                       std::uint32_t sequence_value,
+                       const struct timeval& timestamp_value)
+        : index(index_value), data(data_value),
+          mapped_length(mapped_length_value), bytesused(bytesused_value),
+          flags(flags_value), sequence(sequence_value),
+          timestamp(timestamp_value) {}
+
+    std::uint32_t index;
+    const std::uint8_t* data;
+    std::size_t mapped_length;
+    std::uint32_t bytesused;
+    std::uint32_t flags;
+    std::uint32_t sequence;
+    struct timeval timestamp;
+};
+
 class V4L2System {
 public:
     explicit V4L2System(std::unique_ptr<V4L2Api> api);
@@ -46,12 +69,16 @@ public:
     Status prepare(const V4L2CaptureConfig& config);
     Status start();
     Status stop();
+    Result<V4L2DequeuedBuffer> dequeue();
+    Status requeue(std::uint32_t index);
     Status reset();
     const V4L2NegotiatedFormat& negotiated() const {
         assert(negotiated_.get() != NULL);
         return *negotiated_;
     }
     Result<std::vector<struct pollfd> > poll_descriptors() const;
+    Result<bool> evaluate_poll_events(
+        const std::vector<struct pollfd>& descriptors) const;
 
 private:
     enum State {
@@ -70,6 +97,7 @@ private:
 
     int bounded_open(const char* path, int flags);
     int bounded_ioctl(unsigned long request, void* argument);
+    Status queue_buffer(std::uint32_t index);
     Status rollback(const Status& first_failure);
     void cleanup_noexcept() noexcept;
 

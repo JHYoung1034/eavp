@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -565,7 +566,8 @@ TEST(V4L2SystemTest, StartStopAndPollDescriptorsPreservePreparedResources) {
     ASSERT_TRUE(prepared_descriptors.ok());
     ASSERT_EQ(1U, prepared_descriptors.value().size());
     EXPECT_EQ(41, prepared_descriptors.value()[0].fd);
-    EXPECT_EQ(POLLIN, prepared_descriptors.value()[0].events);
+    EXPECT_EQ(static_cast<short>(POLLIN | POLLRDNORM | POLLPRI),
+              prepared_descriptors.value()[0].events);
     EXPECT_EQ(0, prepared_descriptors.value()[0].revents);
 
     EXPECT_TRUE(fixture.system->start().ok());
@@ -586,6 +588,260 @@ TEST(V4L2SystemTest, StartStopAndPollDescriptorsPreservePreparedResources) {
     ASSERT_EQ(1U, fixture.trace->stream_off_types.size());
     EXPECT_EQ(static_cast<std::uint32_t>(V4L2_BUF_TYPE_VIDEO_CAPTURE),
               fixture.trace->stream_off_types[0]);
+}
+
+TEST(V4L2SystemTest, QueuesEveryMappedBufferBeforeStreamOn) {
+    ScriptedV4L2 fixture;
+    fixture.observed->set_returned_buffer_count(4U);
+    ASSERT_TRUE(fixture.system->prepare(make_config(
+        eavp::PixelFormat::kYuv420p, 16, 8, 30, 1, 4U)).ok());
+
+    ASSERT_TRUE(fixture.system->start().ok());
+
+    const std::vector<std::string> expected = {
+        "VIDIOC_QBUF:0", "VIDIOC_QBUF:1", "VIDIOC_QBUF:2",
+        "VIDIOC_QBUF:3", "VIDIOC_STREAMON"};
+    EXPECT_EQ(expected, fixture.trace->streaming_calls);
+    ASSERT_EQ(4U, fixture.trace->queued_buffer_types.size());
+    ASSERT_EQ(4U, fixture.trace->queued_memory_types.size());
+    for (std::size_t index = 0U; index < 4U; ++index) {
+        EXPECT_EQ(static_cast<std::uint32_t>(V4L2_BUF_TYPE_VIDEO_CAPTURE),
+                  fixture.trace->queued_buffer_types[index]);
+        EXPECT_EQ(static_cast<std::uint32_t>(V4L2_MEMORY_MMAP),
+                  fixture.trace->queued_memory_types[index]);
+    }
+}
+
+TEST(V4L2SystemTest, StartStopsBeforeStreamOnWhenQueueingFails) {
+    ScriptedV4L2 fixture;
+    ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
+    fixture.observed->script_error("VIDIOC_QBUF:1", EIO);
+
+    const eavp::Status status = fixture.system->start();
+
+    EXPECT_EQ(eavp::StatusCode::kIoError, status.code());
+    expect_provider_context(status, "VIDIOC_QBUF", EIO);
+    const std::vector<std::string> expected = {
+        "VIDIOC_QBUF:0", "VIDIOC_QBUF:1"};
+    EXPECT_EQ(expected, fixture.trace->streaming_calls);
+    EXPECT_EQ(0U, fixture.trace->stream_on_calls);
+    EXPECT_TRUE(fixture.system->stop().ok());
+    EXPECT_EQ(0U, fixture.trace->stream_off_calls);
+}
+
+TEST(V4L2SystemTest, DequeuesOneBufferWithMappedMetadataAndRequeuesExplicitly) {
+    ScriptedV4L2 fixture;
+    ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
+    ASSERT_TRUE(fixture.system->start().ok());
+    fixture.trace->streaming_calls.clear();
+    fixture.observed->script_dequeued_buffer(
+        1U, 300U, V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC, 77U, 123L, 456L);
+    fixture.observed->script_dequeued_buffer(2U, 200U, 0U, 78U, 124L, 0L);
+
+    eavp::Result<eavp::detail::V4L2DequeuedBuffer> result =
+        fixture.system->dequeue();
+
+    ASSERT_TRUE(result.ok());
+    EXPECT_EQ(1U, result.value().index);
+    EXPECT_EQ(reinterpret_cast<const std::uint8_t*>(0x30000U),
+              result.value().data);
+    EXPECT_EQ(384U, result.value().mapped_length);
+    EXPECT_EQ(300U, result.value().bytesused);
+    EXPECT_EQ(static_cast<std::uint32_t>(V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC),
+              result.value().flags);
+    EXPECT_EQ(77U, result.value().sequence);
+    EXPECT_EQ(123, result.value().timestamp.tv_sec);
+    EXPECT_EQ(456, result.value().timestamp.tv_usec);
+    ASSERT_EQ(1U, fixture.trace->dequeued_buffer_types.size());
+    EXPECT_EQ(static_cast<std::uint32_t>(V4L2_BUF_TYPE_VIDEO_CAPTURE),
+              fixture.trace->dequeued_buffer_types[0]);
+    EXPECT_EQ(static_cast<std::uint32_t>(V4L2_MEMORY_MMAP),
+              fixture.trace->dequeued_memory_types[0]);
+    EXPECT_EQ(std::vector<std::string>(1U, "VIDIOC_DQBUF"),
+              fixture.trace->streaming_calls);
+
+    ASSERT_TRUE(fixture.system->requeue(result.value().index).ok());
+    ASSERT_EQ(2U, fixture.trace->streaming_calls.size());
+    EXPECT_EQ("VIDIOC_QBUF:1", fixture.trace->streaming_calls[1]);
+}
+
+TEST(V4L2SystemTest, MapsWouldBlockAndBoundsInterruptedDequeueAttempts) {
+    {
+        ScriptedV4L2 fixture;
+        ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
+        ASSERT_TRUE(fixture.system->start().ok());
+        fixture.observed->script_error("VIDIOC_DQBUF", EAGAIN);
+
+        const eavp::Result<eavp::detail::V4L2DequeuedBuffer> result =
+            fixture.system->dequeue();
+
+        ASSERT_FALSE(result.ok());
+        EXPECT_EQ(eavp::StatusCode::kWouldBlock, result.status().code());
+        expect_provider_context(result.status(), "VIDIOC_DQBUF", EAGAIN);
+    }
+    {
+        ScriptedV4L2 fixture;
+        ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
+        ASSERT_TRUE(fixture.system->start().ok());
+        fixture.trace->streaming_calls.clear();
+        fixture.observed->repeat_error("VIDIOC_DQBUF", EINTR, 63U);
+        fixture.observed->script_dequeued_buffer(0U, 384U, 0U, 1U, 1L, 2L);
+
+        const eavp::Result<eavp::detail::V4L2DequeuedBuffer> result =
+            fixture.system->dequeue();
+
+        ASSERT_TRUE(result.ok());
+        EXPECT_EQ(64U, static_cast<std::size_t>(std::count(
+            fixture.trace->streaming_calls.begin(),
+            fixture.trace->streaming_calls.end(), "VIDIOC_DQBUF")));
+    }
+    {
+        ScriptedV4L2 fixture;
+        ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
+        ASSERT_TRUE(fixture.system->start().ok());
+        fixture.trace->streaming_calls.clear();
+        fixture.observed->repeat_error("VIDIOC_DQBUF", EINTR, 64U);
+
+        const eavp::Result<eavp::detail::V4L2DequeuedBuffer> result =
+            fixture.system->dequeue();
+
+        ASSERT_FALSE(result.ok());
+        EXPECT_EQ(eavp::StatusCode::kIoError, result.status().code());
+        expect_provider_context(result.status(), "VIDIOC_DQBUF", EINTR);
+        EXPECT_EQ(64U, fixture.trace->streaming_calls.size());
+    }
+}
+
+TEST(V4L2SystemTest, MapsDequeueDeviceAndIoErrorsPrecisely) {
+    struct Case {
+        int native_code;
+        eavp::StatusCode status_code;
+    };
+    const Case cases[] = {
+        {ENODEV, eavp::StatusCode::kDeviceLost},
+        {ENXIO, eavp::StatusCode::kDeviceLost},
+        {EIO, eavp::StatusCode::kDeviceLost},
+    };
+    for (std::size_t index = 0U;
+         index < sizeof(cases) / sizeof(cases[0]); ++index) {
+        ScriptedV4L2 fixture;
+        ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
+        ASSERT_TRUE(fixture.system->start().ok());
+        fixture.observed->script_error("VIDIOC_DQBUF", cases[index].native_code);
+
+        const eavp::Result<eavp::detail::V4L2DequeuedBuffer> result =
+            fixture.system->dequeue();
+
+        ASSERT_FALSE(result.ok());
+        EXPECT_EQ(cases[index].status_code, result.status().code()) << index;
+        expect_provider_context(result.status(), "VIDIOC_DQBUF",
+                                cases[index].native_code);
+    }
+}
+
+TEST(V4L2SystemTest, RejectsDequeuedBufferWithUntrustedIndex) {
+    ScriptedV4L2 fixture;
+    ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
+    ASSERT_TRUE(fixture.system->start().ok());
+    fixture.observed->script_dequeued_buffer(3U, 384U, 0U, 0U, 0L, 0L);
+
+    const eavp::Result<eavp::detail::V4L2DequeuedBuffer> result =
+        fixture.system->dequeue();
+
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(eavp::StatusCode::kCorruptData, result.status().code());
+    expect_provider_context(result.status(), "VIDIOC_DQBUF", 0);
+}
+
+TEST(V4L2SystemTest, ExposesBytesUsedAndErrorFlagForExplicitRequeue) {
+    struct Case {
+        std::uint32_t bytes_used;
+        std::uint32_t flags;
+    };
+    const Case cases[] = {
+        {385U, 0U},
+        {384U, V4L2_BUF_FLAG_ERROR},
+    };
+    for (std::size_t index = 0U;
+         index < sizeof(cases) / sizeof(cases[0]); ++index) {
+        ScriptedV4L2 fixture;
+        ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
+        ASSERT_TRUE(fixture.system->start().ok());
+        fixture.observed->script_dequeued_buffer(
+            0U, cases[index].bytes_used, cases[index].flags, 0U, 0L, 0L);
+
+        eavp::Result<eavp::detail::V4L2DequeuedBuffer> result =
+            fixture.system->dequeue();
+
+        ASSERT_TRUE(result.ok());
+        EXPECT_EQ(cases[index].bytes_used, result.value().bytesused) << index;
+        EXPECT_EQ(cases[index].flags, result.value().flags) << index;
+        EXPECT_TRUE(fixture.system->requeue(result.value().index).ok())
+            << index;
+    }
+}
+
+TEST(V4L2SystemTest, ValidatesRequeueIndexAndPreservesQueueFailure) {
+    ScriptedV4L2 fixture;
+    ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
+    ASSERT_TRUE(fixture.system->start().ok());
+    fixture.trace->streaming_calls.clear();
+
+    const eavp::Status invalid = fixture.system->requeue(3U);
+
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument, invalid.code());
+    expect_provider_context(invalid, "VIDIOC_QBUF", 0);
+    EXPECT_TRUE(fixture.trace->streaming_calls.empty());
+
+    fixture.observed->script_error("VIDIOC_QBUF:1", EIO);
+    const eavp::Status failed = fixture.system->requeue(1U);
+
+    EXPECT_EQ(eavp::StatusCode::kIoError, failed.code());
+    expect_provider_context(failed, "VIDIOC_QBUF", EIO);
+    EXPECT_EQ(std::vector<std::string>(1U, "VIDIOC_QBUF:1"),
+              fixture.trace->streaming_calls);
+}
+
+TEST(V4L2SystemTest, EvaluatesV4L2ReadinessAndPrioritizesTerminalEvents) {
+    ScriptedV4L2 fixture;
+    ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
+    ASSERT_TRUE(fixture.system->start().ok());
+    eavp::Result<std::vector<struct pollfd> > descriptors =
+        fixture.system->poll_descriptors();
+    ASSERT_TRUE(descriptors.ok());
+
+    const short ready_events[] = {POLLIN, POLLRDNORM, POLLPRI};
+    for (std::size_t index = 0U; index < 3U; ++index) {
+        descriptors.value()[0].revents = ready_events[index];
+        const eavp::Result<bool> result =
+            fixture.system->evaluate_poll_events(descriptors.value());
+        ASSERT_TRUE(result.ok());
+        EXPECT_TRUE(result.value()) << index;
+    }
+    descriptors.value()[0].revents = POLLOUT;
+    eavp::Result<bool> unrelated =
+        fixture.system->evaluate_poll_events(descriptors.value());
+    ASSERT_TRUE(unrelated.ok());
+    EXPECT_FALSE(unrelated.value());
+
+    descriptors.value()[0].revents = static_cast<short>(POLLERR | POLLIN);
+    eavp::Result<bool> io_error =
+        fixture.system->evaluate_poll_events(descriptors.value());
+    ASSERT_FALSE(io_error.ok());
+    EXPECT_EQ(eavp::StatusCode::kIoError, io_error.status().code());
+    expect_provider_context(io_error.status(), "poll", POLLERR | POLLIN);
+
+    const short lost_events[] = {POLLHUP, POLLNVAL};
+    for (std::size_t index = 0U; index < 2U; ++index) {
+        descriptors.value()[0].revents = static_cast<short>(
+            lost_events[index] | POLLERR | POLLPRI);
+        const eavp::Result<bool> lost =
+            fixture.system->evaluate_poll_events(descriptors.value());
+        ASSERT_FALSE(lost.ok());
+        EXPECT_EQ(eavp::StatusCode::kDeviceLost, lost.status().code()) << index;
+        expect_provider_context(lost.status(), "poll",
+                                lost_events[index] | POLLERR | POLLPRI);
+    }
 }
 
 TEST(V4L2SystemTest, ResetRunningSessionUsesStrictOrderAndIsIdempotent) {
