@@ -21,13 +21,33 @@ public:
     virtual Status on_reactor_running(bool running) = 0;
 };
 
+class RuntimeTestHooks {
+public:
+    virtual ~RuntimeTestHooks() {}
+
+    virtual void on_wake_claimed() {}
+    virtual void on_reactor_close_pending() {}
+    virtual void on_reactor_waiting_for_wake() {}
+    virtual void on_join_owner_claimed() {}
+    virtual void on_join_waiter() {}
+    virtual void on_reactor_thread_finishing() {}
+    virtual PlatformRuntimeState snapshot_state(PlatformRuntimeState state) {
+        return state;
+    }
+    virtual Status snapshot_last_failure(const Status& failure) {
+        return failure;
+    }
+};
+
 class LinuxPlatformRuntimeTestPeer {
 public:
     static Result<std::unique_ptr<LinuxPlatformRuntime> > create(
         const LinuxPlatformRuntimeConfig& config,
         std::unique_ptr<LinuxRuntimeApi> api,
         // observer 仅由测试调用方持有，必须晚于 Runtime 销毁。
-        RuntimeObserver* observer = NULL);
+        RuntimeObserver* observer = NULL,
+        // hooks 仅用于确定性并发与异常边界测试，生命周期同 observer。
+        RuntimeTestHooks* hooks = NULL);
 };
 
 }  // namespace detail

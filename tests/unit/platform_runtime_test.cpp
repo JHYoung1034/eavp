@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <fcntl.h>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -63,7 +64,8 @@ private:
 
 class PipeWaitSource : public eavp::LinuxWaitSource {
 public:
-    PipeWaitSource() : read_fd_(-1), write_fd_(-1) {
+    PipeWaitSource()
+        : read_fd_(-1), write_fd_(-1), evaluate_failure_() {
         int descriptors[2] = {-1, -1};
         if (::pipe(descriptors) != 0) {
             throw std::runtime_error("pipe");
@@ -92,6 +94,9 @@ public:
 
     eavp::Result<bool> evaluate_poll_events(
         const std::vector<struct pollfd>& descriptors) override {
+        if (!evaluate_failure_.ok()) {
+            return eavp::Result<bool>(evaluate_failure_);
+        }
         if (descriptors.size() != 1U) {
             return eavp::Result<bool>(
                 eavp::Status(eavp::StatusCode::kInvalidArgument));
@@ -107,10 +112,14 @@ public:
     }
 
     int read_fd() const { return read_fd_; }
+    void set_evaluate_failure(const eavp::Status& failure) {
+        evaluate_failure_ = failure;
+    }
 
 private:
     int read_fd_;
     int write_fd_;
+    eavp::Status evaluate_failure_;
 };
 
 class RecordingNode : public eavp::MediaNode {
@@ -123,7 +132,8 @@ public:
         : eavp::MediaNode(id), ready_fd_(ready_fd),
           start_status_(start_status), tick_status_(tick_status),
           drain_forever_(drain_forever), external_log_(external_log),
-          additional_ready_fd_(-1),
+          additional_ready_fd_(-1), reset_status_(), block_tick_exit_(false),
+          tick_exit_allowed_(false),
           tick_count_(0), stop_count_(0), reset_count_(0),
           tick_in_progress_(false), concurrent_tick_observed_(false),
           calls_() {}
@@ -171,6 +181,19 @@ public:
     }
 
     void set_additional_ready_fd(int fd) { additional_ready_fd_ = fd; }
+    void set_reset_status(const eavp::Status& status) { reset_status_ = status; }
+
+    void block_tick_exit() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        block_tick_exit_ = true;
+        tick_exit_allowed_ = false;
+    }
+
+    void allow_tick_exit() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        tick_exit_allowed_ = true;
+        condition_.notify_all();
+    }
 
 protected:
     eavp::Status on_prepare() override {
@@ -200,7 +223,7 @@ protected:
             ++reset_count_;
         }
         record("reset");
-        return eavp::Status::ok_status();
+        return reset_status_;
     }
 
     eavp::Status on_tick() override {
@@ -219,7 +242,10 @@ protected:
             (void)::read(additional_ready_fd_, &value, sizeof(value));
         }
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::unique_lock<std::mutex> lock(mutex_);
+            while (block_tick_exit_ && !tick_exit_allowed_) {
+                condition_.wait(lock);
+            }
             tick_in_progress_ = false;
             condition_.notify_all();
         }
@@ -240,6 +266,9 @@ private:
     bool drain_forever_;
     std::vector<std::string>* external_log_;
     int additional_ready_fd_;
+    eavp::Status reset_status_;
+    bool block_tick_exit_;
+    bool tick_exit_allowed_;
     mutable std::mutex mutex_;
     std::condition_variable condition_;
     int tick_count_;
@@ -331,16 +360,306 @@ public:
     int running_false_count_;
 };
 
-std::unique_ptr<eavp::LinuxPlatformRuntime> create_test_runtime(
-    eavp::detail::RuntimeObserver* observer, int stop_timeout_ms = 100) {
+class RuntimeConcurrencyProbe : public eavp::detail::RuntimeTestHooks {
+public:
+    RuntimeConcurrencyProbe()
+        : block_wake_claim_(false), block_close_pending_(false),
+          block_write_(false), block_thread_finish_(false),
+          block_join_owner_(false), throw_bad_alloc_on_state_(false),
+          throw_unknown_on_state_(false),
+          throw_bad_alloc_on_last_failure_(false),
+          throw_unknown_on_last_failure_(false), wake_claimed_(false),
+          allow_wake_claim_(false), close_pending_(false),
+          allow_close_pending_(false), reactor_waiting_for_wake_(false),
+          write_entered_(false), write_in_progress_(false),
+          allow_write_(false), close_call_count_(0),
+          close_while_write_(false), thread_finishing_(false),
+          allow_thread_finish_(false), join_owner_count_(0),
+          join_waiter_count_(0), allow_first_join_owner_(false),
+          allow_later_join_owners_(false) {}
+
+    void on_wake_claimed() override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        wake_claimed_ = true;
+        condition_.notify_all();
+        while (block_wake_claim_ && !allow_wake_claim_) {
+            condition_.wait(lock);
+        }
+    }
+
+    void on_reactor_close_pending() override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        close_pending_ = true;
+        condition_.notify_all();
+        while (block_close_pending_ && !allow_close_pending_) {
+            condition_.wait(lock);
+        }
+    }
+
+    void on_reactor_waiting_for_wake() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        reactor_waiting_for_wake_ = true;
+        condition_.notify_all();
+    }
+
+    void on_join_owner_claimed() override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        const int ordinal = ++join_owner_count_;
+        condition_.notify_all();
+        while (block_join_owner_ &&
+               !((ordinal == 1 && allow_first_join_owner_) ||
+                 (ordinal > 1 && allow_later_join_owners_))) {
+            condition_.wait(lock);
+        }
+    }
+
+    void on_join_waiter() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++join_waiter_count_;
+        condition_.notify_all();
+    }
+
+    void on_reactor_thread_finishing() override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        thread_finishing_ = true;
+        condition_.notify_all();
+        while (block_thread_finish_ && !allow_thread_finish_) {
+            condition_.wait(lock);
+        }
+    }
+
+    eavp::PlatformRuntimeState snapshot_state(
+        eavp::PlatformRuntimeState state) override {
+        if (throw_bad_alloc_on_state_) throw std::bad_alloc();
+        if (throw_unknown_on_state_) throw std::runtime_error("state snapshot");
+        return state;
+    }
+
+    eavp::Status snapshot_last_failure(
+        const eavp::Status& failure) override {
+        if (throw_bad_alloc_on_last_failure_) throw std::bad_alloc();
+        if (throw_unknown_on_last_failure_) {
+            throw std::runtime_error("failure snapshot");
+        }
+        return failure;
+    }
+
+    bool wait_for_wake_claimed() { return wait_for(&wake_claimed_); }
+    bool wait_for_close_pending() { return wait_for(&close_pending_); }
+    bool wait_for_write_entered() { return wait_for(&write_entered_); }
+    bool wait_for_thread_finishing() { return wait_for(&thread_finishing_); }
+
+    bool wait_for_close_or_wake_wait() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2), [this]() {
+            return close_call_count_ > 0 || reactor_waiting_for_wake_;
+        });
+    }
+
+    bool wait_for_join_participants(int expected) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2),
+                                   [this, expected]() {
+                                       return join_owner_count_ +
+                                                  join_waiter_count_ >=
+                                              expected;
+                                   });
+    }
+
+    void allow_wake_claim() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        allow_wake_claim_ = true;
+        condition_.notify_all();
+    }
+
+    void allow_close_pending() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        allow_close_pending_ = true;
+        condition_.notify_all();
+    }
+
+    void allow_write() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        allow_write_ = true;
+        condition_.notify_all();
+    }
+
+    void allow_thread_and_first_join_owner() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        allow_thread_finish_ = true;
+        allow_first_join_owner_ = true;
+        condition_.notify_all();
+    }
+
+    void allow_later_join_owners() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        allow_later_join_owners_ = true;
+        condition_.notify_all();
+    }
+
+    void allow_everything() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        allow_wake_claim_ = true;
+        allow_close_pending_ = true;
+        allow_write_ = true;
+        allow_thread_finish_ = true;
+        allow_first_join_owner_ = true;
+        allow_later_join_owners_ = true;
+        condition_.notify_all();
+    }
+
+    void before_write() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        write_entered_ = true;
+        write_in_progress_ = true;
+        condition_.notify_all();
+        while (block_write_ && !allow_write_) condition_.wait(lock);
+    }
+
+    void after_write() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        write_in_progress_ = false;
+        condition_.notify_all();
+    }
+
+    void on_close() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++close_call_count_;
+        if (write_in_progress_) close_while_write_ = true;
+        condition_.notify_all();
+    }
+
+    int join_owner_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return join_owner_count_;
+    }
+
+    int join_waiter_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return join_waiter_count_;
+    }
+
+    bool reactor_waiting_for_wake() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return reactor_waiting_for_wake_;
+    }
+
+    bool close_while_write() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return close_while_write_;
+    }
+
+    bool block_wake_claim_;
+    bool block_close_pending_;
+    bool block_write_;
+    bool block_thread_finish_;
+    bool block_join_owner_;
+    bool throw_bad_alloc_on_state_;
+    bool throw_unknown_on_state_;
+    bool throw_bad_alloc_on_last_failure_;
+    bool throw_unknown_on_last_failure_;
+
+private:
+    bool wait_for(bool* value) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2),
+                                   [value]() { return *value; });
+    }
+
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    bool wake_claimed_;
+    bool allow_wake_claim_;
+    bool close_pending_;
+    bool allow_close_pending_;
+    bool reactor_waiting_for_wake_;
+    bool write_entered_;
+    bool write_in_progress_;
+    bool allow_write_;
+    int close_call_count_;
+    bool close_while_write_;
+    bool thread_finishing_;
+    bool allow_thread_finish_;
+    int join_owner_count_;
+    int join_waiter_count_;
+    bool allow_first_join_owner_;
+    bool allow_later_join_owners_;
+};
+
+class InstrumentedLinuxRuntimeApi : public eavp::detail::LinuxRuntimeApi {
+public:
+    explicit InstrumentedLinuxRuntimeApi(RuntimeConcurrencyProbe* probe = NULL)
+        : delegate_(eavp::detail::create_linux_runtime_api()), probe_(probe),
+          fixed_clock_(false), fixed_time_() {}
+
+    int epoll_create() override { return delegate_->epoll_create(); }
+    int epoll_add(int epoll_fd, int fd, std::uint32_t events,
+                  std::uint64_t token) override {
+        return delegate_->epoll_add(epoll_fd, fd, events, token);
+    }
+    int epoll_remove(int epoll_fd, int fd) override {
+        return delegate_->epoll_remove(epoll_fd, fd);
+    }
+    int epoll_wait_events(int epoll_fd, struct epoll_event* events,
+                          int capacity, int timeout_ms) override {
+        return delegate_->epoll_wait_events(epoll_fd, events, capacity,
+                                            timeout_ms);
+    }
+    int create_event_fd() override { return delegate_->create_event_fd(); }
+    int read_event_fd(int fd, std::uint64_t* value) override {
+        return delegate_->read_event_fd(fd, value);
+    }
+    int write_event_fd(int fd, std::uint64_t value) override {
+        if (probe_ != NULL) probe_->before_write();
+        const int result = delegate_->write_event_fd(fd, value);
+        if (probe_ != NULL) probe_->after_write();
+        return result;
+    }
+    int close_fd(int fd) override {
+        if (probe_ != NULL) probe_->on_close();
+        return delegate_->close_fd(fd);
+    }
+    int monotonic_now(struct timespec* value) override {
+        if (fixed_clock_) {
+            *value = fixed_time_;
+            return 0;
+        }
+        return delegate_->monotonic_now(value);
+    }
+    int last_error() const override { return delegate_->last_error(); }
+
+    void set_fixed_time(const struct timespec& value) {
+        fixed_clock_ = true;
+        fixed_time_ = value;
+    }
+
+private:
+    std::unique_ptr<eavp::detail::LinuxRuntimeApi> delegate_;
+    RuntimeConcurrencyProbe* probe_;
+    bool fixed_clock_;
+    struct timespec fixed_time_;
+};
+
+std::unique_ptr<eavp::LinuxPlatformRuntime> create_injected_runtime(
+    std::unique_ptr<eavp::detail::LinuxRuntimeApi> api,
+    eavp::detail::RuntimeObserver* observer,
+    eavp::detail::RuntimeTestHooks* hooks,
+    int stop_timeout_ms = 100) {
     const eavp::LinuxPlatformRuntimeConfig config =
         eavp::LinuxPlatformRuntimeConfig::create(
             1, stop_timeout_ms).take_value();
     eavp::Result<std::unique_ptr<eavp::LinuxPlatformRuntime> > created =
         eavp::detail::LinuxPlatformRuntimeTestPeer::create(
-            config, eavp::detail::create_linux_runtime_api(), observer);
-    if (!created.ok()) throw std::runtime_error("test runtime create");
+            config, std::move(api), observer, hooks);
+    if (!created.ok()) throw std::runtime_error("injected runtime create");
     return created.take_value();
+}
+
+std::unique_ptr<eavp::LinuxPlatformRuntime> create_test_runtime(
+    eavp::detail::RuntimeObserver* observer, int stop_timeout_ms = 100) {
+    return create_injected_runtime(
+        eavp::detail::create_linux_runtime_api(), observer, NULL,
+        stop_timeout_ms);
 }
 
 TEST(LinuxPlatformRuntimeConfigTest, AcceptsSingleReactorAndPositiveStopTimeout) {
@@ -674,6 +993,241 @@ TEST(LinuxPlatformRuntimeTest, JoinsWhenTheRunningMetricFailsDuringStart) {
     EXPECT_EQ(1, observer.running_true_count_);
     EXPECT_EQ(1, observer.running_false_count_);
     EXPECT_EQ(started.code(), runtime->stop().code());
+}
+
+TEST(LinuxPlatformRuntimeTest, WaitsForClaimedWakeBeforeClosingEventLoop) {
+    RuntimeConcurrencyProbe probe;
+    probe.block_wake_claim_ = true;
+    probe.block_close_pending_ = true;
+    probe.block_write_ = true;
+    const eavp::Status fatal(
+        eavp::StatusCode::kDeviceLost, "wake race", "camera", "tick", 31);
+    RuntimePipelineHarness harness(
+        "wake-close", eavp::Status::ok_status(), fatal);
+    harness.node->block_tick_exit();
+    std::unique_ptr<eavp::detail::LinuxRuntimeApi> api(
+        new InstrumentedLinuxRuntimeApi(&probe));
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_injected_runtime(std::move(api), NULL, &probe);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+    ASSERT_TRUE(harness.source.signal());
+    ASSERT_TRUE(harness.node->wait_for_ticks(1));
+
+    eavp::Status stopped(eavp::StatusCode::kInvalidState);
+    std::thread stopper([&]() { stopped = runtime->stop(); });
+    const bool wake_claimed = probe.wait_for_wake_claimed();
+    EXPECT_TRUE(wake_claimed);
+    harness.node->allow_tick_exit();
+    const bool close_pending = probe.wait_for_close_pending();
+    EXPECT_TRUE(close_pending);
+    probe.allow_wake_claim();
+    const bool write_entered = probe.wait_for_write_entered();
+    EXPECT_TRUE(write_entered);
+    probe.allow_close_pending();
+    const bool close_or_wait = probe.wait_for_close_or_wake_wait();
+    EXPECT_TRUE(close_or_wait);
+
+    EXPECT_TRUE(probe.reactor_waiting_for_wake());
+    EXPECT_FALSE(probe.close_while_write());
+
+    probe.allow_write();
+    probe.allow_everything();
+    stopper.join();
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, stopped.code());
+}
+
+TEST(LinuxPlatformRuntimeTest, ConcurrentStopsShareOneJoinOwner) {
+    RuntimeConcurrencyProbe probe;
+    probe.block_thread_finish_ = true;
+    probe.block_join_owner_ = true;
+    RuntimePipelineHarness harness("double-stop");
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_injected_runtime(
+            eavp::detail::create_linux_runtime_api(), NULL, &probe);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+
+    std::mutex callers_mutex;
+    std::condition_variable callers_condition;
+    int ready_callers = 0;
+    int returned_callers = 0;
+    bool call_stop = false;
+    eavp::Status first(eavp::StatusCode::kInvalidState);
+    eavp::Status second(eavp::StatusCode::kInvalidState);
+    const auto stop_call = [&](eavp::Status* result) {
+        {
+            std::unique_lock<std::mutex> lock(callers_mutex);
+            ++ready_callers;
+            callers_condition.notify_all();
+            callers_condition.wait(lock, [&]() { return call_stop; });
+        }
+        *result = runtime->stop();
+        {
+            std::lock_guard<std::mutex> lock(callers_mutex);
+            ++returned_callers;
+            callers_condition.notify_all();
+        }
+    };
+    std::thread first_stopper(stop_call, &first);
+    std::thread second_stopper(stop_call, &second);
+    {
+        std::unique_lock<std::mutex> lock(callers_mutex);
+        const bool both_callers_ready = callers_condition.wait_for(
+            lock, std::chrono::seconds(2),
+            [&]() { return ready_callers == 2; });
+        EXPECT_TRUE(both_callers_ready);
+        call_stop = true;
+        callers_condition.notify_all();
+    }
+
+    const bool two_join_participants = probe.wait_for_join_participants(2);
+    EXPECT_TRUE(two_join_participants);
+    EXPECT_EQ(1, probe.join_owner_count());
+    EXPECT_EQ(1, probe.join_waiter_count());
+    {
+        std::lock_guard<std::mutex> lock(callers_mutex);
+        EXPECT_EQ(0, returned_callers);
+    }
+
+    probe.allow_thread_and_first_join_owner();
+    {
+        std::unique_lock<std::mutex> lock(callers_mutex);
+        EXPECT_TRUE(callers_condition.wait_for(
+            lock, std::chrono::seconds(2),
+            [&]() { return returned_callers >= 1; }));
+    }
+    probe.allow_later_join_owners();
+    probe.allow_everything();
+    first_stopper.join();
+    second_stopper.join();
+    EXPECT_TRUE(first.ok());
+    EXPECT_TRUE(second.ok());
+}
+
+TEST(LinuxPlatformRuntimeTest, StartFailureAndStopShareOneJoinOwner) {
+    RuntimeConcurrencyProbe probe;
+    probe.block_thread_finish_ = true;
+    probe.block_join_owner_ = true;
+    RuntimePipelineHarness harness(
+        "start-stop-join",
+        eavp::Status(eavp::StatusCode::kDeviceLost, "start lost"));
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_injected_runtime(
+            eavp::detail::create_linux_runtime_api(), NULL, &probe);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+
+    eavp::Status started(eavp::StatusCode::kInvalidState);
+    eavp::Status stopped(eavp::StatusCode::kInvalidState);
+    std::mutex callers_mutex;
+    std::condition_variable callers_condition;
+    int returned_callers = 0;
+    std::thread starter([&]() {
+        started = runtime->start();
+        std::lock_guard<std::mutex> lock(callers_mutex);
+        ++returned_callers;
+        callers_condition.notify_all();
+    });
+    const bool thread_finishing = probe.wait_for_thread_finishing();
+    EXPECT_TRUE(thread_finishing);
+    std::thread stopper([&]() {
+        stopped = runtime->stop();
+        std::lock_guard<std::mutex> lock(callers_mutex);
+        ++returned_callers;
+        callers_condition.notify_all();
+    });
+
+    const bool two_join_participants = probe.wait_for_join_participants(2);
+    EXPECT_TRUE(two_join_participants);
+    EXPECT_EQ(1, probe.join_owner_count());
+    EXPECT_EQ(1, probe.join_waiter_count());
+
+    probe.allow_thread_and_first_join_owner();
+    {
+        std::unique_lock<std::mutex> lock(callers_mutex);
+        EXPECT_TRUE(callers_condition.wait_for(
+            lock, std::chrono::seconds(2),
+            [&]() { return returned_callers >= 1; }));
+    }
+    probe.allow_later_join_owners();
+    probe.allow_everything();
+    starter.join();
+    stopper.join();
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, started.code());
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, stopped.code());
+}
+
+TEST(LinuxPlatformRuntimeTest, WaitSourceFailureRemainsTheFirstMediaCause) {
+    FakeRuntimeObserver observer;
+    RuntimePipelineHarness harness("wait-source-failure");
+    const eavp::Status source_failure(
+        eavp::StatusCode::kDeviceLost, "source lost", "camera", "poll", 41);
+    harness.source.set_evaluate_failure(source_failure);
+    harness.node->set_reset_status(eavp::Status(
+        eavp::StatusCode::kCorruptData, "cancel failed"));
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_test_runtime(&observer);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+
+    ASSERT_TRUE(harness.source.signal());
+    const eavp::Status stopped = runtime->stop();
+
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, stopped.code());
+    EXPECT_EQ("camera", stopped.provider_id());
+    EXPECT_EQ("poll", stopped.operation());
+    EXPECT_EQ(41, stopped.native_code());
+    EXPECT_EQ(1, observer.failure_count_);
+}
+
+TEST(LinuxPlatformRuntimeTest, RejectsAnUnrepresentableStopDeadline) {
+    RuntimePipelineHarness harness(
+        "deadline-overflow", eavp::Status::ok_status(),
+        eavp::Status::ok_status(), true);
+    InstrumentedLinuxRuntimeApi* raw_api =
+        new InstrumentedLinuxRuntimeApi();
+    struct timespec near_limit;
+    near_limit.tv_sec = std::numeric_limits<time_t>::max();
+    near_limit.tv_nsec = 999999999L;
+    raw_api->set_fixed_time(near_limit);
+    std::unique_ptr<eavp::detail::LinuxRuntimeApi> api(raw_api);
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_injected_runtime(std::move(api), NULL, NULL, 100);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+
+    const eavp::Status stopped = runtime->stop();
+
+    EXPECT_EQ(eavp::StatusCode::kResourceExhausted, stopped.code());
+    EXPECT_EQ(eavp::PlatformRuntimeState::kError, runtime->state());
+    EXPECT_GE(harness.node->reset_count(), 1);
+}
+
+TEST(LinuxPlatformRuntimeTest, SnapshotAccessorsContainInjectedExceptions) {
+    RuntimeConcurrencyProbe probe;
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_injected_runtime(
+            eavp::detail::create_linux_runtime_api(), NULL, &probe);
+
+    probe.throw_bad_alloc_on_state_ = true;
+    EXPECT_EQ(eavp::PlatformRuntimeState::kError, runtime->state());
+    probe.throw_bad_alloc_on_state_ = false;
+    probe.throw_unknown_on_state_ = true;
+    EXPECT_EQ(eavp::PlatformRuntimeState::kError, runtime->state());
+    probe.throw_unknown_on_state_ = false;
+
+    probe.throw_bad_alloc_on_last_failure_ = true;
+    EXPECT_EQ(eavp::StatusCode::kResourceExhausted,
+              runtime->last_failure().code());
+    probe.throw_bad_alloc_on_last_failure_ = false;
+    probe.throw_unknown_on_last_failure_ = true;
+    EXPECT_EQ(eavp::StatusCode::kInternal,
+              runtime->last_failure().code());
 }
 
 TEST(LinuxEventLoopTest, CoalescesReadySourcesForTheSamePipeline) {

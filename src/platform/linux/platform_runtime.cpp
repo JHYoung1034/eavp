@@ -2,6 +2,7 @@
 
 #include <condition_variable>
 #include <ctime>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -43,15 +44,26 @@ Status clock_failure(detail::LinuxRuntimeApi* api) {
                   "linux_runtime", "clock_gettime", api->last_error());
 }
 
-void add_milliseconds(const struct timespec& start, int milliseconds,
-                      struct timespec* deadline) {
-    deadline->tv_sec = start.tv_sec + milliseconds / 1000;
-    deadline->tv_nsec =
+Status add_milliseconds(const struct timespec& start, int milliseconds,
+                        struct timespec* deadline) {
+    const long nanoseconds =
         start.tv_nsec + static_cast<long>(milliseconds % 1000) * 1000000L;
-    if (deadline->tv_nsec >= 1000000000L) {
-        ++deadline->tv_sec;
-        deadline->tv_nsec -= 1000000000L;
+    const time_t carry = nanoseconds >= 1000000000L
+                             ? static_cast<time_t>(1)
+                             : static_cast<time_t>(0);
+    const time_t seconds = static_cast<time_t>(milliseconds / 1000);
+    const time_t maximum = std::numeric_limits<time_t>::max();
+    if (start.tv_nsec < 0 || start.tv_nsec >= 1000000000L ||
+        milliseconds < 0 || seconds > maximum - carry ||
+        start.tv_sec > maximum - (seconds + carry)) {
+        return Status(StatusCode::kResourceExhausted,
+                      "Linux Runtime 停止期限超出 time_t 可表示范围");
     }
+
+    deadline->tv_sec = start.tv_sec + seconds + carry;
+    deadline->tv_nsec = nanoseconds -
+                        static_cast<long>(carry) * 1000000000L;
+    return Status::ok_status();
 }
 
 bool reached(const struct timespec& now, const struct timespec& deadline) {
@@ -114,11 +126,14 @@ private:
 
 struct TestDependencies {
     TestDependencies(std::unique_ptr<detail::LinuxRuntimeApi> runtime_api,
-                     detail::RuntimeObserver* runtime_observer)
-        : api(std::move(runtime_api)), observer(runtime_observer) {}
+                     detail::RuntimeObserver* runtime_observer,
+                     detail::RuntimeTestHooks* runtime_hooks)
+        : api(std::move(runtime_api)), observer(runtime_observer),
+          hooks(runtime_hooks) {}
 
     std::unique_ptr<detail::LinuxRuntimeApi> api;
     detail::RuntimeObserver* observer;
+    detail::RuntimeTestHooks* hooks;
 };
 
 TestDependencies*& test_dependencies_slot() {
@@ -152,14 +167,16 @@ public:
 
     Impl(const LinuxPlatformRuntimeConfig& config, MetricRegistry* metrics,
          std::unique_ptr<detail::LinuxRuntimeApi> api,
-         detail::RuntimeObserver* observer)
-        : config_(config), owned_observer_(), observer_(observer),
+         detail::RuntimeObserver* observer, detail::RuntimeTestHooks* hooks)
+        : config_(config), owned_observer_(), observer_(observer), hooks_(hooks),
           runtime_api_(api.get()), loop_(new detail::LinuxEventLoop(std::move(api))),
           state_(PlatformRuntimeState::kCreated),
           last_failure_(StatusCode::kInvalidState),
           stop_result_(Status::ok_status()), thread_exited_(false),
-          stop_requested_(false), reactor_exiting_(false), pipelines_(),
-          registered_pipelines_(), registered_sources_(), reactor_thread_() {
+          stop_requested_(false), reactor_exiting_(false), wake_in_flight_(0U),
+          join_claimed_(false), join_completed_(false),
+          pipelines_(), registered_pipelines_(), registered_sources_(),
+          reactor_thread_() {
         if (observer_ == NULL) {
             if (metrics != NULL) {
                 owned_observer_.reset(new RegistryRuntimeObserver(metrics));
@@ -235,6 +252,9 @@ public:
             thread_exited_ = false;
             stop_requested_ = false;
             reactor_exiting_ = false;
+            wake_in_flight_ = 0U;
+            join_claimed_ = false;
+            join_completed_ = false;
             stop_result_ = Status::ok_status();
             try {
                 reactor_thread_ = std::thread(&Impl::reactor_main, this);
@@ -261,9 +281,8 @@ public:
             });
             const bool started = state_ == PlatformRuntimeState::kRunning;
             const Status result = started ? Status::ok_status() : last_failure_;
-            const bool join_failed_start = !started && reactor_thread_.joinable();
             lock.unlock();
-            if (join_failed_start) reactor_thread_.join();
+            if (!started) join_reactor();
             return result;
         } catch (const std::bad_alloc&) {
             join_noexcept();
@@ -290,31 +309,42 @@ public:
             }
             if (state_ == PlatformRuntimeState::kError && thread_exited_) {
                 const Status result = stop_result_;
-                const bool join_thread = reactor_thread_.joinable();
                 lock.unlock();
-                if (join_thread) reactor_thread_.join();
+                join_reactor();
                 return result;
             }
             if (reactor_exiting_) {
-                const bool join_thread = reactor_thread_.joinable();
                 lock.unlock();
-                if (join_thread) reactor_thread_.join();
+                join_reactor();
                 lock.lock();
                 return stop_result_;
             }
 
             stop_requested_ = true;
             state_ = PlatformRuntimeState::kStopping;
+            ++wake_in_flight_;
             lock.unlock();
 
-            const Status wake_status = loop_->wake();
+            Status wake_status;
+            try {
+                notify_wake_claimed();
+                wake_status = loop_->wake();
+            } catch (...) {
+                lock.lock();
+                --wake_in_flight_;
+                condition_.notify_all();
+                lock.unlock();
+                throw;
+            }
             lock.lock();
+            --wake_in_flight_;
+            condition_.notify_all();
             if (!wake_status.ok() && stop_result_.ok()) {
                 stop_result_ = wake_status;
             }
             lock.unlock();
 
-            if (reactor_thread_.joinable()) reactor_thread_.join();
+            join_reactor();
 
             lock.lock();
             return stop_result_;
@@ -328,23 +358,108 @@ public:
     }
 
     PlatformRuntimeState state() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return state_;
+        try {
+            PlatformRuntimeState snapshot;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                snapshot = state_;
+            }
+            return hooks_ == NULL ? snapshot : hooks_->snapshot_state(snapshot);
+        } catch (...) {
+            return PlatformRuntimeState::kError;
+        }
     }
 
     Status last_failure() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return last_failure_;
+        try {
+            Status snapshot;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                snapshot = last_failure_;
+            }
+            return hooks_ == NULL
+                       ? snapshot
+                       : hooks_->snapshot_last_failure(snapshot);
+        } catch (const std::bad_alloc&) {
+            return allocation_failure();
+        } catch (...) {
+            return internal_failure();
+        }
     }
 
     void join_noexcept() noexcept {
         try {
-            if (reactor_thread_.joinable()) reactor_thread_.join();
+            join_reactor();
         } catch (...) {
         }
     }
 
 private:
+    void join_reactor() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        bool reported_as_waiter = false;
+        for (;;) {
+            if (join_completed_) return;
+            if (!join_claimed_) {
+                if (!reactor_thread_.joinable()) {
+                    join_completed_ = true;
+                    condition_.notify_all();
+                    return;
+                }
+                join_claimed_ = true;
+                break;
+            }
+            if (!reported_as_waiter) {
+                lock.unlock();
+                invoke_hook_noexcept([this]() { hooks_->on_join_waiter(); });
+                lock.lock();
+                reported_as_waiter = true;
+                continue;
+            }
+            condition_.wait(lock, [this]() {
+                return join_completed_ || !join_claimed_;
+            });
+        }
+
+        lock.unlock();
+        notify_join_owner();
+        try {
+            reactor_thread_.join();
+        } catch (...) {
+            lock.lock();
+            join_claimed_ = false;
+            if (!reactor_thread_.joinable()) join_completed_ = true;
+            condition_.notify_all();
+            throw;
+        }
+        lock.lock();
+        join_claimed_ = false;
+        join_completed_ = true;
+        condition_.notify_all();
+    }
+
+    template <typename HookCall>
+    void invoke_hook_noexcept(const HookCall& call) const noexcept {
+        if (hooks_ == NULL) return;
+        try {
+            call();
+        } catch (...) {
+        }
+    }
+
+    void notify_wake_claimed() const noexcept {
+        invoke_hook_noexcept([this]() { hooks_->on_wake_claimed(); });
+    }
+
+    void notify_join_owner() const noexcept {
+        invoke_hook_noexcept([this]() { hooks_->on_join_owner_claimed(); });
+    }
+
+    void notify_thread_finishing() const noexcept {
+        invoke_hook_noexcept(
+            [this]() { hooks_->on_reactor_thread_finishing(); });
+    }
+
     Status observe_poll(const detail::LinuxEventLoopTurn& turn) {
         return invoke_observer([this, &turn]() {
             return observer_->on_poll(turn.wakeup_count,
@@ -422,8 +537,19 @@ private:
     }
 
     void mark_reactor_exiting() {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         reactor_exiting_ = true;
+        lock.unlock();
+        invoke_hook_noexcept(
+            [this]() { hooks_->on_reactor_close_pending(); });
+        lock.lock();
+        if (wake_in_flight_ > 0U) {
+            lock.unlock();
+            invoke_hook_noexcept(
+                [this]() { hooks_->on_reactor_waiting_for_wake(); });
+            lock.lock();
+            condition_.wait(lock, [this]() { return wake_in_flight_ == 0U; });
+        }
     }
 
     void drain(Status* media_failure, Status* reactor_failure,
@@ -435,7 +561,13 @@ private:
             return;
         }
         struct timespec deadline;
-        add_milliseconds(started, config_.stop_timeout_ms(), &deadline);
+        const Status deadline_status = add_milliseconds(
+            started, config_.stop_timeout_ms(), &deadline);
+        if (!deadline_status.ok()) {
+            record_first(deadline_status, reactor_failure);
+            cancel_all(media_failure);
+            return;
+        }
 
         std::vector<bool> stopped(pipelines_.size(), false);
         std::size_t remaining = pipelines_.size();
@@ -544,7 +676,13 @@ private:
                observer_failure.ok()) {
             Result<detail::LinuxEventLoopTurn> turn = loop_->wait_once();
             if (!turn.ok()) {
-                record_first(turn.status(), &reactor_failure);
+                if (turn.status().provider_id() == "linux_runtime") {
+                    record_first(turn.status(), &reactor_failure);
+                } else {
+                    record_first(turn.status(), &media_failure);
+                    record_first(observe_pipeline_failure(),
+                                 &observer_failure);
+                }
                 break;
             }
             record_first(observe_poll(turn.value()), &observer_failure);
@@ -596,11 +734,13 @@ private:
             Status observer_failure = observe_running(false);
             finish(media_failure, reactor_failure, observer_failure);
         }
+        notify_thread_finishing();
     }
 
     LinuxPlatformRuntimeConfig config_;
     std::unique_ptr<detail::RuntimeObserver> owned_observer_;
     detail::RuntimeObserver* observer_;
+    detail::RuntimeTestHooks* hooks_;
     detail::LinuxRuntimeApi* runtime_api_;
     std::unique_ptr<detail::LinuxEventLoop> loop_;
 
@@ -612,6 +752,9 @@ private:
     bool thread_exited_;
     bool stop_requested_;
     bool reactor_exiting_;
+    std::size_t wake_in_flight_;
+    bool join_claimed_;
+    bool join_completed_;
     std::vector<PipelineRecord> pipelines_;
     std::set<MediaPipeline*> registered_pipelines_;
     std::set<LinuxWaitSource*> registered_sources_;
@@ -666,23 +809,51 @@ LinuxPlatformRuntime::~LinuxPlatformRuntime() noexcept {
 Status LinuxPlatformRuntime::register_pipeline(
     MediaPipeline* pipeline,
     const std::vector<LinuxWaitSource*>& wait_sources) {
-    return impl_->register_pipeline(pipeline, wait_sources);
+    try {
+        return impl_->register_pipeline(pipeline, wait_sources);
+    } catch (const std::bad_alloc&) {
+        return allocation_failure();
+    } catch (...) {
+        return internal_failure();
+    }
 }
 
 Status LinuxPlatformRuntime::start() {
-    return impl_->start();
+    try {
+        return impl_->start();
+    } catch (const std::bad_alloc&) {
+        return allocation_failure();
+    } catch (...) {
+        return internal_failure();
+    }
 }
 
 Status LinuxPlatformRuntime::stop() {
-    return impl_->stop();
+    try {
+        return impl_->stop();
+    } catch (const std::bad_alloc&) {
+        return allocation_failure();
+    } catch (...) {
+        return internal_failure();
+    }
 }
 
 PlatformRuntimeState LinuxPlatformRuntime::state() const {
-    return impl_->state();
+    try {
+        return impl_->state();
+    } catch (...) {
+        return PlatformRuntimeState::kError;
+    }
 }
 
 Status LinuxPlatformRuntime::last_failure() const {
-    return impl_->last_failure();
+    try {
+        return impl_->last_failure();
+    } catch (const std::bad_alloc&) {
+        return allocation_failure();
+    } catch (...) {
+        return internal_failure();
+    }
 }
 
 LinuxPlatformRuntime::LinuxPlatformRuntime(
@@ -691,10 +862,10 @@ LinuxPlatformRuntime::LinuxPlatformRuntime(
     TestDependencies* dependencies = test_dependencies_slot();
     if (dependencies != NULL) {
         impl_.reset(new Impl(config, metrics, std::move(dependencies->api),
-                             dependencies->observer));
+                             dependencies->observer, dependencies->hooks));
     } else {
         impl_.reset(new Impl(config, metrics,
-                             detail::create_linux_runtime_api(), NULL));
+                             detail::create_linux_runtime_api(), NULL, NULL));
     }
 }
 
@@ -704,12 +875,13 @@ Result<std::unique_ptr<LinuxPlatformRuntime> >
 LinuxPlatformRuntimeTestPeer::create(
     const LinuxPlatformRuntimeConfig& config,
     std::unique_ptr<LinuxRuntimeApi> api,
-    RuntimeObserver* observer) {
+    RuntimeObserver* observer,
+    RuntimeTestHooks* hooks) {
     if (!api) {
         return Result<std::unique_ptr<LinuxPlatformRuntime> >(
             Status(StatusCode::kInvalidArgument));
     }
-    TestDependencies dependencies(std::move(api), observer);
+    TestDependencies dependencies(std::move(api), observer, hooks);
     ScopedTestDependencies scoped(&dependencies);
     return LinuxPlatformRuntime::create(config, NULL);
 }
