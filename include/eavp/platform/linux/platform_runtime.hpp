@@ -39,10 +39,13 @@ enum class PlatformRuntimeState {
 
 class LinuxPlatformRuntime {
 public:
+    // metrics 可为空；为空时仅关闭 Runtime Metrics，不影响调度或错误传播。
     static Result<std::unique_ptr<LinuxPlatformRuntime> > create(
         const LinuxPlatformRuntimeConfig& config, MetricRegistry* metrics);
     ~LinuxPlatformRuntime() noexcept;
 
+    // Runtime 不取得 MediaPipeline 或 LinuxWaitSource 的所有权。调用方必须先完成
+    // stop() 并销毁 Runtime，随后才能销毁这些被借用对象。
     Status register_pipeline(MediaPipeline* pipeline,
                              const std::vector<LinuxWaitSource*>& wait_sources);
     Status start();

@@ -1,6 +1,7 @@
 #include "eavp/platform/linux/platform_runtime.hpp"
 
 #include <new>
+#include <utility>
 
 namespace eavp {
 
