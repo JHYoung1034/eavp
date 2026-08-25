@@ -61,6 +61,37 @@ bool checked_multiply(std::size_t left, std::size_t right,
     return true;
 }
 
+bool checked_multiply_u64(std::uint64_t left, std::uint64_t right,
+                          std::uint64_t* result) {
+    if (left != 0U &&
+        right > std::numeric_limits<std::uint64_t>::max() / left) {
+        return false;
+    }
+    *result = left * right;
+    return true;
+}
+
+bool equivalent_frame_interval(std::uint32_t actual_numerator,
+                               std::uint32_t actual_denominator,
+                               int requested_fps_numerator,
+                               int requested_fps_denominator) {
+    if (actual_numerator == 0U || actual_denominator == 0U ||
+        requested_fps_numerator <= 0 || requested_fps_denominator <= 0) {
+        return false;
+    }
+    std::uint64_t actual_scaled = 0U;
+    std::uint64_t requested_scaled = 0U;
+    return checked_multiply_u64(
+               static_cast<std::uint64_t>(actual_numerator),
+               static_cast<std::uint64_t>(requested_fps_numerator),
+               &actual_scaled) &&
+           checked_multiply_u64(
+               static_cast<std::uint64_t>(actual_denominator),
+               static_cast<std::uint64_t>(requested_fps_denominator),
+               &requested_scaled) &&
+           actual_scaled == requested_scaled;
+}
+
 bool uint32_to_size(std::uint32_t value, std::size_t* result) {
     if (static_cast<std::uint64_t>(value) >
         static_cast<std::uint64_t>(
@@ -80,9 +111,11 @@ bool size_to_uint32(std::size_t value, std::uint32_t* result) {
     return true;
 }
 
-bool uint32_to_offset(std::uint32_t value, std::int64_t* result) {
+bool uint32_to_offset(std::uint32_t value,
+                      std::uint64_t maximum_mappable_offset,
+                      std::int64_t* result) {
     if (static_cast<std::uint64_t>(value) >
-        static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
+            maximum_mappable_offset ||
         static_cast<std::uint64_t>(value) >
         static_cast<std::uint64_t>(
             std::numeric_limits<std::int64_t>::max())) {
@@ -431,12 +464,11 @@ Status V4L2System::prepare(const V4L2CaptureConfig& config) {
         if (actual_parameters.type != V4L2_BUF_TYPE_VIDEO_CAPTURE ||
             (actual_parameters.parm.capture.capability &
              V4L2_CAP_TIMEPERFRAME) == 0U ||
-            actual_parameters.parm.capture.timeperframe.numerator !=
-                static_cast<std::uint32_t>(
-                    config.frame_rate_denominator()) ||
-            actual_parameters.parm.capture.timeperframe.denominator !=
-                static_cast<std::uint32_t>(
-                    config.frame_rate_numerator())) {
+            !equivalent_frame_interval(
+                actual_parameters.parm.capture.timeperframe.numerator,
+                actual_parameters.parm.capture.timeperframe.denominator,
+                config.frame_rate_numerator(),
+                config.frame_rate_denominator())) {
             return rollback(contract_failure(
                 "VIDIOC_G_PARM",
                 "V4L2 driver changed the requested frame interval"));
@@ -499,7 +531,9 @@ Status V4L2System::prepare(const V4L2CaptureConfig& config) {
                 buffer.index != query_index ||
                 !uint32_to_size(buffer.length, &length) ||
                 length < negotiated->total_capacity ||
-                !uint32_to_offset(buffer.m.offset, &offset)) {
+                !uint32_to_offset(
+                    buffer.m.offset, api_->maximum_mappable_offset(),
+                    &offset)) {
                 return rollback(contract_failure(
                     "VIDIOC_QUERYBUF",
                     "V4L2 query buffer metadata is invalid or overflows"));
@@ -599,6 +633,7 @@ Status V4L2System::reset() {
         return first_failure;
     } catch (...) {
         cleanup_noexcept();
+        if (!first_failure.ok()) return first_failure;
         return v4l2_failure(StatusCode::kInternal,
                             "unexpected failure while resetting V4L2",
                             "reset", 0);

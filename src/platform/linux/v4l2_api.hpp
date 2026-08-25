@@ -21,6 +21,7 @@ public:
     virtual int unmap_memory(void* address, std::size_t length) = 0;
     virtual int close_device(int fd) = 0;
     virtual int monotonic_now(struct timespec* value) = 0;
+    virtual std::uint64_t maximum_mappable_offset() const = 0;
     virtual int last_error() const = 0;
 };
 

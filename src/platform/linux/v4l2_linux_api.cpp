@@ -61,6 +61,11 @@ public:
         return result;
     }
 
+    std::uint64_t maximum_mappable_offset() const override {
+        return static_cast<std::uint64_t>(
+            std::numeric_limits<off_t>::max());
+    }
+
     int last_error() const override { return last_error_; }
 
 private:

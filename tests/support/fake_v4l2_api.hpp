@@ -7,9 +7,11 @@
 #include <cstring>
 #include <deque>
 #include <linux/videodev2.h>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <sys/mman.h>
 #include <vector>
 
@@ -19,12 +21,17 @@ namespace eavp_test {
 
 struct FakeV4L2Buffer {
     FakeV4L2Buffer(std::uint32_t index_value, std::uint32_t length_value,
-                   std::uint32_t offset_value)
-        : index(index_value), length(length_value), offset(offset_value) {}
+                   std::uint32_t offset_value, std::uint32_t type_value =
+                       V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                   std::uint32_t memory_value = V4L2_MEMORY_MMAP)
+        : index(index_value), length(length_value), offset(offset_value),
+          type(type_value), memory(memory_value) {}
 
     std::uint32_t index;
     std::uint32_t length;
     std::uint32_t offset;
+    std::uint32_t type;
+    std::uint32_t memory;
 };
 
 struct FakeV4L2MapCall {
@@ -92,6 +99,10 @@ public:
           pixel_format_(V4L2_PIX_FMT_YUV420), width_(16U), height_(8U),
           bytes_per_line_(32U), size_image_(384U), frame_numerator_(1U),
           frame_denominator_(30U), returned_buffer_count_(3U),
+          returned_buffer_type_(V4L2_BUF_TYPE_VIDEO_CAPTURE),
+          returned_memory_type_(V4L2_MEMORY_MMAP),
+          maximum_mappable_offset_(
+              std::numeric_limits<std::uint64_t>::max()),
           monotonic_now_result_(0) {
         buffers_.push_back(FakeV4L2Buffer(0U, 384U, 0U));
         buffers_.push_back(FakeV4L2Buffer(1U, 384U, 4096U));
@@ -135,15 +146,31 @@ public:
         }
     }
 
+    void set_returned_buffer_metadata(std::uint32_t type,
+                                      std::uint32_t memory) {
+        returned_buffer_type_ = type;
+        returned_memory_type_ = memory;
+    }
+
     void set_buffer(std::size_t requested_index, std::uint32_t reported_index,
-                    std::uint32_t length, std::uint32_t offset) {
+                    std::uint32_t length, std::uint32_t offset,
+                    std::uint32_t type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                    std::uint32_t memory = V4L2_MEMORY_MMAP) {
         while (buffers_.size() <= requested_index) {
             const std::uint32_t index =
                 static_cast<std::uint32_t>(buffers_.size());
             buffers_.push_back(FakeV4L2Buffer(index, size_image_, index * 4096U));
         }
         buffers_[requested_index] =
-            FakeV4L2Buffer(reported_index, length, offset);
+            FakeV4L2Buffer(reported_index, length, offset, type, memory);
+    }
+
+    void set_maximum_mappable_offset(std::uint64_t value) {
+        maximum_mappable_offset_ = value;
+    }
+
+    std::uint64_t maximum_mappable_offset() const override {
+        return maximum_mappable_offset_;
     }
 
     void script_error(const std::string& operation, int native_error) {
@@ -157,11 +184,16 @@ public:
         }
     }
 
+    void script_throw(const std::string& operation) {
+        ++throws_[operation];
+    }
+
     int open_device(const char* path, int flags) override {
         ++trace_->open_calls;
         trace_->last_open_path = path == NULL ? std::string() : std::string(path);
         trace_->last_open_flags = flags;
         trace_->operations.push_back("open");
+        throw_if_scripted("open");
         if (take_error("open")) return -1;
         return descriptor_;
     }
@@ -194,6 +226,7 @@ public:
             trace_->stream_off_types.push_back(
                 *static_cast<const enum v4l2_buf_type*>(argument));
         }
+        throw_if_scripted(operation);
         if (take_error(operation)) return -1;
 
         if (request == VIDIOC_QUERYCAP) {
@@ -239,6 +272,8 @@ public:
                 static_cast<struct v4l2_requestbuffers*>(argument);
             if (request_buffers->count != 0U) {
                 request_buffers->count = returned_buffer_count_;
+                request_buffers->type = returned_buffer_type_;
+                request_buffers->memory = returned_memory_type_;
             }
         } else if (request == VIDIOC_QUERYBUF) {
             struct v4l2_buffer* buffer =
@@ -250,8 +285,8 @@ public:
                 return -1;
             }
             const FakeV4L2Buffer value = buffers_[requested_index];
-            buffer->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-            buffer->memory = V4L2_MEMORY_MMAP;
+            buffer->type = value.type;
+            buffer->memory = value.memory;
             buffer->index = value.index;
             buffer->length = value.length;
             buffer->m.offset = value.offset;
@@ -264,6 +299,7 @@ public:
         trace_->operations.push_back("mmap");
         trace_->mmap_calls.push_back(
             FakeV4L2MapCall(address, length, protection, flags, fd, offset));
+        throw_if_scripted("mmap");
         if (take_error("mmap")) return MAP_FAILED;
         const std::uintptr_t mapped_address =
             static_cast<std::uintptr_t>(0x10000U) +
@@ -275,6 +311,7 @@ public:
         trace_->operations.push_back("munmap");
         trace_->munmap_calls.push_back(
             FakeV4L2MapCall(address, length, 0, 0, -1, 0));
+        throw_if_scripted("munmap");
         return take_error("munmap") ? -1 : 0;
     }
 
@@ -282,11 +319,13 @@ public:
         (void)fd;
         ++trace_->close_calls;
         trace_->operations.push_back("close");
+        throw_if_scripted("close");
         return take_error("close") ? -1 : 0;
     }
 
     int monotonic_now(struct timespec* value) override {
         trace_->operations.push_back("clock_gettime(CLOCK_MONOTONIC)");
+        throw_if_scripted("clock_gettime(CLOCK_MONOTONIC)");
         if (take_error("clock_gettime(CLOCK_MONOTONIC)")) return -1;
         *value = monotonic_now_value_;
         return monotonic_now_result_;
@@ -295,6 +334,14 @@ public:
     int last_error() const override { return last_error_; }
 
 private:
+    void throw_if_scripted(const std::string& operation) {
+        std::map<std::string, std::size_t>::iterator found =
+            throws_.find(operation);
+        if (found == throws_.end() || found->second == 0U) return;
+        --found->second;
+        throw std::runtime_error("scripted V4L2 API exception");
+    }
+
     bool take_error(const std::string& operation) {
         std::map<std::string, std::deque<int> >::iterator found =
             errors_.find(operation);
@@ -337,8 +384,12 @@ private:
     std::uint32_t frame_numerator_;
     std::uint32_t frame_denominator_;
     std::uint32_t returned_buffer_count_;
+    std::uint32_t returned_buffer_type_;
+    std::uint32_t returned_memory_type_;
+    std::uint64_t maximum_mappable_offset_;
     std::vector<FakeV4L2Buffer> buffers_;
     std::map<std::string, std::deque<int> > errors_;
+    std::map<std::string, std::size_t> throws_;
     int monotonic_now_result_;
     struct timespec monotonic_now_value_;
 };

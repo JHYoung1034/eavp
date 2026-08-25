@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <fcntl.h>
 #include <linux/videodev2.h>
+#include <limits>
 #include <memory>
 #include <poll.h>
 #include <string>
@@ -336,6 +337,39 @@ TEST(V4L2SystemTest, RejectsDriverChangesToFormatDimensionsOrFrameRate) {
     }
 }
 
+TEST(V4L2SystemTest, AcceptsEquivalentReducedFrameInterval) {
+    ScriptedV4L2 fixture;
+    fixture.observed->set_frame_interval(1U, 30U);
+
+    const eavp::Status status = fixture.system->prepare(make_config(
+        eavp::PixelFormat::kYuv420p, 16, 8, 60, 2));
+
+    EXPECT_TRUE(status.ok());
+    EXPECT_EQ(2U, fixture.trace->requested_frame_numerator);
+    EXPECT_EQ(60U, fixture.trace->requested_frame_denominator);
+}
+
+TEST(V4L2SystemTest, RejectsZeroActualFrameIntervalComponents) {
+    const std::uint32_t intervals[][2] = {
+        {0U, 30U},
+        {1U, 0U},
+        {0U, 0U},
+    };
+    for (std::size_t index = 0U;
+         index < sizeof(intervals) / sizeof(intervals[0]); ++index) {
+        ScriptedV4L2 fixture;
+        fixture.observed->set_frame_interval(
+            intervals[index][0], intervals[index][1]);
+
+        const eavp::Status status = fixture.system->prepare(make_config());
+
+        EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch, status.code())
+            << index;
+        expect_provider_context(status, "VIDIOC_G_PARM", 0);
+        EXPECT_EQ(1U, fixture.trace->close_calls) << index;
+    }
+}
+
 TEST(V4L2SystemTest, RejectsInvalidPaddingAndSizeImageForEveryFormat) {
     struct Case {
         eavp::PixelFormat format;
@@ -380,6 +414,34 @@ TEST(V4L2SystemTest, RejectsFewerThanTwoKernelBuffersAndReleasesAllocation) {
     expect_cleanup_tail(fixture.trace->operations, 0U, true);
 }
 
+TEST(V4L2SystemTest, RejectsInvalidRequestBufferTypeOrMemoryAndRollsBack) {
+    struct Case {
+        std::uint32_t type;
+        std::uint32_t memory;
+    };
+    const Case cases[] = {
+        {V4L2_BUF_TYPE_VIDEO_OUTPUT, V4L2_MEMORY_MMAP},
+        {V4L2_BUF_TYPE_VIDEO_CAPTURE, V4L2_MEMORY_USERPTR},
+    };
+    for (std::size_t index = 0U;
+         index < sizeof(cases) / sizeof(cases[0]); ++index) {
+        ScriptedV4L2 fixture;
+        fixture.observed->set_returned_buffer_metadata(
+            cases[index].type, cases[index].memory);
+
+        const eavp::Status status = fixture.system->prepare(make_config());
+
+        EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch, status.code())
+            << index;
+        expect_provider_context(status, "VIDIOC_REQBUFS", 0);
+        EXPECT_EQ(0U, fixture.trace->mmap_calls.size()) << index;
+        EXPECT_EQ(0U, fixture.trace->munmap_calls.size()) << index;
+        EXPECT_EQ(1U, fixture.trace->request_buffers_zero_calls) << index;
+        EXPECT_EQ(1U, fixture.trace->close_calls) << index;
+        expect_cleanup_tail(fixture.trace->operations, 0U, true);
+    }
+}
+
 TEST(V4L2SystemTest, RejectsInvalidQueryBufferIndexAndLength) {
     struct Case {
         std::uint32_t reported_index;
@@ -403,6 +465,42 @@ TEST(V4L2SystemTest, RejectsInvalidQueryBufferIndexAndLength) {
         EXPECT_EQ(0U, fixture.trace->mmap_calls.size()) << index;
         EXPECT_EQ(1U, fixture.trace->request_buffers_zero_calls) << index;
         EXPECT_EQ(1U, fixture.trace->close_calls) << index;
+    }
+}
+
+TEST(V4L2SystemTest, RejectsInvalidQueryBufferTypeMemoryOrOffsetBeforeMmap) {
+    struct Case {
+        std::uint32_t type;
+        std::uint32_t memory;
+        std::uint32_t offset;
+        std::uint64_t maximum_mappable_offset;
+    };
+    const Case cases[] = {
+        {V4L2_BUF_TYPE_VIDEO_OUTPUT, V4L2_MEMORY_MMAP, 0U,
+         std::numeric_limits<std::uint64_t>::max()},
+        {V4L2_BUF_TYPE_VIDEO_CAPTURE, V4L2_MEMORY_USERPTR, 0U,
+         std::numeric_limits<std::uint64_t>::max()},
+        {V4L2_BUF_TYPE_VIDEO_CAPTURE, V4L2_MEMORY_MMAP, 4097U, 4096U},
+    };
+    for (std::size_t index = 0U;
+         index < sizeof(cases) / sizeof(cases[0]); ++index) {
+        ScriptedV4L2 fixture;
+        fixture.observed->set_buffer(
+            0U, 0U, 384U, cases[index].offset,
+            cases[index].type, cases[index].memory);
+        fixture.observed->set_maximum_mappable_offset(
+            cases[index].maximum_mappable_offset);
+
+        const eavp::Status status = fixture.system->prepare(make_config());
+
+        EXPECT_EQ(eavp::StatusCode::kCapabilityMismatch, status.code())
+            << index;
+        expect_provider_context(status, "VIDIOC_QUERYBUF", 0);
+        EXPECT_EQ(0U, fixture.trace->mmap_calls.size()) << index;
+        EXPECT_EQ(0U, fixture.trace->munmap_calls.size()) << index;
+        EXPECT_EQ(1U, fixture.trace->request_buffers_zero_calls) << index;
+        EXPECT_EQ(1U, fixture.trace->close_calls) << index;
+        expect_cleanup_tail(fixture.trace->operations, 0U, true);
     }
 }
 
@@ -535,6 +633,25 @@ TEST(V4L2SystemTest, ResetContinuesCleanupAndReturnsTheFirstError) {
     EXPECT_EQ(1U, fixture.trace->request_buffers_zero_calls);
     EXPECT_EQ(1U, fixture.trace->close_calls);
     EXPECT_TRUE(fixture.system->reset().ok());
+}
+
+TEST(V4L2SystemTest, ResetPreservesFirstFailureWhenLaterCleanupThrows) {
+    ScriptedV4L2 fixture;
+    ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
+    ASSERT_TRUE(fixture.system->start().ok());
+    fixture.observed->script_error("VIDIOC_STREAMOFF", EPIPE);
+    fixture.observed->script_throw("munmap");
+
+    const eavp::Status status = fixture.system->reset();
+
+    expect_provider_context(status, "VIDIOC_STREAMOFF", EPIPE);
+    EXPECT_EQ(3U, fixture.trace->munmap_calls.size());
+    EXPECT_EQ(1U, fixture.trace->request_buffers_zero_calls);
+    EXPECT_EQ(1U, fixture.trace->close_calls);
+    EXPECT_TRUE(fixture.system->reset().ok());
+    EXPECT_EQ(3U, fixture.trace->munmap_calls.size());
+    EXPECT_EQ(1U, fixture.trace->request_buffers_zero_calls);
+    EXPECT_EQ(1U, fixture.trace->close_calls);
 }
 
 TEST(V4L2SystemTest, CloseIsNeverRetriedAfterEintr) {
