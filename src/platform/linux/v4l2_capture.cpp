@@ -79,6 +79,39 @@ public:
     }
 };
 
+class DefaultV4L2FormatFactory : public detail::V4L2FormatFactory {
+public:
+    Result<VideoFormat> create_cpu(
+        const VideoFormat& negotiated) override {
+        return VideoFormat::create(
+            negotiated.pixel_format(), negotiated.width(), negotiated.height(),
+            MemoryDomain::kCpu, negotiated.planes(), negotiated.color_range(),
+            negotiated.color_primaries(), negotiated.transfer(),
+            negotiated.matrix());
+    }
+
+    Result<VideoFormat> clone_actual(
+        const VideoFormat& negotiated) override {
+        return Result<VideoFormat>(negotiated);
+    }
+};
+
+class PosixV4L2Clock : public detail::V4L2Clock {
+public:
+    PosixV4L2Clock() : last_error_(0) {}
+
+    int monotonic_now(struct timespec* value) override {
+        const int result = ::clock_gettime(CLOCK_MONOTONIC, value);
+        last_error_ = result < 0 ? errno : 0;
+        return result;
+    }
+
+    int last_error() const override { return last_error_; }
+
+private:
+    int last_error_;
+};
+
 class RegistryV4L2Observer : public detail::V4L2Observer {
 public:
     explicit RegistryV4L2Observer(MetricRegistry* metrics)
@@ -129,12 +162,18 @@ private:
 struct TestDependencies {
     TestDependencies(std::unique_ptr<detail::V4L2System> system_value,
                      std::unique_ptr<detail::V4L2FrameAllocator> allocator_value,
+                     std::unique_ptr<detail::V4L2FormatFactory> format_factory_value,
+                     std::unique_ptr<detail::V4L2Clock> clock_value,
                      detail::V4L2Observer* observer_value)
         : system(std::move(system_value)), allocator(std::move(allocator_value)),
+          format_factory(std::move(format_factory_value)),
+          clock(std::move(clock_value)),
           observer(observer_value) {}
 
     std::unique_ptr<detail::V4L2System> system;
     std::unique_ptr<detail::V4L2FrameAllocator> allocator;
+    std::unique_ptr<detail::V4L2FormatFactory> format_factory;
+    std::unique_ptr<detail::V4L2Clock> clock;
     detail::V4L2Observer* observer;
 };
 
@@ -205,9 +244,13 @@ public:
     Impl(const V4L2CaptureConfig& config_value, MetricRegistry* metrics_value,
          std::unique_ptr<detail::V4L2System> system_value,
          std::unique_ptr<detail::V4L2FrameAllocator> allocator_value,
+         std::unique_ptr<detail::V4L2FormatFactory> format_factory_value,
+         std::unique_ptr<detail::V4L2Clock> clock_value,
          detail::V4L2Observer* observer_value)
         : config(config_value), metrics(metrics_value),
           system(std::move(system_value)), allocator(std::move(allocator_value)),
+          format_factory(std::move(format_factory_value)),
+          clock(std::move(clock_value)),
           output("video_output"), actual_format(), cpu_format(), pending(),
           has_pts(false), last_pts(0), has_sequence(false), expected_sequence(0U),
           owned_observer(), observer(observer_value) {
@@ -232,7 +275,7 @@ public:
     }
 
     Status timestamp_for(const detail::V4L2DequeuedBuffer& dequeued,
-                         std::int64_t* pts) const {
+                         std::int64_t* pts) {
         const bool monotonic =
             (dequeued.flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) ==
             V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
@@ -240,8 +283,8 @@ public:
         if (!monotonic || !timeval_to_us(dequeued.timestamp, &candidate)) {
             struct timespec now;
             std::memset(&now, 0, sizeof(now));
-            if (::clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
-                const int native_code = errno;
+            if (clock->monotonic_now(&now) < 0) {
+                const int native_code = clock->last_error();
                 return v4l2_failure(StatusCode::kIoError,
                                     std::strerror(native_code),
                                     "clock_gettime(CLOCK_MONOTONIC)",
@@ -408,6 +451,8 @@ public:
     MetricRegistry* metrics;
     std::unique_ptr<detail::V4L2System> system;
     std::unique_ptr<detail::V4L2FrameAllocator> allocator;
+    std::unique_ptr<detail::V4L2FormatFactory> format_factory;
+    std::unique_ptr<detail::V4L2Clock> clock;
     OutputPort<VideoFrame> output;
     std::unique_ptr<VideoFormat> actual_format;
     std::unique_ptr<VideoFormat> cpu_format;
@@ -438,23 +483,33 @@ Result<std::unique_ptr<V4L2SourceNode> > V4L2SourceNode::create(
 
         std::unique_ptr<detail::V4L2System> system;
         std::unique_ptr<detail::V4L2FrameAllocator> allocator;
+        std::unique_ptr<detail::V4L2FormatFactory> format_factory;
+        std::unique_ptr<detail::V4L2Clock> clock;
         detail::V4L2Observer* observer = NULL;
         if (current_test_dependencies != NULL) {
             system = std::move(current_test_dependencies->system);
             allocator = std::move(current_test_dependencies->allocator);
+            format_factory =
+                std::move(current_test_dependencies->format_factory);
+            clock = std::move(current_test_dependencies->clock);
             observer = current_test_dependencies->observer;
         } else {
             system.reset(new detail::V4L2System(
                 detail::create_linux_v4l2_api()));
             allocator.reset(new BufferFrameAllocator());
         }
+        if (!format_factory) {
+            format_factory.reset(new DefaultV4L2FormatFactory());
+        }
+        if (!clock) clock.reset(new PosixV4L2Clock());
         if (!system || !allocator) {
             return Result<std::unique_ptr<V4L2SourceNode> >(Status(
                 StatusCode::kInvalidArgument,
                 "V4L2 source dependencies must be configured"));
         }
         std::unique_ptr<Impl> impl(new Impl(
-            config, metrics, std::move(system), std::move(allocator), observer));
+            config, metrics, std::move(system), std::move(allocator),
+            std::move(format_factory), std::move(clock), observer));
         return Result<std::unique_ptr<V4L2SourceNode> >(
             std::unique_ptr<V4L2SourceNode>(
                 new V4L2SourceNode(id, std::move(impl))));
@@ -524,15 +579,40 @@ Status V4L2SourceNode::on_prepare() {
         if (!prepare_status.ok()) return prepare_status;
         const detail::V4L2NegotiatedFormat& negotiated =
             impl_->system->negotiated();
-        const Result<VideoFormat> cpu = VideoFormat::create(
-            negotiated.format.pixel_format(), negotiated.format.width(),
-            negotiated.format.height(), MemoryDomain::kCpu,
-            negotiated.format.planes(), negotiated.format.color_range(),
-            negotiated.format.color_primaries(), negotiated.format.transfer(),
-            negotiated.format.matrix());
-        if (!cpu.ok()) return cpu.status();
-        impl_->actual_format.reset(new VideoFormat(negotiated.format));
-        impl_->cpu_format.reset(new VideoFormat(cpu.value()));
+        Status post_prepare_status;
+        std::unique_ptr<VideoFormat> actual_format;
+        std::unique_ptr<VideoFormat> cpu_format;
+        try {
+            Result<VideoFormat> cpu =
+                impl_->format_factory->create_cpu(negotiated.format);
+            if (!cpu.ok()) {
+                post_prepare_status = cpu.status();
+            } else {
+                Result<VideoFormat> actual =
+                    impl_->format_factory->clone_actual(negotiated.format);
+                if (!actual.ok()) {
+                    post_prepare_status = actual.status();
+                } else {
+                    cpu_format.reset(new VideoFormat(cpu.value()));
+                    actual_format.reset(new VideoFormat(actual.value()));
+                }
+            }
+        } catch (const std::bad_alloc&) {
+            post_prepare_status = allocation_failure();
+        } catch (...) {
+            post_prepare_status = unexpected_failure();
+        }
+        if (!post_prepare_status.ok()) {
+            try {
+                impl_->system->reset();
+            } catch (...) {
+            }
+            impl_->actual_format.reset();
+            impl_->cpu_format.reset();
+            return post_prepare_status;
+        }
+        impl_->actual_format = std::move(actual_format);
+        impl_->cpu_format = std::move(cpu_format);
         return Status::ok_status();
     } catch (const std::bad_alloc&) {
         return allocation_failure();
@@ -550,9 +630,22 @@ Status V4L2SourceNode::on_start() {
         impl_->expected_sequence = 0U;
         const Status start_status = impl_->system->start();
         if (!start_status.ok()) return start_status;
-        return invoke_observer([this]() {
+        const Status observer_status = invoke_observer([this]() {
             return impl_->observer->on_pending(false);
         });
+        if (observer_status.ok()) return observer_status;
+        Status stop_status;
+        try {
+            stop_status = impl_->system->stop();
+        } catch (const std::bad_alloc&) {
+            stop_status = allocation_failure();
+        } catch (...) {
+            stop_status = unexpected_failure();
+        }
+        if (!stop_status.ok()) {
+            return impl_->report_media_failure(stop_status);
+        }
+        return observer_status;
     } catch (const std::bad_alloc&) {
         return allocation_failure();
     } catch (...) {
@@ -615,7 +708,7 @@ Status V4L2SourceNode::on_tick() {
             const Status output_status = impl_->output.send(impl_->pending);
             if (!output_status.ok()) {
                 if (output_status.code() == StatusCode::kWouldBlock) {
-                    return impl_->report_would_block(output_status);
+                    return output_status;
                 }
                 return impl_->report_media_failure(output_status);
             }
@@ -655,7 +748,9 @@ Status V4L2SourceNode::on_tick() {
         } catch (...) {
             requeue_status = unexpected_failure();
         }
-        if (!requeue_status.ok()) return requeue_status;
+        if (!requeue_status.ok()) {
+            return impl_->report_media_failure(requeue_status);
+        }
         if (!media_status.ok()) return impl_->report_media_failure(media_status);
 
         impl_->has_pts = true;
@@ -680,10 +775,8 @@ Status V4L2SourceNode::on_tick() {
                 Status pending_status = invoke_observer([this]() {
                     return impl_->observer->on_pending(true);
                 });
-                const Status would_block_status = impl_->report_would_block(
-                    output_status);
                 if (!pending_status.ok()) return pending_status;
-                return would_block_status;
+                return output_status;
             }
             return impl_->report_media_failure(output_status);
         }
@@ -701,7 +794,9 @@ Result<std::unique_ptr<V4L2SourceNode> > V4L2SourceNodeTestPeer::create(
     const std::string& id, const V4L2CaptureConfig& config,
     MetricRegistry* metrics, std::unique_ptr<V4L2System> system,
     std::unique_ptr<V4L2FrameAllocator> allocator,
-    V4L2Observer* observer) {
+    V4L2Observer* observer,
+    std::unique_ptr<V4L2FormatFactory> format_factory,
+    std::unique_ptr<V4L2Clock> clock) {
     try {
         if (id.empty() || !system || !allocator) {
             return Result<std::unique_ptr<V4L2SourceNode> >(Status(
@@ -709,7 +804,8 @@ Result<std::unique_ptr<V4L2SourceNode> > V4L2SourceNodeTestPeer::create(
                 "V4L2 source test dependencies must be configured"));
         }
         TestDependencies dependencies(
-            std::move(system), std::move(allocator), observer);
+            std::move(system), std::move(allocator),
+            std::move(format_factory), std::move(clock), observer);
         ScopedTestDependencies scoped(&dependencies);
         return V4L2SourceNode::create(id, config, metrics);
     } catch (const std::bad_alloc&) {

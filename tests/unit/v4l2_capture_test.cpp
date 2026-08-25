@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <linux/videodev2.h>
+#include <limits>
 #include <memory>
 #include <new>
 #include <poll.h>
@@ -24,6 +25,11 @@
 #include "support/fake_v4l2_api.hpp"
 
 namespace {
+
+std::int64_t timestamp_microseconds(long seconds, long microseconds) {
+    return static_cast<std::int64_t>(seconds) * 1000000 +
+           static_cast<std::int64_t>(microseconds);
+}
 
 struct SourceMemory {
     SourceMemory(std::size_t buffer_count, std::size_t capacity)
@@ -50,6 +56,11 @@ public:
     }
 
     int unmap_memory(void*, std::size_t) override { return 0; }
+
+    int close_device(int fd) override {
+        memory_->next_map = 0U;
+        return FakeV4L2Api::close_device(fd);
+    }
 
 private:
     std::shared_ptr<SourceMemory> memory_;
@@ -121,6 +132,91 @@ public:
 
 private:
     Mode mode_;
+};
+
+class FailOnceFormatFactory : public eavp::detail::V4L2FormatFactory {
+public:
+    enum Failure { kStatusFailure, kBadAlloc, kUnexpected };
+
+    explicit FailOnceFormatFactory(Failure failure)
+        : failure_(failure), failed_(false) {}
+
+    eavp::Result<eavp::VideoFormat> create_cpu(
+        const eavp::VideoFormat& negotiated) override {
+        return eavp::VideoFormat::create(
+            negotiated.pixel_format(), negotiated.width(), negotiated.height(),
+            eavp::MemoryDomain::kCpu, negotiated.planes(),
+            negotiated.color_range(), negotiated.color_primaries(),
+            negotiated.transfer(), negotiated.matrix());
+    }
+
+    eavp::Result<eavp::VideoFormat> clone_actual(
+        const eavp::VideoFormat& negotiated) override {
+        if (!failed_) {
+            failed_ = true;
+            if (failure_ == kBadAlloc) throw std::bad_alloc();
+            if (failure_ == kUnexpected) {
+                throw std::runtime_error("format factory threw");
+            }
+            return eavp::Result<eavp::VideoFormat>(eavp::Status(
+                eavp::StatusCode::kResourceExhausted,
+                "scripted format failure"));
+        }
+        return eavp::Result<eavp::VideoFormat>(negotiated);
+    }
+
+private:
+    Failure failure_;
+    bool failed_;
+};
+
+class ScriptedClock : public eavp::detail::V4L2Clock {
+public:
+    enum Mode {
+        kSuccess,
+        kSyscallFailure,
+        kInvalidTimespec,
+        kBadAlloc,
+        kUnexpected
+    };
+
+    explicit ScriptedClock(Mode mode = kSuccess)
+        : mode_(mode), last_error_(0) {}
+
+    int monotonic_now(struct timespec* value) override {
+        if (mode_ == kBadAlloc) throw std::bad_alloc();
+        if (mode_ == kUnexpected) throw std::runtime_error("clock threw");
+        if (mode_ == kSyscallFailure) {
+            last_error_ = EIO;
+            return -1;
+        }
+        if (mode_ == kInvalidTimespec) {
+            const time_t maximum_seconds =
+                std::numeric_limits<time_t>::max();
+            const std::uint64_t maximum_pts_seconds =
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::int64_t>::max()) / 1000000U;
+            if (maximum_seconds > 0 &&
+                static_cast<std::uint64_t>(maximum_seconds) >
+                    maximum_pts_seconds) {
+                value->tv_sec = maximum_seconds;
+                value->tv_nsec = 999999999L;
+            } else {
+                value->tv_sec = 0;
+                value->tv_nsec = 1000000000L;
+            }
+            return 0;
+        }
+        value->tv_sec = 9;
+        value->tv_nsec = 7000L;
+        return 0;
+    }
+
+    int last_error() const override { return last_error_; }
+
+private:
+    Mode mode_;
+    int last_error_;
 };
 
 class RecordingObserver : public eavp::detail::V4L2Observer {
@@ -226,7 +322,12 @@ public:
                     eavp::OverflowPolicy policy = eavp::OverflowPolicy::kBlock,
                     ScriptedAllocator::Mode allocator_mode = ScriptedAllocator::kNormal,
                     RecordingObserver* observer_value = NULL,
-                    eavp::MetricRegistry* metrics_value = NULL)
+                    eavp::MetricRegistry* metrics_value = NULL,
+                    std::unique_ptr<eavp::detail::V4L2FormatFactory>
+                        format_factory =
+                            std::unique_ptr<eavp::detail::V4L2FormatFactory>(),
+                    std::unique_ptr<eavp::detail::V4L2Clock> clock =
+                        std::unique_ptr<eavp::detail::V4L2Clock>())
         : format(format_value), width(width_value), height(height_value),
           stride(stride_value), capacity(capacity_value),
           trace(new eavp_test::FakeV4L2Trace()),
@@ -241,10 +342,12 @@ public:
                 std::unique_ptr<eavp::detail::V4L2Api>(fake.release())));
         std::unique_ptr<eavp::detail::V4L2FrameAllocator> allocator(
             new ScriptedAllocator(allocator_mode));
+        if (!clock) clock.reset(new ScriptedClock());
         eavp::Result<std::unique_ptr<eavp::V4L2SourceNode> > created =
             eavp::detail::V4L2SourceNodeTestPeer::create(
                 "camera0", make_config(format, width, height), metrics,
-                std::move(system), std::move(allocator), observer_value);
+                std::move(system), std::move(allocator), observer_value,
+                std::move(format_factory), std::move(clock));
         EXPECT_TRUE(created.ok());
         node = created.take_value();
         EXPECT_TRUE(eavp::connect(node->output(), sink).ok());
@@ -526,6 +629,30 @@ TEST(V4L2SourceNodeTest, RequeueFailureWinsOverMediaFailureExactly) {
     EXPECT_EQ(1U, fixture.qbuf_after_dequeue_calls());
 }
 
+TEST(V4L2SourceNodeTest, RequeueFailureReportsFatalWithoutBeingOverwritten) {
+    RecordingObserver observer;
+    observer.fail_callback = RecordingObserver::kFatal;
+    V4L2NodeFixture fixture(
+        eavp::PixelFormat::kYuv420p, 8, 4, 12U, 80U, 4U,
+        eavp::OverflowPolicy::kBlock,
+        ScriptedAllocator::kAllocationFailure, &observer);
+    fixture.fill_visible();
+    fixture.script_frame();
+    fixture.api->script_error("VIDIOC_QBUF:0", 0);
+    fixture.api->script_error("VIDIOC_QBUF:0", EIO);
+    ASSERT_TRUE(fixture.start().ok());
+
+    const eavp::Status status = fixture.node->tick();
+
+    EXPECT_EQ(eavp::StatusCode::kIoError, status.code());
+    EXPECT_EQ("v4l2", status.provider_id());
+    EXPECT_EQ("VIDIOC_QBUF", status.operation());
+    ASSERT_TRUE(status.has_native_code());
+    EXPECT_EQ(EIO, status.native_code());
+    EXPECT_EQ(1U, observer.fatal);
+    EXPECT_EQ(1U, fixture.qbuf_after_dequeue_calls());
+}
+
 TEST(V4L2SourceNodeTest, FrameOwnsCpuCopyAfterDriverMemoryChanges) {
     V4L2NodeFixture fixture(eavp::PixelFormat::kYuv420p, 8, 4, 12U, 80U);
     fixture.fill_visible(41U);
@@ -605,6 +732,44 @@ TEST(V4L2SourceNodeTest, ActualFormatExistsOnlyBetweenPrepareAndReset) {
               fixture.node->actual_format().status().code());
 }
 
+TEST(V4L2SourceNodeTest, PreparePostFailureRollsBackAndCanRetry) {
+    const FailOnceFormatFactory::Failure failures[] = {
+        FailOnceFormatFactory::kStatusFailure,
+        FailOnceFormatFactory::kBadAlloc,
+        FailOnceFormatFactory::kUnexpected};
+    const eavp::StatusCode expected[] = {
+        eavp::StatusCode::kResourceExhausted,
+        eavp::StatusCode::kResourceExhausted,
+        eavp::StatusCode::kInternal};
+    for (std::size_t index = 0U; index < 3U; ++index) {
+        std::unique_ptr<eavp::detail::V4L2FormatFactory> format_factory(
+            new FailOnceFormatFactory(failures[index]));
+        V4L2NodeFixture fixture(
+            eavp::PixelFormat::kYuv420p, 8, 4, 12U, 80U, 4U,
+            eavp::OverflowPolicy::kBlock, ScriptedAllocator::kNormal,
+            NULL, NULL, std::move(format_factory));
+        if (index == 0U) {
+            fixture.api->script_error("VIDIOC_REQBUFS(0)", EIO);
+        }
+
+        const eavp::Status first = fixture.node->prepare();
+
+        EXPECT_EQ(expected[index], first.code()) << index;
+        if (index == 0U) {
+            EXPECT_EQ("scripted format failure", first.message());
+        } else {
+            EXPECT_TRUE(first.message().empty()) << index;
+        }
+        EXPECT_EQ(eavp::StatusCode::kInvalidState,
+                  fixture.node->actual_format().status().code()) << index;
+        EXPECT_EQ(1U, fixture.trace->close_calls) << index;
+        EXPECT_TRUE(fixture.node->reset().ok()) << index;
+        EXPECT_TRUE(fixture.node->prepare().ok()) << index;
+        EXPECT_TRUE(fixture.node->actual_format().ok()) << index;
+        EXPECT_EQ(2U, fixture.trace->open_calls) << index;
+    }
+}
+
 TEST(V4L2SourceNodeTest, WaitSourceDelegatesOnlyWhileRunning) {
     V4L2NodeFixture fixture(eavp::PixelFormat::kYuv420p, 8, 4, 12U, 80U);
 
@@ -652,6 +817,50 @@ TEST(V4L2SourceNodeTest, RestartsPreparedSessionAndClearsPtsAndSequence) {
     EXPECT_EQ(1U, fixture.trace->open_calls);
 }
 
+TEST(V4L2SourceNodeTest, StartObserverFailureRollsBackStreamingAndCanRetry) {
+    RecordingObserver observer;
+    observer.fail_callback = RecordingObserver::kPending;
+    V4L2NodeFixture fixture(
+        eavp::PixelFormat::kYuv420p, 8, 4, 12U, 80U, 4U,
+        eavp::OverflowPolicy::kBlock, ScriptedAllocator::kNormal,
+        &observer);
+    ASSERT_TRUE(fixture.node->prepare().ok());
+
+    const eavp::Status first = fixture.node->start();
+
+    EXPECT_EQ(eavp::StatusCode::kResourceExhausted, first.code());
+    EXPECT_EQ(1U, fixture.trace->stream_on_calls);
+    EXPECT_EQ(1U, fixture.trace->stream_off_calls);
+    observer.fail_callback = RecordingObserver::kNone;
+    EXPECT_TRUE(fixture.node->stop().ok());
+    EXPECT_TRUE(fixture.node->prepare().ok());
+    EXPECT_TRUE(fixture.node->start().ok());
+    EXPECT_EQ(2U, fixture.trace->stream_on_calls);
+    EXPECT_EQ(1U, fixture.trace->open_calls);
+}
+
+TEST(V4L2SourceNodeTest, StartRollbackFailureWinsAndReportsFatal) {
+    RecordingObserver observer;
+    observer.fail_callback = RecordingObserver::kPending;
+    V4L2NodeFixture fixture(
+        eavp::PixelFormat::kYuv420p, 8, 4, 12U, 80U, 4U,
+        eavp::OverflowPolicy::kBlock, ScriptedAllocator::kNormal,
+        &observer);
+    ASSERT_TRUE(fixture.node->prepare().ok());
+    fixture.api->script_error("VIDIOC_STREAMOFF", EIO);
+
+    const eavp::Status status = fixture.node->start();
+
+    EXPECT_EQ(eavp::StatusCode::kIoError, status.code());
+    EXPECT_EQ("v4l2", status.provider_id());
+    EXPECT_EQ("VIDIOC_STREAMOFF", status.operation());
+    ASSERT_TRUE(status.has_native_code());
+    EXPECT_EQ(EIO, status.native_code());
+    EXPECT_EQ(1U, observer.fatal);
+    EXPECT_TRUE(fixture.node->reset().ok());
+    EXPECT_EQ(2U, fixture.trace->stream_off_calls);
+}
+
 TEST(V4L2SourceNodeTest, PendingFrameStopsDequeueUntilDeliverySucceeds) {
     RecordingObserver observer;
     V4L2NodeFixture fixture(
@@ -678,6 +887,34 @@ TEST(V4L2SourceNodeTest, PendingFrameStopsDequeueUntilDeliverySucceeds) {
     EXPECT_FALSE(observer.pending_reports[0U]);
     EXPECT_TRUE(observer.pending_reports[1U]);
     EXPECT_FALSE(observer.pending_reports.back());
+}
+
+TEST(V4L2SourceNodeTest, OutputBackpressureDoesNotPublishDequeueWouldBlock) {
+    eavp::MetricRegistry metrics;
+    V4L2NodeFixture fixture(
+        eavp::PixelFormat::kYuv420p, 8, 4, 12U, 80U, 1U,
+        eavp::OverflowPolicy::kBlock, ScriptedAllocator::kNormal,
+        NULL, &metrics);
+    fixture.fill_visible();
+    fixture.script_frame(0U);
+    fixture.script_frame(1U);
+    ASSERT_TRUE(fixture.start().ok());
+    ASSERT_TRUE(fixture.node->tick().ok());
+    ASSERT_EQ(eavp::StatusCode::kWouldBlock, fixture.node->tick().code());
+    const std::size_t dequeues_with_pending =
+        operation_count(fixture.trace->streaming_calls, "VIDIOC_DQBUF");
+
+    EXPECT_EQ(0U, counter_or_zero(metrics, "v4l2.dequeue.would_block"));
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock, fixture.node->tick().code());
+    EXPECT_EQ(dequeues_with_pending,
+              operation_count(fixture.trace->streaming_calls, "VIDIOC_DQBUF"));
+    EXPECT_EQ(0U, counter_or_zero(metrics, "v4l2.dequeue.would_block"));
+    fixture.take_frame();
+    EXPECT_TRUE(fixture.node->tick().ok());
+    EXPECT_EQ(dequeues_with_pending,
+              operation_count(fixture.trace->streaming_calls, "VIDIOC_DQBUF"));
+    EXPECT_EQ(eavp::StatusCode::kWouldBlock, fixture.node->tick().code());
+    EXPECT_EQ(1U, counter_or_zero(metrics, "v4l2.dequeue.would_block"));
 }
 
 TEST(V4L2SourceNodeTest, StopDropsPendingAndPublishesDropAndGauge) {
@@ -745,7 +982,6 @@ TEST(V4L2SourceNodeTest, InvalidOrOverflowingDriverTimestampsUseMonotonicFallbac
         {V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC, -1L, 2L},
         {V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC, 1L, -1L},
         {V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC, 1L, 1000000L},
-        {V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC, LONG_MAX, 999999L},
     };
     for (std::size_t index = 0U; index < sizeof(cases) / sizeof(cases[0]);
          ++index) {
@@ -755,12 +991,81 @@ TEST(V4L2SourceNodeTest, InvalidOrOverflowingDriverTimestampsUseMonotonicFallbac
         fixture.script_frame(0U, cases[index].seconds,
                              cases[index].microseconds, cases[index].flags);
         ASSERT_TRUE(fixture.start().ok()) << index;
-        const std::int64_t before = monotonic_us();
         ASSERT_TRUE(fixture.node->tick().ok()) << index;
-        const std::int64_t after = monotonic_us();
         const std::shared_ptr<const eavp::VideoFrame> frame = fixture.take_frame();
-        EXPECT_GE(frame->pts(), before) << index;
-        EXPECT_LE(frame->pts(), after) << index;
+        EXPECT_EQ(9000007, frame->pts()) << index;
+    }
+
+    V4L2NodeFixture boundary(eavp::PixelFormat::kYuv420p,
+                             8, 4, 12U, 80U);
+    boundary.fill_visible();
+    const std::uint64_t first_overflowing_second =
+        static_cast<std::uint64_t>(
+            std::numeric_limits<std::int64_t>::max()) / 1000000U + 1U;
+    const bool long_can_express_overflow =
+        static_cast<std::uint64_t>(LONG_MAX) >= first_overflowing_second;
+    const long seconds = long_can_express_overflow
+        ? static_cast<long>(first_overflowing_second) : LONG_MAX;
+    boundary.script_frame(0U, seconds, 999999L);
+    ASSERT_TRUE(boundary.start().ok());
+    ASSERT_TRUE(boundary.node->tick().ok());
+    const std::shared_ptr<const eavp::VideoFrame> frame =
+        boundary.take_frame();
+    if (long_can_express_overflow) {
+        EXPECT_EQ(9000007, frame->pts());
+    } else {
+        const std::int64_t maximum_legal =
+            timestamp_microseconds(seconds, 999999L);
+        EXPECT_EQ(maximum_legal, frame->pts());
+    }
+}
+
+TEST(V4L2SourceNodeTest, FallbackClockFailuresRequeueWithoutOutput) {
+    const ScriptedClock::Mode modes[] = {
+        ScriptedClock::kSyscallFailure,
+        ScriptedClock::kInvalidTimespec,
+        ScriptedClock::kBadAlloc,
+        ScriptedClock::kUnexpected};
+    const eavp::StatusCode expected[] = {
+        eavp::StatusCode::kIoError,
+        eavp::StatusCode::kCorruptData,
+        eavp::StatusCode::kResourceExhausted,
+        eavp::StatusCode::kInternal};
+    for (std::size_t index = 0U; index < 4U; ++index) {
+        std::unique_ptr<eavp::detail::V4L2Clock> clock(
+            new ScriptedClock(modes[index]));
+        V4L2NodeFixture fixture(
+            eavp::PixelFormat::kYuv420p, 8, 4, 12U, 80U, 4U,
+            eavp::OverflowPolicy::kBlock, ScriptedAllocator::kNormal,
+            NULL, NULL,
+            std::unique_ptr<eavp::detail::V4L2FormatFactory>(),
+            std::move(clock));
+        fixture.fill_visible();
+        fixture.script_frame(0U, 0L, 0L);
+        ASSERT_TRUE(fixture.start().ok()) << index;
+
+        const eavp::Status status = fixture.node->tick();
+
+        EXPECT_EQ(expected[index], status.code()) << index;
+        if (modes[index] == ScriptedClock::kSyscallFailure) {
+            EXPECT_EQ("v4l2", status.provider_id());
+            EXPECT_EQ("clock_gettime(CLOCK_MONOTONIC)", status.operation());
+            ASSERT_TRUE(status.has_native_code());
+            EXPECT_EQ(EIO, status.native_code());
+        }
+        if (modes[index] == ScriptedClock::kInvalidTimespec) {
+            EXPECT_EQ("V4L2 monotonic timestamp is invalid or overflows",
+                      status.message());
+            EXPECT_TRUE(status.provider_id().empty());
+            EXPECT_TRUE(status.operation().empty());
+            EXPECT_FALSE(status.has_native_code());
+        }
+        if (modes[index] == ScriptedClock::kBadAlloc ||
+            modes[index] == ScriptedClock::kUnexpected) {
+            EXPECT_TRUE(status.message().empty()) << index;
+        }
+        EXPECT_EQ(1U, fixture.qbuf_after_dequeue_calls()) << index;
+        EXPECT_EQ(0U, fixture.sink.queue_size()) << index;
     }
 }
 
@@ -820,6 +1125,21 @@ TEST(V4L2SourceNodeTest, RejectsClearlyReverseSequenceAndStillRequeues) {
 
     EXPECT_EQ(eavp::StatusCode::kCorruptData, status.code());
     EXPECT_EQ(2U, fixture.qbuf_after_dequeue_calls());
+}
+
+TEST(V4L2SourceNodeTest, RejectsSequenceDeltaAtHalfRangeAndStillRequeues) {
+    V4L2NodeFixture fixture(eavp::PixelFormat::kYuv420p, 8, 4, 12U, 80U);
+    fixture.fill_visible();
+    fixture.script_frame(0U);
+    fixture.script_frame(0x80000001U);
+    ASSERT_TRUE(fixture.start().ok());
+    ASSERT_TRUE(fixture.node->tick().ok());
+
+    const eavp::Status status = fixture.node->tick();
+
+    EXPECT_EQ(eavp::StatusCode::kCorruptData, status.code());
+    EXPECT_EQ(2U, fixture.qbuf_after_dequeue_calls());
+    EXPECT_EQ(1U, fixture.sink.queue_size());
 }
 
 TEST(V4L2SourceNodeTest, PublishesCapturedBytesWouldBlockGapAndPendingMetrics) {
