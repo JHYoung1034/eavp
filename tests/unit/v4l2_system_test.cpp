@@ -629,6 +629,77 @@ TEST(V4L2SystemTest, StartStopsBeforeStreamOnWhenQueueingFails) {
     EXPECT_EQ(0U, fixture.trace->stream_off_calls);
 }
 
+TEST(V4L2SystemTest, StreamOnFailureLeavesPreparedStateWithoutStreamOff) {
+    ScriptedV4L2 fixture;
+    ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
+    fixture.observed->script_error("VIDIOC_STREAMON", EBUSY);
+
+    const eavp::Status status = fixture.system->start();
+
+    EXPECT_EQ(eavp::StatusCode::kIoError, status.code());
+    expect_provider_context(status, "VIDIOC_STREAMON", EBUSY);
+    const std::vector<std::string> expected = {
+        "VIDIOC_QBUF:0", "VIDIOC_QBUF:1", "VIDIOC_QBUF:2",
+        "VIDIOC_STREAMON"};
+    EXPECT_EQ(expected, fixture.trace->streaming_calls);
+    EXPECT_TRUE(fixture.system->poll_descriptors().ok());
+
+    EXPECT_TRUE(fixture.system->stop().ok());
+    EXPECT_EQ(expected, fixture.trace->streaming_calls);
+    EXPECT_EQ(0U, fixture.trace->stream_off_calls);
+}
+
+TEST(V4L2SystemTest, FailedStreamOffRemainsRunningUntilSuccessfulRetry) {
+    ScriptedV4L2 fixture;
+    ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
+    ASSERT_TRUE(fixture.system->start().ok());
+    fixture.trace->streaming_calls.clear();
+    fixture.observed->script_error("VIDIOC_STREAMOFF", EPIPE);
+
+    const eavp::Status first = fixture.system->stop();
+
+    EXPECT_EQ(eavp::StatusCode::kIoError, first.code());
+    expect_provider_context(first, "VIDIOC_STREAMOFF", EPIPE);
+    EXPECT_EQ(std::vector<std::string>(1U, "VIDIOC_STREAMOFF"),
+              fixture.trace->streaming_calls);
+
+    EXPECT_TRUE(fixture.system->stop().ok());
+    EXPECT_EQ(2U, fixture.trace->stream_off_calls);
+    EXPECT_EQ(2U, fixture.trace->streaming_calls.size());
+    EXPECT_EQ("VIDIOC_STREAMOFF", fixture.trace->streaming_calls[1]);
+
+    EXPECT_TRUE(fixture.system->stop().ok());
+    EXPECT_EQ(2U, fixture.trace->stream_off_calls);
+    EXPECT_EQ(2U, fixture.trace->streaming_calls.size());
+}
+
+TEST(V4L2SystemTest, RejectsStreamingOperationsBeforeRunningWithoutApiCalls) {
+    ScriptedV4L2 fixture;
+    const struct pollfd descriptor = {
+        41, static_cast<short>(POLLIN | POLLRDNORM | POLLPRI), POLLIN};
+    const std::vector<struct pollfd> descriptors(1U, descriptor);
+
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              fixture.system->dequeue().status().code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              fixture.system->requeue(0U).code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              fixture.system->evaluate_poll_events(descriptors).status().code());
+    EXPECT_TRUE(fixture.trace->operations.empty());
+    EXPECT_TRUE(fixture.trace->streaming_calls.empty());
+
+    ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
+    const std::size_t prepared_operations = fixture.trace->operations.size();
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              fixture.system->dequeue().status().code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              fixture.system->requeue(0U).code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              fixture.system->evaluate_poll_events(descriptors).status().code());
+    EXPECT_EQ(prepared_operations, fixture.trace->operations.size());
+    EXPECT_TRUE(fixture.trace->streaming_calls.empty());
+}
+
 TEST(V4L2SystemTest, DequeuesOneBufferWithMappedMetadataAndRequeuesExplicitly) {
     ScriptedV4L2 fixture;
     ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
@@ -721,6 +792,7 @@ TEST(V4L2SystemTest, MapsDequeueDeviceAndIoErrorsPrecisely) {
         {ENODEV, eavp::StatusCode::kDeviceLost},
         {ENXIO, eavp::StatusCode::kDeviceLost},
         {EIO, eavp::StatusCode::kDeviceLost},
+        {EINVAL, eavp::StatusCode::kIoError},
     };
     for (std::size_t index = 0U;
          index < sizeof(cases) / sizeof(cases[0]); ++index) {
@@ -743,6 +815,7 @@ TEST(V4L2SystemTest, RejectsDequeuedBufferWithUntrustedIndex) {
     ScriptedV4L2 fixture;
     ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
     ASSERT_TRUE(fixture.system->start().ok());
+    fixture.trace->streaming_calls.clear();
     fixture.observed->script_dequeued_buffer(3U, 384U, 0U, 0U, 0L, 0L);
 
     const eavp::Result<eavp::detail::V4L2DequeuedBuffer> result =
@@ -751,6 +824,8 @@ TEST(V4L2SystemTest, RejectsDequeuedBufferWithUntrustedIndex) {
     ASSERT_FALSE(result.ok());
     EXPECT_EQ(eavp::StatusCode::kCorruptData, result.status().code());
     expect_provider_context(result.status(), "VIDIOC_DQBUF", 0);
+    EXPECT_EQ(std::vector<std::string>(1U, "VIDIOC_DQBUF"),
+              fixture.trace->streaming_calls);
 }
 
 TEST(V4L2SystemTest, ExposesBytesUsedAndErrorFlagForExplicitRequeue) {
