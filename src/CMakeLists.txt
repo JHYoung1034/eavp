@@ -102,6 +102,7 @@ add_library(eavp_platform STATIC
     platform/linux/linux_runtime_api.cpp
     platform/linux/platform_runtime.cpp
     platform/linux/v4l2_capture_config.cpp
+    platform/linux/v4l2_capture.cpp
     platform/linux/v4l2_linux_api.cpp
     platform/linux/v4l2_system.cpp
     platform/reference_media_platform.cpp
