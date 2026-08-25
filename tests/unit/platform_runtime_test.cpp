@@ -640,6 +640,50 @@ private:
     struct timespec fixed_time_;
 };
 
+class ControlledWaitFailureApi : public FakeLinuxRuntimeApi {
+public:
+    enum FailureMode {
+        kBadAlloc,
+        kInternal,
+    };
+
+    ControlledWaitFailureApi(FailureMode mode, bool block_wait)
+        : FakeLinuxRuntimeApi(), mode_(mode), block_wait_(block_wait),
+          wait_entered_(false), wait_allowed_(!block_wait) {}
+
+    int epoll_wait_events(int, struct epoll_event*, int, int) override {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            wait_entered_ = true;
+            condition_.notify_all();
+            while (block_wait_ && !wait_allowed_) condition_.wait(lock);
+        }
+        if (mode_ == kBadAlloc) throw std::bad_alloc();
+        throw std::runtime_error("epoll_wait");
+    }
+
+    bool wait_for_wait_entered() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2), [this]() {
+            return wait_entered_;
+        });
+    }
+
+    void allow_wait() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        wait_allowed_ = true;
+        condition_.notify_all();
+    }
+
+private:
+    FailureMode mode_;
+    bool block_wait_;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool wait_entered_;
+    bool wait_allowed_;
+};
+
 std::unique_ptr<eavp::LinuxPlatformRuntime> create_injected_runtime(
     std::unique_ptr<eavp::detail::LinuxRuntimeApi> api,
     eavp::detail::RuntimeObserver* observer,
@@ -1107,6 +1151,63 @@ TEST(LinuxPlatformRuntimeTest, ConcurrentStopsShareOneJoinOwner) {
     EXPECT_TRUE(second.ok());
 }
 
+TEST(LinuxPlatformRuntimeTest, StoppedStateStillWaitsForExistingJoinOwner) {
+    RuntimeConcurrencyProbe probe;
+    probe.block_thread_finish_ = true;
+    probe.block_join_owner_ = true;
+    RuntimePipelineHarness harness("stopped-join-gate");
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_injected_runtime(
+            eavp::detail::create_linux_runtime_api(), NULL, &probe);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+
+    eavp::Status first(eavp::StatusCode::kInvalidState);
+    eavp::Status second(eavp::StatusCode::kInvalidState);
+    std::mutex second_mutex;
+    std::condition_variable second_condition;
+    bool second_entered = false;
+    bool second_returned = false;
+    std::thread first_stopper([&]() { first = runtime->stop(); });
+
+    EXPECT_TRUE(probe.wait_for_join_participants(1));
+    EXPECT_TRUE(probe.wait_for_thread_finishing());
+    EXPECT_EQ(eavp::PlatformRuntimeState::kStopped, runtime->state());
+
+    std::thread second_stopper([&]() {
+        {
+            std::lock_guard<std::mutex> lock(second_mutex);
+            second_entered = true;
+            second_condition.notify_all();
+        }
+        second = runtime->stop();
+        {
+            std::lock_guard<std::mutex> lock(second_mutex);
+            second_returned = true;
+            second_condition.notify_all();
+        }
+    });
+    {
+        std::unique_lock<std::mutex> lock(second_mutex);
+        EXPECT_TRUE(second_condition.wait_for(
+            lock, std::chrono::seconds(2),
+            [&]() { return second_entered; }));
+    }
+
+    EXPECT_TRUE(probe.wait_for_join_participants(2));
+    {
+        std::lock_guard<std::mutex> lock(second_mutex);
+        EXPECT_FALSE(second_returned);
+    }
+
+    probe.allow_everything();
+    first_stopper.join();
+    second_stopper.join();
+    EXPECT_TRUE(first.ok());
+    EXPECT_TRUE(second.ok());
+}
+
 TEST(LinuxPlatformRuntimeTest, StartFailureAndStopShareOneJoinOwner) {
     RuntimeConcurrencyProbe probe;
     probe.block_thread_finish_ = true;
@@ -1164,7 +1265,8 @@ TEST(LinuxPlatformRuntimeTest, WaitSourceFailureRemainsTheFirstMediaCause) {
     FakeRuntimeObserver observer;
     RuntimePipelineHarness harness("wait-source-failure");
     const eavp::Status source_failure(
-        eavp::StatusCode::kDeviceLost, "source lost", "camera", "poll", 41);
+        eavp::StatusCode::kDeviceLost, "source lost", "linux_runtime", "poll",
+        41);
     harness.source.set_evaluate_failure(source_failure);
     harness.node->set_reset_status(eavp::Status(
         eavp::StatusCode::kCorruptData, "cancel failed"));
@@ -1178,10 +1280,43 @@ TEST(LinuxPlatformRuntimeTest, WaitSourceFailureRemainsTheFirstMediaCause) {
     const eavp::Status stopped = runtime->stop();
 
     EXPECT_EQ(eavp::StatusCode::kDeviceLost, stopped.code());
-    EXPECT_EQ("camera", stopped.provider_id());
+    EXPECT_EQ("linux_runtime", stopped.provider_id());
     EXPECT_EQ("poll", stopped.operation());
     EXPECT_EQ(41, stopped.native_code());
     EXPECT_EQ(1, observer.failure_count_);
+}
+
+TEST(LinuxPlatformRuntimeTest,
+     ProviderlessEventLoopExceptionsRemainReactorFailures) {
+    const ControlledWaitFailureApi::FailureMode modes[] = {
+        ControlledWaitFailureApi::kBadAlloc,
+        ControlledWaitFailureApi::kInternal};
+    const eavp::StatusCode expected_codes[] = {
+        eavp::StatusCode::kResourceExhausted,
+        eavp::StatusCode::kInternal};
+
+    for (std::size_t index = 0U; index < 2U; ++index) {
+        FakeRuntimeObserver observer;
+        RuntimePipelineHarness harness(
+            index == 0U ? "wait-bad-alloc" : "wait-internal");
+        ControlledWaitFailureApi* raw_api =
+            new ControlledWaitFailureApi(modes[index], true);
+        std::unique_ptr<eavp::detail::LinuxRuntimeApi> api(raw_api);
+        std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+            create_injected_runtime(std::move(api), &observer, NULL);
+        ASSERT_TRUE(runtime->register_pipeline(
+            &harness.pipeline, harness.wait_sources()).ok());
+        ASSERT_TRUE(runtime->start().ok());
+
+        const bool wait_entered = raw_api->wait_for_wait_entered();
+        EXPECT_TRUE(wait_entered);
+        raw_api->allow_wait();
+        const eavp::Status stopped = runtime->stop();
+
+        EXPECT_EQ(expected_codes[index], stopped.code());
+        EXPECT_TRUE(stopped.provider_id().empty());
+        EXPECT_EQ(0, observer.failure_count_);
+    }
 }
 
 TEST(LinuxPlatformRuntimeTest, RejectsAnUnrepresentableStopDeadline) {
@@ -1250,6 +1385,76 @@ TEST(LinuxEventLoopTest, CoalescesReadySourcesForTheSamePipeline) {
     EXPECT_EQ(1U, ready.value().wakeup_count);
     EXPECT_EQ(0U, ready.value().interrupted_count);
     EXPECT_FALSE(ready.value().control_wakeup);
+}
+
+TEST(LinuxEventLoopTest, ResetsExplicitWaitFailureOriginOnEveryWait) {
+    RuntimeFixture fixture;
+
+    EXPECT_FALSE(fixture.loop->wait_once().ok());
+    EXPECT_EQ(eavp::detail::LinuxEventLoopWaitFailureOrigin::kRuntime,
+              fixture.loop->wait_failure_origin());
+
+    ASSERT_TRUE(fixture.loop->initialize().ok());
+    fixture.api->queue_events(std::vector<FakeLinuxRuntimeApi::ReadyEvent>());
+    EXPECT_TRUE(fixture.loop->wait_once().ok());
+    EXPECT_EQ(eavp::detail::LinuxEventLoopWaitFailureOrigin::kNone,
+              fixture.loop->wait_failure_origin());
+}
+
+TEST(LinuxEventLoopTest,
+     MarksProviderlessExceptionsAsRuntimeWaitFailures) {
+    const ControlledWaitFailureApi::FailureMode modes[] = {
+        ControlledWaitFailureApi::kBadAlloc,
+        ControlledWaitFailureApi::kInternal};
+    const eavp::StatusCode expected_codes[] = {
+        eavp::StatusCode::kResourceExhausted,
+        eavp::StatusCode::kInternal};
+
+    for (std::size_t index = 0U; index < 2U; ++index) {
+        ControlledWaitFailureApi* raw_api =
+            new ControlledWaitFailureApi(modes[index], false);
+        std::unique_ptr<eavp::detail::LinuxRuntimeApi> api(raw_api);
+        eavp::detail::LinuxEventLoop loop(std::move(api));
+        ASSERT_TRUE(loop.initialize().ok());
+
+        const eavp::Result<eavp::detail::LinuxEventLoopTurn> ready =
+            loop.wait_once();
+
+        ASSERT_FALSE(ready.ok());
+        EXPECT_EQ(expected_codes[index], ready.status().code());
+        EXPECT_TRUE(ready.status().provider_id().empty());
+        EXPECT_EQ(eavp::detail::LinuxEventLoopWaitFailureOrigin::kRuntime,
+                  loop.wait_failure_origin());
+        EXPECT_TRUE(loop.wake().ok());
+        EXPECT_EQ(eavp::detail::LinuxEventLoopWaitFailureOrigin::kRuntime,
+                  loop.wait_failure_origin());
+    }
+}
+
+TEST(LinuxEventLoopTest,
+     MarksEvaluateFailureAsWaitSourceRegardlessOfProvider) {
+    RuntimeFixture fixture;
+    fixture.source_a.set_descriptors(
+        std::vector<pollfd>(1, readable_fd(10)));
+    fixture.source_a.set_evaluate_failure(eavp::Status(
+        eavp::StatusCode::kDeviceLost, "source lost", "linux_runtime",
+        "evaluate", 51));
+    fixture.api->queue_ready_fds(std::vector<int>(1, 10));
+    ASSERT_TRUE(fixture.loop->initialize().ok());
+    ASSERT_TRUE(fixture.loop->register_source(
+        &fixture.pipeline, &fixture.source_a).ok());
+
+    const eavp::Result<eavp::detail::LinuxEventLoopTurn> ready =
+        fixture.loop->wait_once();
+
+    ASSERT_FALSE(ready.ok());
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, ready.status().code());
+    EXPECT_EQ("source lost", ready.status().message());
+    EXPECT_EQ("linux_runtime", ready.status().provider_id());
+    EXPECT_EQ("evaluate", ready.status().operation());
+    EXPECT_EQ(51, ready.status().native_code());
+    EXPECT_EQ(eavp::detail::LinuxEventLoopWaitFailureOrigin::kWaitSource,
+              fixture.loop->wait_failure_origin());
 }
 
 TEST(LinuxEventLoopTest, RegistersLevelTriggeredPollInterestsExactly) {

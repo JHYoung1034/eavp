@@ -26,6 +26,12 @@ struct LinuxEventLoopTurn {
     bool control_wakeup;
 };
 
+enum class LinuxEventLoopWaitFailureOrigin {
+    kNone,
+    kRuntime,
+    kWaitSource,
+};
+
 class LinuxEventLoop {
 public:
     explicit LinuxEventLoop(std::unique_ptr<LinuxRuntimeApi> api);
@@ -34,6 +40,8 @@ public:
     Status initialize();
     Status register_source(MediaPipeline* pipeline, LinuxWaitSource* source);
     Result<LinuxEventLoopTurn> wait_once();
+    // 仅由 wait_once() 的调用线程读取；wake() 不修改该值。
+    LinuxEventLoopWaitFailureOrigin wait_failure_origin() const;
     Status wake();
     Status close();
 

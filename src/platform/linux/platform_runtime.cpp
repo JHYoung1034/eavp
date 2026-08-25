@@ -302,9 +302,11 @@ public:
             if (state_ == PlatformRuntimeState::kCreated) {
                 state_ = PlatformRuntimeState::kStopped;
                 stop_result_ = Status::ok_status();
-                return stop_result_;
             }
             if (state_ == PlatformRuntimeState::kStopped) {
+                lock.unlock();
+                join_reactor();
+                lock.lock();
                 return stop_result_;
             }
             if (state_ == PlatformRuntimeState::kError && thread_exited_) {
@@ -676,12 +678,13 @@ private:
                observer_failure.ok()) {
             Result<detail::LinuxEventLoopTurn> turn = loop_->wait_once();
             if (!turn.ok()) {
-                if (turn.status().provider_id() == "linux_runtime") {
-                    record_first(turn.status(), &reactor_failure);
-                } else {
+                if (loop_->wait_failure_origin() ==
+                    detail::LinuxEventLoopWaitFailureOrigin::kWaitSource) {
                     record_first(turn.status(), &media_failure);
                     record_first(observe_pipeline_failure(),
                                  &observer_failure);
+                } else {
+                    record_first(turn.status(), &reactor_failure);
                 }
                 break;
             }

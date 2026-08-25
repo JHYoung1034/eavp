@@ -90,8 +90,9 @@ public:
 
     explicit Impl(std::unique_ptr<LinuxRuntimeApi> runtime_api)
         : api(std::move(runtime_api)), epoll_fd(-1), event_fd(-1), next_token(1U),
-          invalidated(false), sources(), tokens(), registered_fds(),
-          registered_sources() {}
+          invalidated(false), wait_failure_origin(
+                                  LinuxEventLoopWaitFailureOrigin::kNone),
+          sources(), tokens(), registered_fds(), registered_sources() {}
 
     bool rollback_registration(const SourceRecord& record,
                                std::size_t added_count) noexcept {
@@ -132,6 +133,7 @@ public:
     int event_fd;
     std::uint64_t next_token;
     bool invalidated;
+    LinuxEventLoopWaitFailureOrigin wait_failure_origin;
     std::vector<SourceRecord> sources;
     std::map<std::uint64_t, TokenTarget> tokens;
     std::set<int> registered_fds;
@@ -293,8 +295,11 @@ Status LinuxEventLoop::register_source(MediaPipeline* pipeline,
 }
 
 Result<LinuxEventLoopTurn> LinuxEventLoop::wait_once() {
+    impl_->wait_failure_origin = LinuxEventLoopWaitFailureOrigin::kNone;
     try {
         if (impl_->epoll_fd < 0 || impl_->event_fd < 0) {
+            impl_->wait_failure_origin =
+                LinuxEventLoopWaitFailureOrigin::kRuntime;
             return Result<LinuxEventLoopTurn>(Status(StatusCode::kInvalidState));
         }
 
@@ -311,11 +316,15 @@ Result<LinuxEventLoopTurn> LinuxEventLoop::wait_once() {
             }
             const int error = impl_->api->last_error();
             if (error != EINTR) {
+                impl_->wait_failure_origin =
+                    LinuxEventLoopWaitFailureOrigin::kRuntime;
                 return Result<LinuxEventLoopTurn>(system_error(
                     "Linux Reactor 等待失败", "epoll_wait", error));
             }
             ++turn.interrupted_count;
             if (turn.interrupted_count >= kMaxConsecutiveInterruptions) {
+                impl_->wait_failure_origin =
+                    LinuxEventLoopWaitFailureOrigin::kRuntime;
                 return Result<LinuxEventLoopTurn>(Status(
                     StatusCode::kIoError,
                     "Linux Reactor 等待被连续信号中断",
@@ -340,6 +349,8 @@ Result<LinuxEventLoopTurn> LinuxEventLoop::wait_once() {
                 if (!turn.control_wakeup) {
                     std::uint64_t value = 0U;
                     if (impl_->api->read_event_fd(impl_->event_fd, &value) < 0) {
+                        impl_->wait_failure_origin =
+                            LinuxEventLoopWaitFailureOrigin::kRuntime;
                         return Result<LinuxEventLoopTurn>(system_error(
                             "无法读取 Linux eventfd", "read(eventfd)",
                             impl_->api->last_error()));
@@ -366,6 +377,8 @@ Result<LinuxEventLoopTurn> LinuxEventLoop::wait_once() {
             Result<bool> evaluated =
                 source.source->evaluate_poll_events(source.descriptors);
             if (!evaluated.ok()) {
+                impl_->wait_failure_origin =
+                    LinuxEventLoopWaitFailureOrigin::kWaitSource;
                 return Result<LinuxEventLoopTurn>(evaluated.status());
             }
             if (evaluated.value() &&
@@ -375,10 +388,18 @@ Result<LinuxEventLoopTurn> LinuxEventLoop::wait_once() {
         }
         return Result<LinuxEventLoopTurn>(std::move(turn));
     } catch (const std::bad_alloc&) {
+        impl_->wait_failure_origin =
+            LinuxEventLoopWaitFailureOrigin::kRuntime;
         return Result<LinuxEventLoopTurn>(allocation_error());
     } catch (...) {
+        impl_->wait_failure_origin =
+            LinuxEventLoopWaitFailureOrigin::kRuntime;
         return Result<LinuxEventLoopTurn>(internal_error());
     }
+}
+
+LinuxEventLoopWaitFailureOrigin LinuxEventLoop::wait_failure_origin() const {
+    return impl_->wait_failure_origin;
 }
 
 Status LinuxEventLoop::wake() {
