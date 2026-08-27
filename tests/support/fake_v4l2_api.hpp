@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <linux/videodev2.h>
 #include <limits>
 #include <map>
@@ -127,7 +128,9 @@ public:
           returned_memory_type_(V4L2_MEMORY_MMAP),
           maximum_mappable_offset_(
               std::numeric_limits<std::uint64_t>::max()),
-          monotonic_now_result_(0) {
+          monotonic_now_result_(0), runtime_mode_(false),
+          runtime_ready_outstanding_(false), runtime_next_map_(0U),
+          runtime_memory_(), runtime_ready_callback_() {
         buffers_.push_back(FakeV4L2Buffer(0U, 384U, 0U));
         buffers_.push_back(FakeV4L2Buffer(1U, 384U, 4096U));
         buffers_.push_back(FakeV4L2Buffer(2U, 384U, 8192U));
@@ -198,6 +201,39 @@ public:
                                 long seconds, long microseconds) {
         dequeued_buffers_.push_back(FakeV4L2DequeuedBuffer(
             index, bytes_used, flags, sequence, seconds, microseconds));
+    }
+
+    static std::uint8_t runtime_payload_byte(
+        std::uint32_t sequence, std::size_t offset) {
+        if (offset < 4U) {
+            return static_cast<std::uint8_t>(sequence >> (offset * 8U));
+        }
+        return static_cast<std::uint8_t>(
+            sequence * 31U + offset * 17U + 11U);
+    }
+
+    void script_runtime_frames(std::size_t count) {
+        runtime_mode_ = true;
+        runtime_ready_outstanding_ = false;
+        runtime_next_map_ = 0U;
+        dequeued_buffers_.clear();
+        runtime_memory_.assign(
+            static_cast<std::size_t>(returned_buffer_count_),
+            std::vector<std::uint8_t>(static_cast<std::size_t>(size_image_),
+                                      0U));
+        if (returned_buffer_count_ == 0U) return;
+        for (std::size_t sequence = 0U; sequence < count; ++sequence) {
+            script_dequeued_buffer(
+                static_cast<std::uint32_t>(
+                    sequence % static_cast<std::size_t>(returned_buffer_count_)),
+                size_image_, V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC,
+                static_cast<std::uint32_t>(sequence), 1L,
+                static_cast<long>(sequence));
+        }
+    }
+
+    void set_runtime_ready_callback(const std::function<void()>& callback) {
+        runtime_ready_callback_ = callback;
     }
 
     std::uint64_t maximum_mappable_offset() const override {
@@ -350,6 +386,26 @@ public:
             buffer->sequence = value.sequence;
             buffer->timestamp.tv_sec = value.seconds;
             buffer->timestamp.tv_usec = value.microseconds;
+            if (runtime_mode_) {
+                if (static_cast<std::size_t>(value.index) >=
+                    runtime_memory_.size()) {
+                    last_error_ = EINVAL;
+                    return -1;
+                }
+                std::vector<std::uint8_t>& bytes =
+                    runtime_memory_[value.index];
+                for (std::size_t offset = 0U; offset < bytes.size(); ++offset) {
+                    bytes[offset] = runtime_payload_byte(
+                        value.sequence, offset);
+                }
+                runtime_ready_outstanding_ = false;
+            }
+        }
+        if (runtime_mode_ && request == VIDIOC_STREAMON) {
+            signal_runtime_ready();
+        } else if (runtime_mode_ && request == VIDIOC_QBUF &&
+                   !runtime_ready_outstanding_) {
+            signal_runtime_ready();
         }
         return 0;
     }
@@ -361,6 +417,14 @@ public:
             FakeV4L2MapCall(address, length, protection, flags, fd, offset));
         throw_if_scripted("mmap");
         if (take_error("mmap")) return MAP_FAILED;
+        if (runtime_mode_) {
+            if (runtime_next_map_ >= runtime_memory_.size() ||
+                runtime_memory_[runtime_next_map_].size() < length) {
+                last_error_ = ENOMEM;
+                return MAP_FAILED;
+            }
+            return runtime_memory_[runtime_next_map_++].data();
+        }
         const std::uintptr_t mapped_address =
             static_cast<std::uintptr_t>(0x10000U) +
             trace_->mmap_calls.size() * static_cast<std::uintptr_t>(0x10000U);
@@ -380,6 +444,8 @@ public:
         ++trace_->close_calls;
         trace_->operations.push_back("close");
         throw_if_scripted("close");
+        runtime_next_map_ = 0U;
+        runtime_ready_outstanding_ = false;
         return take_error("close") ? -1 : 0;
     }
 
@@ -394,6 +460,15 @@ public:
     int last_error() const override { return last_error_; }
 
 private:
+    void signal_runtime_ready() {
+        if (runtime_ready_outstanding_ || dequeued_buffers_.empty() ||
+            !runtime_ready_callback_) {
+            return;
+        }
+        runtime_ready_outstanding_ = true;
+        runtime_ready_callback_();
+    }
+
     void throw_if_scripted(const std::string& operation) {
         std::map<std::string, std::size_t>::iterator found =
             throws_.find(operation);
@@ -460,6 +535,11 @@ private:
     std::map<std::string, std::size_t> throws_;
     int monotonic_now_result_;
     struct timespec monotonic_now_value_;
+    bool runtime_mode_;
+    bool runtime_ready_outstanding_;
+    std::size_t runtime_next_map_;
+    std::vector<std::vector<std::uint8_t> > runtime_memory_;
+    std::function<void()> runtime_ready_callback_;
 };
 
 }  // namespace eavp_test

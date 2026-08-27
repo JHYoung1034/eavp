@@ -2,9 +2,11 @@
 #define EAVP_TESTS_SUPPORT_FAKE_LINUX_RUNTIME_API_HPP_
 
 #include <cerrno>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <set>
 #include <stdexcept>
@@ -60,7 +62,7 @@ public:
           monotonic_now_count(0), written_event_fd(-1), written_value(0U),
           add_calls(), remove_calls(), closed_fds(),
           external_closed_fds_(external_closed_fds), registered_fds_(),
-          wait_steps() {}
+          wait_steps(), blocking_wait_(false) {}
 
     int epoll_create() {
         ++epoll_create_count;
@@ -105,9 +107,15 @@ public:
 
     int epoll_wait_events(int, struct epoll_event* events, int capacity, int) {
         ++epoll_wait_count;
-        if (wait_steps.empty()) return 0;
+        std::unique_lock<std::mutex> lock(wait_mutex_);
+        if (blocking_wait_) {
+            wait_condition_.wait(lock, [this]() { return !wait_steps.empty(); });
+        } else if (wait_steps.empty()) {
+            return 0;
+        }
         const WaitStep step = wait_steps.front();
         wait_steps.pop_front();
+        lock.unlock();
         if (step.result < 0) {
             saved_error = step.error;
             return -1;
@@ -137,6 +145,10 @@ public:
         ++write_event_fd_count;
         written_event_fd = fd;
         written_value = value;
+        if (blocking_wait_ && write_event_fd_result == 0) {
+            queue_events(std::vector<ReadyEvent>(
+                1U, ReadyEvent(fd, EPOLLIN)));
+        }
         return write_event_fd_result;
     }
 
@@ -171,15 +183,25 @@ public:
         step.result = static_cast<int>(events.size());
         step.error = 0;
         step.events = events;
-        wait_steps.push_back(step);
+        {
+            std::lock_guard<std::mutex> lock(wait_mutex_);
+            wait_steps.push_back(step);
+        }
+        wait_condition_.notify_one();
     }
 
     void queue_error(int error) {
         WaitStep step;
         step.result = -1;
         step.error = error;
-        wait_steps.push_back(step);
+        {
+            std::lock_guard<std::mutex> lock(wait_mutex_);
+            wait_steps.push_back(step);
+        }
+        wait_condition_.notify_one();
     }
+
+    void enable_blocking_wait() { blocking_wait_ = true; }
 
     int close_count_for(int fd) const {
         int count = 0;
@@ -237,6 +259,9 @@ private:
     std::vector<int>* external_closed_fds_;
     std::set<int> registered_fds_;
     std::deque<WaitStep> wait_steps;
+    bool blocking_wait_;
+    std::mutex wait_mutex_;
+    std::condition_variable wait_condition_;
 };
 
 }  // namespace eavp_test
