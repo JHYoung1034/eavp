@@ -562,7 +562,7 @@ private:
             cancel_all(media_failure);
             return;
         }
-        struct timespec deadline;
+        struct timespec deadline = {0, 0};
         const Status deadline_status = add_milliseconds(
             started, config_.stop_timeout_ms(), &deadline);
         if (!deadline_status.ok()) {

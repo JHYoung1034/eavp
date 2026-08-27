@@ -24,7 +24,10 @@
         "EAVP_BUILD_TESTS": "ON",
         "EAVP_BUILD_EXAMPLES": "ON",
         "EAVP_FETCH_TEST_DEPS": "OFF",
-        "EAVP_ENABLE_ALSA": "ON"
+        "EAVP_ENABLE_ALSA": "ON",
+        "EAVP_ENABLE_LINUX_RUNTIME": "ON",
+        "EAVP_ENABLE_V4L2": "ON",
+        "EAVP_ENABLE_V4L2_DEVICE_TESTS": "OFF"
       }
     },
     {
@@ -42,7 +45,10 @@
         "EAVP_BUILD_TESTS": "ON",
         "EAVP_BUILD_EXAMPLES": "ON",
         "EAVP_FETCH_TEST_DEPS": "OFF",
-        "EAVP_ENABLE_ALSA": "ON"
+        "EAVP_ENABLE_ALSA": "ON",
+        "EAVP_ENABLE_LINUX_RUNTIME": "ON",
+        "EAVP_ENABLE_V4L2": "ON",
+        "EAVP_ENABLE_V4L2_DEVICE_TESTS": "OFF"
       }
     },
     {
@@ -61,7 +67,10 @@
         "EAVP_BUILD_EXAMPLES": "ON",
         "EAVP_FETCH_TEST_DEPS": "OFF",
         "EAVP_ENABLE_SANITIZERS": "ON",
-        "EAVP_ENABLE_ALSA": "ON"
+        "EAVP_ENABLE_ALSA": "ON",
+        "EAVP_ENABLE_LINUX_RUNTIME": "ON",
+        "EAVP_ENABLE_V4L2": "ON",
+        "EAVP_ENABLE_V4L2_DEVICE_TESTS": "OFF"
       }
     },
     {
@@ -69,6 +78,22 @@
       "inherits": "linux-asan",
       "cacheVariables": {
         "EAVP_FETCH_TEST_DEPS": "ON"
+      }
+    },
+    {
+      "name": "linux-tsan",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CROSSCOMPILING_EMULATOR": "setarch;x86_64;-R",
+        "EAVP_BUILD_TESTS": "ON",
+        "EAVP_BUILD_EXAMPLES": "ON",
+        "EAVP_FETCH_TEST_DEPS": "OFF",
+        "EAVP_ENABLE_THREAD_SANITIZER": "ON",
+        "EAVP_ENABLE_ALSA": "ON",
+        "EAVP_ENABLE_LINUX_RUNTIME": "ON",
+        "EAVP_ENABLE_V4L2": "ON",
+        "EAVP_ENABLE_V4L2_DEVICE_TESTS": "OFF"
       }
     },
     {
@@ -80,7 +105,10 @@
         "EAVP_BUILD_TESTS": "OFF",
         "EAVP_BUILD_EXAMPLES": "OFF",
         "EAVP_FETCH_TEST_DEPS": "OFF",
-        "EAVP_ENABLE_ALSA": "OFF"
+        "EAVP_ENABLE_ALSA": "OFF",
+        "EAVP_ENABLE_LINUX_RUNTIME": "ON",
+        "EAVP_ENABLE_V4L2": "ON",
+        "EAVP_ENABLE_V4L2_DEVICE_TESTS": "OFF"
       }
     },
     {
@@ -92,7 +120,10 @@
         "EAVP_BUILD_TESTS": "OFF",
         "EAVP_BUILD_EXAMPLES": "OFF",
         "EAVP_FETCH_TEST_DEPS": "OFF",
-        "EAVP_ENABLE_ALSA": "OFF"
+        "EAVP_ENABLE_ALSA": "OFF",
+        "EAVP_ENABLE_LINUX_RUNTIME": "ON",
+        "EAVP_ENABLE_V4L2": "ON",
+        "EAVP_ENABLE_V4L2_DEVICE_TESTS": "OFF"
       }
     },
     {
@@ -104,7 +135,10 @@
         "EAVP_BUILD_TESTS": "OFF",
         "EAVP_BUILD_EXAMPLES": "OFF",
         "EAVP_FETCH_TEST_DEPS": "OFF",
-        "EAVP_ENABLE_ALSA": "OFF"
+        "EAVP_ENABLE_ALSA": "OFF",
+        "EAVP_ENABLE_LINUX_RUNTIME": "ON",
+        "EAVP_ENABLE_V4L2": "ON",
+        "EAVP_ENABLE_V4L2_DEVICE_TESTS": "OFF"
       }
     }
   ],
@@ -115,6 +149,7 @@
     { "name": "linux-release-fetch-deps", "configurePreset": "linux-release-fetch-deps" },
     { "name": "linux-asan", "configurePreset": "linux-asan" },
     { "name": "linux-asan-fetch-deps", "configurePreset": "linux-asan-fetch-deps" },
+    { "name": "linux-tsan", "configurePreset": "linux-tsan" },
     { "name": "aarch64-release", "configurePreset": "aarch64-release" },
     { "name": "rockchip-armhf-release", "configurePreset": "rockchip-armhf-release" },
     { "name": "hisiv600-release", "configurePreset": "hisiv600-release" }
@@ -148,6 +183,14 @@
     {
       "name": "linux-asan-fetch-deps",
       "configurePreset": "linux-asan-fetch-deps",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-tsan",
+      "configurePreset": "linux-tsan",
+      "filter": {
+        "exclude": { "name": "^eavp\\.install_consumer$" }
+      },
       "output": { "outputOnFailure": true }
     }
   ]

@@ -20,6 +20,16 @@ namespace {
 
 const std::int64_t kMicrosecondsPerSecond = 1000000;
 const std::uint32_t kSequenceHalfRange = 0x80000000U;
+#if defined(V4L2_BUF_FLAG_TIMESTAMP_MASK) && \
+    defined(V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC)
+const std::uint32_t kV4L2TimestampMask = V4L2_BUF_FLAG_TIMESTAMP_MASK;
+const std::uint32_t kV4L2TimestampMonotonic =
+    V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+#else
+// 旧厂商 UAPI 头可能缺少名称，但内核 ABI 位值保持稳定。
+const std::uint32_t kV4L2TimestampMask = 0x0000e000U;
+const std::uint32_t kV4L2TimestampMonotonic = 0x00002000U;
+#endif
 
 Status allocation_failure() {
     return Status(StatusCode::kResourceExhausted);
@@ -277,8 +287,8 @@ public:
     Status timestamp_for(const detail::V4L2DequeuedBuffer& dequeued,
                          std::int64_t* pts) {
         const bool monotonic =
-            (dequeued.flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) ==
-            V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+            (dequeued.flags & kV4L2TimestampMask) ==
+            kV4L2TimestampMonotonic;
         std::int64_t candidate = 0;
         if (!monotonic || !timeval_to_us(dequeued.timestamp, &candidate)) {
             struct timespec now;

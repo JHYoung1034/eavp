@@ -98,13 +98,6 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/eavp/management
 
 add_library(eavp_platform STATIC
     platform/linux/alsa_capture_config.cpp
-    platform/linux/linux_event_loop.cpp
-    platform/linux/linux_runtime_api.cpp
-    platform/linux/platform_runtime.cpp
-    platform/linux/v4l2_capture_config.cpp
-    platform/linux/v4l2_capture.cpp
-    platform/linux/v4l2_linux_api.cpp
-    platform/linux/v4l2_system.cpp
     platform/reference_media_platform.cpp
     platform/simulated_platform.cpp
 )
@@ -114,6 +107,22 @@ target_link_libraries(
     PUBLIC EAVP::control EAVP::management
     PRIVATE $<BUILD_INTERFACE:eavp_project_options>
 )
+if(EAVP_ENABLE_LINUX_RUNTIME)
+    target_sources(eavp_platform PRIVATE
+        platform/linux/linux_event_loop.cpp
+        platform/linux/linux_runtime_api.cpp
+        platform/linux/platform_runtime.cpp
+    )
+    target_link_libraries(eavp_platform PUBLIC Threads::Threads)
+endif()
+if(EAVP_ENABLE_V4L2)
+    target_sources(eavp_platform PRIVATE
+        platform/linux/v4l2_capture_config.cpp
+        platform/linux/v4l2_capture.cpp
+        platform/linux/v4l2_linux_api.cpp
+        platform/linux/v4l2_system.cpp
+    )
+endif()
 if(EAVP_ENABLE_ALSA)
     target_sources(eavp_platform PRIVATE
         platform/linux/alsa_capture.cpp

@@ -3,6 +3,8 @@
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
 set(EAVP_ALSA_ENABLED @EAVP_ENABLE_ALSA@)
+set(EAVP_LINUX_RUNTIME_ENABLED @EAVP_ENABLE_LINUX_RUNTIME@)
+set(EAVP_V4L2_ENABLED @EAVP_ENABLE_V4L2@)
 if(EAVP_ALSA_ENABLED)
     find_dependency(ALSA)
 endif()
