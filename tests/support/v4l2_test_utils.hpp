@@ -12,8 +12,6 @@
 #include <vector>
 
 #include "eavp/base/status.hpp"
-#include "eavp/management/health.hpp"
-#include "eavp/management/metrics.hpp"
 #include "eavp/media/frame.hpp"
 #include "eavp/media/node.hpp"
 #include "eavp/media/port.hpp"

@@ -203,15 +203,6 @@ public:
             index, bytes_used, flags, sequence, seconds, microseconds));
     }
 
-    static std::uint8_t runtime_payload_byte(
-        std::uint32_t sequence, std::size_t offset) {
-        if (offset < 4U) {
-            return static_cast<std::uint8_t>(sequence >> (offset * 8U));
-        }
-        return static_cast<std::uint8_t>(
-            sequence * 31U + offset * 17U + 11U);
-    }
-
     void script_runtime_frames(std::size_t count) {
         runtime_mode_ = true;
         runtime_ready_outstanding_ = false;
@@ -460,6 +451,15 @@ public:
     int last_error() const override { return last_error_; }
 
 private:
+    static std::uint8_t runtime_payload_byte(
+        std::uint32_t sequence, std::size_t offset) {
+        if (offset < 4U) {
+            return static_cast<std::uint8_t>(sequence >> (offset * 8U));
+        }
+        return static_cast<std::uint8_t>(
+            sequence * 31U + offset * 17U + 11U);
+    }
+
     void signal_runtime_ready() {
         if (runtime_ready_outstanding_ || dequeued_buffers_.empty() ||
             !runtime_ready_callback_) {

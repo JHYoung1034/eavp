@@ -22,11 +22,19 @@ const std::size_t kFrameBytes = 192U;
 const std::uint64_t kFnv1aOffsetBasis = 14695981039346656037ULL;
 const std::uint64_t kFnv1aPrime = 1099511628211ULL;
 
+std::uint8_t expected_payload_byte(std::uint32_t sequence,
+                                   std::size_t offset) {
+    if (offset < 4U) {
+        return static_cast<std::uint8_t>(sequence >> (offset * 8U));
+    }
+    return static_cast<std::uint8_t>(sequence * 31U + offset * 17U + 11U);
+}
+
 std::uint64_t checksum_for(std::size_t frame_count) {
     std::uint64_t checksum = kFnv1aOffsetBasis;
     for (std::size_t frame = 0U; frame < frame_count; ++frame) {
         for (std::size_t offset = 0U; offset < kFrameBytes; ++offset) {
-            checksum ^= eavp_test::FakeV4L2Api::runtime_payload_byte(
+            checksum ^= expected_payload_byte(
                 static_cast<std::uint32_t>(frame), offset);
             checksum *= kFnv1aPrime;
         }
