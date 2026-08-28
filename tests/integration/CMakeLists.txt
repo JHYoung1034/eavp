@@ -46,3 +46,12 @@ if(EAVP_ENABLE_ALSA_DEVICE_TESTS)
     gtest_discover_tests(eavp_alsa_capture_device_tests
         TEST_PREFIX "eavp.alsa_device.")
 endif()
+
+if(EAVP_ENABLE_V4L2_DEVICE_TESTS)
+    add_executable(eavp_v4l2_capture_device_tests
+                   v4l2_capture_device_test.cpp)
+    target_link_libraries(eavp_v4l2_capture_device_tests
+                          PRIVATE EAVP::platform GTest::gtest_main)
+    gtest_discover_tests(eavp_v4l2_capture_device_tests
+        TEST_PREFIX "eavp.v4l2_device.")
+endif()
