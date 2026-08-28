@@ -26,7 +26,9 @@ Status internal_error() { return Status(StatusCode::kInternal); }
 
 std::uint32_t epoll_interests(short events) {
     std::uint32_t interests = 0U;
-    if ((events & POLLIN) != 0) interests |= EPOLLIN;
+    if ((events & static_cast<short>(POLLIN | POLLRDNORM)) != 0) {
+        interests |= EPOLLIN;
+    }
     if ((events & POLLOUT) != 0) interests |= EPOLLOUT;
     if ((events & POLLPRI) != 0) interests |= EPOLLPRI;
     return interests;
@@ -39,6 +41,17 @@ short poll_events(std::uint32_t events) {
     if ((events & EPOLLPRI) != 0U) translated |= POLLPRI;
     if ((events & EPOLLERR) != 0U) translated |= POLLERR;
     if ((events & EPOLLHUP) != 0U) translated |= POLLHUP;
+    return translated;
+}
+
+short requested_poll_events(std::uint32_t events, short requested_events) {
+    short translated = static_cast<short>(
+        poll_events(events) & static_cast<short>(~(POLLIN | POLLRDNORM)));
+    if ((events & EPOLLIN) != 0U) {
+        const short requested_read = static_cast<short>(
+            requested_events & static_cast<short>(POLLIN | POLLRDNORM));
+        translated |= requested_read == 0 ? POLLIN : requested_read;
+    }
     return translated;
 }
 
@@ -215,7 +228,8 @@ Status LinuxEventLoop::register_source(MediaPipeline* pipeline,
         if (descriptors.empty()) return Status(StatusCode::kInvalidArgument);
 
         std::set<int> local_fds;
-        const short allowed = static_cast<short>(POLLIN | POLLOUT | POLLPRI);
+        const short allowed = static_cast<short>(
+            POLLIN | POLLRDNORM | POLLOUT | POLLPRI);
         for (std::size_t index = 0U; index < descriptors.size(); ++index) {
             const short requested = descriptors[index].events;
             if (descriptors[index].fd < 0 || requested == 0 ||
@@ -365,7 +379,9 @@ Result<LinuxEventLoopTurn> LinuxEventLoop::wait_once() {
             if (found == impl_->tokens.end()) continue;
             Impl::SourceRecord& source = impl_->sources[found->second.source_index];
             source.descriptors[found->second.descriptor_index].revents |=
-                poll_events(events[static_cast<std::size_t>(event_index)].events);
+                requested_poll_events(
+                    events[static_cast<std::size_t>(event_index)].events,
+                    source.descriptors[found->second.descriptor_index].events);
             ready_sources.insert(found->second.source_index);
         }
 

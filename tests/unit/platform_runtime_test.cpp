@@ -1460,24 +1460,38 @@ TEST(LinuxEventLoopTest,
 TEST(LinuxEventLoopTest, RegistersLevelTriggeredPollInterestsExactly) {
     RuntimeFixture fixture;
     const struct pollfd input = {10, static_cast<short>(POLLIN), 0};
+    const struct pollfd normal_input = {
+        12, static_cast<short>(POLLRDNORM), 0};
     const struct pollfd output_priority = {
         11, static_cast<short>(POLLOUT | POLLPRI), 0};
     fixture.source_a.set_descriptors(
-        std::vector<pollfd>{input, output_priority});
+        std::vector<pollfd>{input, normal_input, output_priority});
 
     ASSERT_TRUE(fixture.loop->initialize().ok());
     ASSERT_TRUE(fixture.loop->register_source(
         &fixture.pipeline, &fixture.source_a).ok());
 
-    ASSERT_EQ(3U, fixture.api->add_calls.size());
+    ASSERT_EQ(4U, fixture.api->add_calls.size());
     EXPECT_EQ(EPOLLIN, fixture.api->add_calls[0].events);
     EXPECT_EQ(EPOLLIN, fixture.api->add_calls[1].events);
+    EXPECT_EQ(EPOLLIN, fixture.api->add_calls[2].events);
     EXPECT_EQ(static_cast<std::uint32_t>(EPOLLOUT | EPOLLPRI),
-              fixture.api->add_calls[2].events);
+              fixture.api->add_calls[3].events);
     EXPECT_EQ(0U, fixture.api->add_calls[1].events &
                       static_cast<std::uint32_t>(EPOLLET | EPOLLONESHOT));
     EXPECT_EQ(0U, fixture.api->add_calls[2].events &
                       static_cast<std::uint32_t>(EPOLLET | EPOLLONESHOT));
+    EXPECT_EQ(0U, fixture.api->add_calls[3].events &
+                      static_cast<std::uint32_t>(EPOLLET | EPOLLONESHOT));
+
+    fixture.api->queue_ready_fds(std::vector<int>(1U, 12));
+    const eavp::Result<eavp::detail::LinuxEventLoopTurn> ready =
+        fixture.loop->wait_once();
+    ASSERT_TRUE(ready.ok());
+    ASSERT_EQ(3U, fixture.source_a.evaluated_descriptors().size());
+    EXPECT_EQ(static_cast<short>(POLLRDNORM),
+              fixture.source_a.evaluated_descriptors()[1].revents);
+    ASSERT_EQ(1U, ready.value().ready_pipelines.size());
 }
 
 TEST(LinuxEventLoopTest, RejectsEmptyInvalidAndDuplicateDescriptors) {
