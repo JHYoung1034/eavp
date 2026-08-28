@@ -237,9 +237,14 @@ protected:
             condition_.notify_all();
         }
         char value = 0;
-        if (ready_fd_ >= 0) (void)::read(ready_fd_, &value, sizeof(value));
+        if (ready_fd_ >= 0) {
+            const ssize_t ignored = ::read(ready_fd_, &value, sizeof(value));
+            (void)ignored;
+        }
         if (additional_ready_fd_ >= 0) {
-            (void)::read(additional_ready_fd_, &value, sizeof(value));
+            const ssize_t ignored =
+                ::read(additional_ready_fd_, &value, sizeof(value));
+            (void)ignored;
         }
         {
             std::unique_lock<std::mutex> lock(mutex_);
