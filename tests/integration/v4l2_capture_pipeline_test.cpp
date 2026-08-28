@@ -112,10 +112,13 @@ private:
 
 class V4L2RuntimePipeline {
 public:
-    explicit V4L2RuntimePipeline(std::size_t frame_count)
+    V4L2RuntimePipeline()
         : metrics(), health(), trace(new eavp_test::FakeV4L2Trace()),
           capture_observer(&metrics, &health), runtime_api(NULL),
           pipeline("v4l2-runtime-live"), sink(NULL), wait_source(), runtime() {
+    }
+
+    eavp::Status initialize(std::size_t frame_count) {
         std::unique_ptr<eavp_test::FakeLinuxRuntimeApi> fake_runtime(
             new eavp_test::FakeLinuxRuntimeApi());
         runtime_api = fake_runtime.get();
@@ -137,35 +140,49 @@ public:
         std::unique_ptr<eavp::detail::V4L2System> system(
             new eavp::detail::V4L2System(
                 std::unique_ptr<eavp::detail::V4L2Api>(fake_v4l2.release())));
-        const eavp::V4L2CaptureConfig capture_config =
-            eavp::V4L2CaptureConfig::create(
-                "/dev/video-test", eavp::PixelFormat::kYuv420p,
-                16, 8, 30, 1, 3U).take_value();
-        std::unique_ptr<eavp::V4L2SourceNode> capture =
+        const eavp::Result<eavp::V4L2CaptureConfig> capture_config =
+            eavp::V4L2CaptureConfig::create("/dev/video-test",
+                                            eavp::PixelFormat::kYuv420p,
+                                            16, 8, 30, 1, 3U);
+        if (!capture_config.ok()) return capture_config.status();
+        eavp::Result<std::unique_ptr<eavp::V4L2SourceNode> > capture_result =
             eavp::detail::V4L2SourceNodeTestPeer::create(
-                "camera0", capture_config, &metrics, std::move(system),
+                "camera0", capture_config.value(), &metrics, std::move(system),
                 std::unique_ptr<eavp::detail::V4L2FrameAllocator>(
-                    new CpuFrameAllocator()), &capture_observer).take_value();
+                    new CpuFrameAllocator()),
+                &capture_observer);
+        if (!capture_result.ok()) return capture_result.status();
+        std::unique_ptr<eavp::V4L2SourceNode> capture =
+            capture_result.take_value();
         wait_source.reset(
             new eavp_test::RuntimeV4L2WaitSource(capture.get()));
         std::unique_ptr<eavp_test::FrameChecksumSink> owned_sink(
             new eavp_test::FrameChecksumSink());
         sink = owned_sink.get();
-        EXPECT_TRUE(eavp::connect(capture->output(), sink->input()).ok());
-        EXPECT_TRUE(pipeline.add_node(std::move(capture)).ok());
-        EXPECT_TRUE(pipeline.add_node(std::move(owned_sink)).ok());
-        EXPECT_TRUE(pipeline.connect("camera0", "frame-checksum").ok());
+        const eavp::Status connected =
+            eavp::connect(capture->output(), sink->input());
+        if (!connected.ok()) return connected;
+        const eavp::Status added_capture = pipeline.add_node(std::move(capture));
+        if (!added_capture.ok()) return added_capture;
+        const eavp::Status added_sink = pipeline.add_node(std::move(owned_sink));
+        if (!added_sink.ok()) return added_sink;
+        const eavp::Status linked =
+            pipeline.connect("camera0", "frame-checksum");
+        if (!linked.ok()) return linked;
 
-        const eavp::LinuxPlatformRuntimeConfig runtime_config =
-            eavp::LinuxPlatformRuntimeConfig::create(1, 2000).take_value();
-        runtime = eavp::detail::LinuxPlatformRuntimeTestPeer::create(
-            runtime_config,
-            std::unique_ptr<eavp::detail::LinuxRuntimeApi>(
-                fake_runtime.release())).take_value();
-        EXPECT_TRUE(runtime->register_pipeline(
+        const eavp::Result<eavp::LinuxPlatformRuntimeConfig> runtime_config =
+            eavp::LinuxPlatformRuntimeConfig::create(1, 2000);
+        if (!runtime_config.ok()) return runtime_config.status();
+        eavp::Result<std::unique_ptr<eavp::LinuxPlatformRuntime> > runtime_result =
+            eavp::detail::LinuxPlatformRuntimeTestPeer::create(
+                runtime_config.value(),
+                std::unique_ptr<eavp::detail::LinuxRuntimeApi>(
+                    fake_runtime.release()));
+        if (!runtime_result.ok()) return runtime_result.status();
+        runtime = runtime_result.take_value();
+        return runtime->register_pipeline(
             &pipeline,
-            std::vector<eavp::LinuxWaitSource*>(
-                1U, wait_source.get())).ok());
+            std::vector<eavp::LinuxWaitSource*>(1U, wait_source.get()));
     }
 
     ~V4L2RuntimePipeline() {
@@ -197,7 +214,8 @@ public:
 };
 
 TEST(V4L2CapturePipelineTest, CapturesExactlyThreeHundredFramesViaRuntime) {
-    V4L2RuntimePipeline fixture(300U);
+    V4L2RuntimePipeline fixture;
+    ASSERT_TRUE(fixture.initialize(300U).ok());
     const eavp::Status start_status = fixture.runtime->start();
     ASSERT_TRUE(start_status.ok())
         << "code=" << static_cast<int>(start_status.code())
@@ -231,6 +249,28 @@ TEST(V4L2CapturePipelineTest, CapturesExactlyThreeHundredFramesViaRuntime) {
               fixture.health.component("v4l2.capture").value().status);
     EXPECT_EQ(300U, fixture.trace->dequeued_buffer_types.size());
     EXPECT_EQ(0, fixture.open_handles());
+}
+
+TEST(V4L2CapturePipelineTest,
+     ContinuesCapturingAfterWaitPredicateReachesTheTarget) {
+    V4L2RuntimePipeline fixture;
+    ASSERT_TRUE(fixture.initialize(32U).ok());
+    ASSERT_TRUE(fixture.runtime->start().ok());
+
+    ASSERT_TRUE(fixture.wait_until_sink_frames(8U, 5000));
+    ASSERT_TRUE(fixture.wait_until_sink_frames(9U, 5000));
+
+    const eavp::Status stop_status = fixture.runtime->stop();
+    ASSERT_TRUE(stop_status.ok());
+
+    const std::size_t final_frames = fixture.sink->frame_count();
+    EXPECT_GT(final_frames, 8U);
+    const eavp::Result<std::uint64_t> captured_metric =
+        fixture.metrics.counter("v4l2.frames.captured");
+    ASSERT_TRUE(captured_metric.ok());
+    EXPECT_EQ(static_cast<std::uint64_t>(final_frames),
+              captured_metric.value());
+    EXPECT_EQ(0U, fixture.sink->dropped_count());
 }
 
 }  // namespace

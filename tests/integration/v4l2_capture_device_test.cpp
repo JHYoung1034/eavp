@@ -621,7 +621,8 @@ TEST(V4L2CaptureDeviceTest, CapturesConfiguredFramesViaRuntime) {
     EXPECT_TRUE(stopped.ok()) << status_description(stopped);
     EXPECT_EQ(eavp::PlatformRuntimeState::kStopped, runtime->state());
     EXPECT_EQ(eavp::PipelineState::kStopped, pipeline.state());
-    EXPECT_EQ(static_cast<std::size_t>(config.frame_count), observed_sink->frames());
+    const std::size_t final_frames = observed_sink->frames();
+    EXPECT_GE(final_frames, static_cast<std::size_t>(config.frame_count));
     EXPECT_TRUE(observed_sink->pts_monotonic());
     EXPECT_TRUE(observed_sink->layouts_consistent());
     EXPECT_FALSE(observed_sink->layouts().empty());
@@ -632,8 +633,7 @@ TEST(V4L2CaptureDeviceTest, CapturesConfiguredFramesViaRuntime) {
     const eavp::Result<std::uint64_t> frames_metric =
         metrics.counter("v4l2.frames.captured");
     ASSERT_TRUE(frames_metric.ok()) << status_description(frames_metric.status());
-    EXPECT_EQ(static_cast<std::uint64_t>(config.frame_count),
-              frames_metric.value());
+    EXPECT_EQ(static_cast<std::uint64_t>(final_frames), frames_metric.value());
     const eavp::Result<eavp::HealthComponent> component =
         health.component("v4l2_device/pipeline");
     ASSERT_TRUE(component.ok()) << status_description(component.status());
