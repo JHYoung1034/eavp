@@ -30,6 +30,7 @@ public:
     virtual void on_reactor_waiting_for_wake() {}
     virtual void on_join_owner_claimed() {}
     virtual void on_join_waiter() {}
+    virtual void on_startup_result_ready() {}
     virtual void on_reactor_thread_finishing() {}
     virtual PlatformRuntimeState snapshot_state(PlatformRuntimeState state) {
         return state;

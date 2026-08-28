@@ -207,7 +207,9 @@ public:
           runtime_api_(api.get()), loop_(new detail::LinuxEventLoop(std::move(api))),
           state_(PlatformRuntimeState::kCreated),
           last_failure_(StatusCode::kInvalidState),
-          stop_result_(Status::ok_status()), thread_exited_(false),
+          stop_result_(Status::ok_status()),
+          startup_result_(StatusCode::kInvalidState),
+          startup_completed_(false), thread_exited_(false),
           stop_requested_(false), reactor_exiting_(false), wake_in_flight_(0U),
           join_claimed_(false), join_completed_(false),
           pipelines_(), registered_pipelines_(), registered_sources_(),
@@ -291,11 +293,15 @@ public:
             join_claimed_ = false;
             join_completed_ = false;
             stop_result_ = Status::ok_status();
+            startup_result_ = Status(StatusCode::kInvalidState);
+            startup_completed_ = false;
             try {
                 reactor_thread_ = std::thread(&Impl::reactor_main, this);
             } catch (const std::bad_alloc&) {
                 last_failure_ = allocation_failure();
                 stop_result_ = last_failure_;
+                startup_result_ = last_failure_;
+                startup_completed_ = true;
                 state_ = PlatformRuntimeState::kError;
                 thread_exited_ = true;
                 condition_.notify_all();
@@ -303,6 +309,8 @@ public:
             } catch (...) {
                 last_failure_ = internal_failure();
                 stop_result_ = last_failure_;
+                startup_result_ = last_failure_;
+                startup_completed_ = true;
                 state_ = PlatformRuntimeState::kError;
                 thread_exited_ = true;
                 condition_.notify_all();
@@ -310,12 +318,14 @@ public:
             }
 
             condition_.wait(lock, [this]() {
-                return state_ == PlatformRuntimeState::kRunning ||
-                       state_ == PlatformRuntimeState::kError ||
-                       thread_exited_;
+                return startup_completed_;
             });
-            const bool started = state_ == PlatformRuntimeState::kRunning;
-            const Status result = started ? Status::ok_status() : last_failure_;
+            lock.unlock();
+            invoke_hook_noexcept(
+                [this]() { hooks_->on_startup_result_ready(); });
+            lock.lock();
+            const Status result = startup_result_;
+            const bool started = result.ok();
             lock.unlock();
             if (!started) join_reactor();
             return result;
@@ -548,6 +558,12 @@ private:
         }
         thread_exited_ = true;
         stop_result_ = final_failure;
+        if (!startup_completed_) {
+            startup_result_ = final_failure.ok()
+                                  ? internal_failure()
+                                  : final_failure;
+            startup_completed_ = true;
+        }
         if (final_failure.ok()) {
             state_ = PlatformRuntimeState::kStopped;
         } else {
@@ -716,6 +732,8 @@ private:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             state_ = PlatformRuntimeState::kRunning;
+            startup_result_ = Status::ok_status();
+            startup_completed_ = true;
             condition_.notify_all();
         }
 
@@ -797,6 +815,8 @@ private:
     PlatformRuntimeState state_;
     Status last_failure_;
     Status stop_result_;
+    Status startup_result_;
+    bool startup_completed_;
     bool thread_exited_;
     bool stop_requested_;
     bool reactor_exiting_;

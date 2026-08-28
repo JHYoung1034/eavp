@@ -591,6 +591,38 @@ private:
     bool allow_later_join_owners_;
 };
 
+class StartupResultProbe : public eavp::detail::RuntimeTestHooks {
+public:
+    StartupResultProbe()
+        : entered_(false), released_(false) {}
+
+    void on_startup_result_ready() override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        entered_ = true;
+        condition_.notify_all();
+        while (!released_) condition_.wait(lock);
+    }
+
+    bool wait_until_entered() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2), [this]() {
+            return entered_;
+        });
+    }
+
+    void release() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_ = true;
+        condition_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool entered_;
+    bool released_;
+};
+
 class InstrumentedLinuxRuntimeApi : public eavp::detail::LinuxRuntimeApi {
 public:
     explicit InstrumentedLinuxRuntimeApi(RuntimeConcurrencyProbe* probe = NULL)
@@ -833,6 +865,25 @@ TEST(LinuxPlatformRuntimeTest, JoinsTheReactorBeforeStartFailureReturns) {
     EXPECT_GE(resets_after_return, 1);
     EXPECT_EQ(resets_after_return, harness.node->reset_count());
     EXPECT_EQ(eavp::StatusCode::kDeviceLost, runtime->stop().code());
+}
+
+TEST(LinuxPlatformRuntimeTest, StartFailureReturnsTheLatchedEnrichedStatus) {
+    const eavp::Status failure(
+        eavp::StatusCode::kDeviceLost, "camera disappeared",
+        "camera", "start", ENODEV);
+    RuntimePipelineHarness harness("enriched-start-failure", failure);
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime = create_runtime();
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+
+    const eavp::Status started = runtime->start();
+
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, started.code());
+    EXPECT_EQ("camera disappeared", started.message());
+    EXPECT_EQ("camera", started.provider_id());
+    EXPECT_EQ("start", started.operation());
+    EXPECT_EQ(ENODEV, started.native_code());
+    EXPECT_EQ(started.code(), runtime->stop().code());
 }
 
 TEST(LinuxPlatformRuntimeTest, StopWakesAReactorBlockedInEpoll) {
@@ -1429,6 +1480,37 @@ TEST(LinuxPlatformRuntimeTest, StartFailureAndStopShareOneJoinOwner) {
     stopper.join();
     EXPECT_EQ(eavp::StatusCode::kDeviceLost, started.code());
     EXPECT_EQ(eavp::StatusCode::kDeviceLost, stopped.code());
+}
+
+TEST(LinuxPlatformRuntimeTest,
+     StartReturnsLatchedSuccessWhenConcurrentStopFinishesFirst) {
+    StartupResultProbe probe;
+    RuntimePipelineHarness harness("startup-result-latch");
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_injected_runtime(
+            eavp::detail::create_linux_runtime_api(), NULL, &probe);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+
+    eavp::Status started(eavp::StatusCode::kInvalidState);
+    std::thread starter([&]() { started = runtime->start(); });
+    const bool startup_result_ready = probe.wait_until_entered();
+    if (!startup_result_ready) {
+        const eavp::Status stopped = runtime->stop();
+        starter.join();
+        EXPECT_TRUE(startup_result_ready);
+        EXPECT_TRUE(stopped.ok());
+        return;
+    }
+
+    const eavp::Status stopped = runtime->stop();
+    probe.release();
+    starter.join();
+
+    EXPECT_TRUE(stopped.ok());
+    EXPECT_TRUE(started.ok());
+    EXPECT_EQ(eavp::StatusCode::kOk, started.code());
+    EXPECT_EQ(eavp::PlatformRuntimeState::kStopped, runtime->state());
 }
 
 TEST(LinuxPlatformRuntimeTest, WaitSourceFailureRemainsTheFirstMediaCause) {
