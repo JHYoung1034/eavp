@@ -171,6 +171,18 @@ void MappedRegion::unmap() {
 }
 
 Result<Buffer> Buffer::allocate(std::size_t size) {
+    try {
+        return allocate(size, std::vector<PlaneLayout>(1U, PlaneLayout(0U, size, size)));
+    } catch (const std::bad_alloc&) {
+        return Result<Buffer>(
+            Status(StatusCode::kResourceExhausted, "failed to allocate CPU buffer storage"));
+    } catch (...) {
+        return Result<Buffer>(Status(StatusCode::kInternal));
+    }
+}
+
+Result<Buffer> Buffer::allocate(std::size_t size,
+                                const std::vector<PlaneLayout>& planes) {
     if (size == 0U) {
         return Result<Buffer>(
             Status(StatusCode::kInvalidArgument, "buffer size must be positive"));
@@ -178,12 +190,11 @@ Result<Buffer> Buffer::allocate(std::size_t size) {
 
     try {
         std::shared_ptr<BufferStorage> storage(new CpuBufferStorage(size));
-        std::vector<PlaneLayout> planes;
-        planes.push_back(PlaneLayout(0U, size, size));
         return create(storage, planes);
     } catch (const std::bad_alloc&) {
-        return Result<Buffer>(
-            Status(StatusCode::kResourceExhausted, "failed to allocate CPU buffer storage"));
+        return Result<Buffer>(Status(StatusCode::kResourceExhausted));
+    } catch (...) {
+        return Result<Buffer>(Status(StatusCode::kInternal));
     }
 }
 

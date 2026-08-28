@@ -70,6 +70,18 @@ Status validate_format(PixelFormat pixel_format, int width, int height,
     const std::size_t pixel_height = static_cast<std::size_t>(height);
 
     switch (pixel_format) {
+    case PixelFormat::kYuyv422:
+        if (width % 2 != 0) {
+            return Status(StatusCode::kUnsupported,
+                          "YUYV422 with an odd width is unsupported");
+        }
+        if (planes.size() != 1U) {
+            return invalid_format("YUYV422 requires one plane");
+        }
+        if (pixel_width > std::numeric_limits<std::size_t>::max() / 2U) {
+            return invalid_format("YUYV422 stride overflows");
+        }
+        return validate_plane(planes[0], pixel_width * 2U, pixel_height);
     case PixelFormat::kRgb24:
         if (planes.size() != 1U) {
             return invalid_format("RGB24 requires one plane");
@@ -129,6 +141,8 @@ Result<std::string> pixel_format_name(PixelFormat pixel_format) noexcept {
                 return Result<std::string>(std::string("yuv420p"));
             case PixelFormat::kRgb24:
                 return Result<std::string>(std::string("rgb24"));
+            case PixelFormat::kYuyv422:
+                return Result<std::string>(std::string("yuyv422"));
             case PixelFormat::kUnknown:
                 break;
         }

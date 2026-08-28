@@ -332,6 +332,28 @@ Result<std::unique_ptr<AlsaSourceNode> > AlsaSourceNode::create(
 
 OutputPort<AudioFrame>& AlsaSourceNode::output() { return impl_->output; }
 
+Result<std::vector<struct pollfd> > AlsaSourceNode::poll_descriptors() {
+    try {
+        return impl_->system->poll_descriptors();
+    } catch (const std::bad_alloc&) {
+        return Result<std::vector<struct pollfd> >(allocation_failure());
+    } catch (...) {
+        return Result<std::vector<struct pollfd> >(
+            Status(StatusCode::kInternal));
+    }
+}
+
+Result<bool> AlsaSourceNode::evaluate_poll_events(
+    const std::vector<struct pollfd>& descriptors) {
+    try {
+        return impl_->system->evaluate_poll_events(descriptors);
+    } catch (const std::bad_alloc&) {
+        return Result<bool>(allocation_failure());
+    } catch (...) {
+        return Result<bool>(Status(StatusCode::kInternal));
+    }
+}
+
 Status AlsaSourceNode::on_prepare() {
     try {
         const Status system_status = impl_->system->prepare(impl_->config);

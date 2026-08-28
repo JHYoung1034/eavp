@@ -383,6 +383,7 @@ bool PlaneLayoutConstraint::valid() const {
 bool FormatMemoryDomain::valid() const {
     std::size_t expected_plane_count = 0U;
     switch (pixel_format_) {
+        case PixelFormat::kYuyv422:
         case PixelFormat::kRgb24:
             expected_plane_count = 1U;
             break;

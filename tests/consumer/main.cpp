@@ -6,9 +6,14 @@
 #include "eavp/management/health.hpp"
 #include "eavp/management/metrics.hpp"
 #include "eavp/platform/linux/alsa_capture.hpp"
+#include "eavp/platform/linux/platform_runtime.hpp"
+#include "eavp/platform/linux/v4l2_capture.hpp"
 #include "eavp/platform/simulated_platform.hpp"
 
 int main() {
+    eavp::MetricRegistry metrics;
+    eavp::HealthManager health;
+
     const std::vector<eavp::PlaneLayout> planes{
         eavp::PlaneLayout(0U, 12U, 6U)};
     eavp::Result<eavp::Buffer> buffer_result = eavp::Buffer::allocate(12U);
@@ -50,12 +55,39 @@ int main() {
         return 1;
     }
 #if defined(EAVP_CONSUMER_ALSA_ENABLED)
-    eavp::MetricRegistry metrics;
-    eavp::HealthManager health;
     eavp::Result<std::unique_ptr<eavp::AlsaSourceNode> > alsa_source_result =
         eavp::AlsaSourceNode::create(
             "consumer-alsa", alsa_config_result.value(), &metrics, &health);
     if (!alsa_source_result.ok()) {
+        return 1;
+    }
+#endif
+
+#if defined(EAVP_CONSUMER_LINUX_RUNTIME_ENABLED)
+    eavp::Result<eavp::LinuxPlatformRuntimeConfig> runtime_config =
+        eavp::LinuxPlatformRuntimeConfig::create(1, 5000);
+    if (!runtime_config.ok()) {
+        return 1;
+    }
+    eavp::Result<std::unique_ptr<eavp::LinuxPlatformRuntime> > runtime =
+        eavp::LinuxPlatformRuntime::create(runtime_config.value(), &metrics);
+    if (!runtime.ok()) {
+        return 1;
+    }
+#endif
+
+#if defined(EAVP_CONSUMER_V4L2_ENABLED)
+    eavp::Result<eavp::V4L2CaptureConfig> v4l2_config =
+        eavp::V4L2CaptureConfig::create(
+            "/dev/video10", eavp::PixelFormat::kYuv420p,
+            1920, 1080, 30, 1, 4U);
+    if (!v4l2_config.ok()) {
+        return 1;
+    }
+    eavp::Result<std::unique_ptr<eavp::V4L2SourceNode> > v4l2_source =
+        eavp::V4L2SourceNode::create(
+            "consumer-v4l2", v4l2_config.value(), &metrics);
+    if (!v4l2_source.ok()) {
         return 1;
     }
 #endif

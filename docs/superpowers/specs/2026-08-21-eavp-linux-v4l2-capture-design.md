@@ -1,6 +1,6 @@
 # EAVP Linux V4L2 Capture 0.3a 设计规格
 
-> 状态：已批准
+> 状态：已实现（2026-08-28）
 >
 > 适用版本：`0.3.0` 开发阶段，稳定版本仍为 `0.2.0`
 >
@@ -180,12 +180,17 @@ Node 不创建私有线程，设备以 `O_RDWR | O_NONBLOCK | O_CLOEXEC` 打开�
 | Node 操作 | V4L2 行为 | 结果 |
 |---|---|---|
 | `prepare` | open、QUERYCAP、S/G_FMT、S/G_PARM、REQBUFS、QUERYBUF、mmap | Prepared |
-| `start` | 全部 QBUF 后 STREAMON | Running |
+| `start` | 全部 QBUF 后 STREAMON；失败时 STREAMOFF 清除已排队 Buffer | Running，或回到 Prepared |
 | `tick` | 至多一次 DQBUF/copy/QBUF/send | Running 或 Error |
 | `stop` | 立即 STREAMOFF，丢弃内部 pending | Stopped |
 | `reset` | munmap、REQBUFS(0)、close | Created |
 
 stop 不再采集新 Frame；已经进入端口队列的 Frame 由现有 Pipeline 继续排空。尚未进入队列的 pending Frame 在 stop 时丢弃，并计入 `v4l2.frames.dropped_on_stop`。重复 stop/reset 必须幂等。
+
+start 的 QBUF 部分失败或 STREAMON 失败必须保留原始失败为首因，并用
+STREAMOFF 清除本次已排队 Buffer；回滚成功后会话保持 Prepared，允许再次
+start。若回滚 STREAMOFF 失败，会话不得伪装为可重试状态，必须继续完整
+reset/close 收束到 Created，同时仍向调用方返回原始 QBUF/STREAMON 失败。
 
 所有 `open`/`ioctl` 的 `EINTR` 最多重试 64 次；达到上限后返回 enriched I/O 错误，避免单线程 Executor 永久停留在一次 tick 中。DQBUF 成功后，无论复制或 Frame 构造是否成功都必须尝试 QBUF；若原媒体操作和 QBUF 同时失败，优先返回会破坏后续驱动队列可用性的 QBUF 错误。
 
@@ -364,7 +369,17 @@ FFmpeg 错误转换为 enriched Status：`provider_id="ffmpeg"`、operation 为�
 
 FFmpeg Backend 只验证平台架构、Backend 契约和标准码流数据流，不代表 ARM 产品将携带 FFmpeg。嵌入式部署仍优先使用 SoC 厂商媒体接口。
 
-## 14. 参考依据
+## 14. 实现与验收记录
+
+本规格的 0.3a V4L2 实现已于 2026-08-28 完成开发验收；稳定安装包版本仍为 `0.2.0`。以下记录只证明单平面 MMAP CPU Frame 采集，不宣称 DMABUF、M2M、硬件编码、容器或协议能力已实现。
+
+- Host clean 矩阵执行 `linux-debug`、`linux-release`、`linux-asan`、`linux-tsan` 的 configure、`--target clean`、build 与 CTest。Debug、Release、ASan/UBSan 控制台汇总均为 314/314 通过；TSan 控制台汇总为 313/313 通过，按既有裁定排除嵌套安装消费工程；四套均只有 64-bit 上不可达的 size-type 溢出用例按设计 skip 一次。
+- 真实设备验收执行 `EAVP_V4L2_DEVICE=/dev/video10 EAVP_V4L2_FRAME_COUNT=300 EAVP_V4L2_TIMEOUT_SECONDS=20 EAVP_V4L2_PIXEL_FORMAT=yuv420p EAVP_V4L2_WIDTH=1920 EAVP_V4L2_HEIGHT=1080 EAVP_V4L2_FPS_NUMERATOR=30 EAVP_V4L2_FPS_DENOMINATOR=1 EAVP_V4L2_BUFFER_COUNT=4 ctest --test-dir build/linux-v4l2-device -R '^eavp\\.v4l2_device\\.' --output-on-failure`；2 项通过，Runtime 驱动的采集用例在约 10 秒内完成 300 帧。
+- 安装消费工程复验通过；`EAVPConfig.cmake` 导出 Runtime、V4L2 与 ALSA 能力变量，消费工程仅在能力存在时引用对应 factory。
+- ARM clean 验证分别对 `aarch64-release`、`rockchip-armhf-release`、`hisiv600-release` 执行 configure、`--target clean` 和 build；每套构建 32 个目标，`v4l2_system.cpp.o` 分别为 `ELF64 / AArch64`、`ELF32 / ARM`、`ELF32 / ARM`。
+- 最终范围检查确认 0.3a target 无 FFmpeg、libv4l2、Rockchip MPP/RGA 或海思 `HI_MPI` 生产依赖，且 `include/eavp/media`、`include/eavp/base` 未包含 Linux 平台头。
+
+## 15. 参考依据
 
 - Linux Kernel V4L2 capture 示例：`https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/capture.c.html`
 - Linux Kernel V4L2 MMAP streaming：`https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/mmap.html`

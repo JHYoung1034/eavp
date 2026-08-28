@@ -9,6 +9,7 @@
 #include "eavp/media/frame.hpp"
 #include "eavp/media/node.hpp"
 #include "eavp/media/port.hpp"
+#include "eavp/platform/linux/wait_source.hpp"
 
 namespace eavp {
 
@@ -46,7 +47,7 @@ private:
     int buffer_periods_;
 };
 
-class AlsaSourceNode : public MediaNode {
+class AlsaSourceNode : public MediaNode, public LinuxWaitSource {
 public:
     static Result<std::unique_ptr<AlsaSourceNode> > create(
         const std::string& id, const AlsaCaptureConfig& config,
@@ -54,6 +55,9 @@ public:
     ~AlsaSourceNode() noexcept;
 
     OutputPort<AudioFrame>& output();
+    Result<std::vector<struct pollfd> > poll_descriptors() override;
+    Result<bool> evaluate_poll_events(
+        const std::vector<struct pollfd>& descriptors) override;
 
 protected:
     Status on_prepare() override;

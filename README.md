@@ -1,6 +1,6 @@
 # EAVP
 
-EAVP（Embedded Audio/Video Platform）是面向 Embedded Linux 音视频设备的通用产品底座。稳定安装包版本仍为 `0.2.0`；仓库同时包含已验收的 `0.3b` Linux ALSA 音频采集开发能力，它不是完整产品功能。
+EAVP（Embedded Audio/Video Platform）是面向 Embedded Linux 音视频设备的通用产品底座。稳定安装包版本仍为 `0.2.0`；仓库同时包含已完成开发验收的 `0.3a` Linux Runtime/V4L2 视频采集能力和 `0.3b` Linux ALSA 音频采集能力，它们还不是完整产品功能。
 
 ## 当前能力
 
@@ -9,10 +9,12 @@ EAVP（Embedded Audio/Video Platform）是面向 Embedded Linux 音视频设备�
 - Provider Capability、冻结后的确定性 BackendRegistry，以及仅用于测试和集成验证的 Reference Backend。
 - Command/Query、Desired/Actual StateStore 与幂等 Reconciler。
 - Counter、Gauge、Health，以及单进程模拟媒体纵切面。
+- `0.3a` 的 Linux Platform Runtime：`epoll + eventfd` Reactor、统一线程生命周期、串行 Pipeline tick、ThreadSanitizer 验证、安装消费工程能力导出。
+- `0.3a` 的 Linux V4L2 非阻塞 MMAP Capture：YUV420P/NV12/YUYV422 到 CPU `VideoFrame` 的严格映射、Runtime 驱动采集、Metrics/Health，以及 `/dev/video10` 300 帧设备验收。
 - `0.3b` 的 Linux ALSA 非阻塞 PCM Capture：CPU `AudioFormat`/`AudioFrame`、首采样点 PTS、XRUN/suspend discontinuity、Metrics/Health，以及显式 Loopback 设备验收。
 - Linux x86_64 原生构建，以及通用 aarch64、Rockchip ARM32 和海思 v600 ARM32 的交叉编译验证配置。
 
-Reference Backend 产生的是内部确定性 `kReference` payload，不是标准 H.264/H.265 码流。`0.3b` 仅增加 Linux ALSA Capture 开发能力；V4L2、FFmpeg、硬件编解码、容器和网络协议、RPC、Web API 与 Service Mode 仍不属于稳定 `0.2.0` 包。
+Reference Backend 产生的是内部确定性 `kReference` payload，不是标准 H.264/H.265 码流。`0.3a`/`0.3b` 仅增加 Linux 本机采集与 Runtime 开发能力；FFmpeg、硬件编解码、容器和网络协议、RPC、Web API 与 Service Mode 仍不属于稳定 `0.2.0` 包。
 
 ## 快速开始
 
@@ -34,7 +36,7 @@ Release 和 Sanitizer 环境没有系统 GoogleTest 时，分别使用 `linux-re
 
 安装和消费示例见 `docs/architecture/build-and-portability.md`。
 
-ARM 交叉构建仅验证 Core（含平台无关的 AudioFormat/AudioFrame）和 Reference Backend 可被对应编译器生成和链接，且 ARM 预设关闭 ALSA；不代表 ARM libasound 链接、ALSA 设备验证、Rockchip MPP/RGA 或海思 HI_MPI 已接入。
+ARM 交叉构建验证 Core、Reference Backend、Linux Runtime 与 V4L2 代码可被对应编译器生成和链接，且 ARM 预设关闭 ALSA 与真实设备测试；不代表 ARM libasound 链接、目标板运行、ALSA 设备验证、Rockchip MPP/RGA 或海思 HI_MPI 已接入。
 
 ## 文档
 

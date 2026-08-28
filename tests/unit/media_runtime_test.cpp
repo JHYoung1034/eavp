@@ -78,6 +78,23 @@ TEST(PortTest, ConnectedPortsTransferTheSameImmutablePacket) {
     EXPECT_EQ(packet.get(), received.value().get());
 }
 
+TEST(PortTest, ReportsDroppedCountFromConnectedDropOldestQueue) {
+    eavp::OutputPort<eavp::MediaPacket> output("encoded");
+    eavp::InputPort<eavp::MediaPacket> input(
+        "mux", 1U, eavp::OverflowPolicy::kDropOldest);
+
+    EXPECT_EQ(0U, input.dropped_count());
+    ASSERT_TRUE(eavp::connect(output, input).ok());
+    ASSERT_TRUE(output.send(make_packet(10)).ok());
+    ASSERT_TRUE(output.send(make_packet(20)).ok());
+
+    EXPECT_EQ(1U, input.dropped_count());
+    const eavp::Result<std::shared_ptr<const eavp::MediaPacket> > packet =
+        input.receive();
+    ASSERT_TRUE(packet.ok());
+    EXPECT_EQ(20, packet.value()->pts());
+}
+
 TEST(PortTest, FanOutDoesNotPartiallyPushWhenALaterBlockQueueIsFull) {
     eavp::OutputPort<eavp::MediaPacket> output("encoded");
     eavp::InputPort<eavp::MediaPacket> first(

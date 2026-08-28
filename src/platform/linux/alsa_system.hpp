@@ -3,6 +3,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <poll.h>
+#include <vector>
 
 #include "eavp/base/result.hpp"
 #include "eavp/base/status.hpp"
@@ -68,6 +70,9 @@ public:
     Result<AlsaReadResult> read_interleaved(std::uint8_t* destination,
                                             int requested_frames);
     Result<AlsaAnchor> capture_anchor();
+    Result<std::vector<struct pollfd> > poll_descriptors();
+    Result<bool> evaluate_poll_events(
+        const std::vector<struct pollfd>& descriptors);
     const AlsaNegotiatedParameters& negotiated() const { return negotiated_; }
     bool suspend_recovery_pending() const { return suspended_; }
 
@@ -89,6 +94,7 @@ private:
     AlsaNegotiatedParameters negotiated_;
     State state_;
     bool suspended_;
+    std::size_t poll_descriptor_count_;
 };
 
 std::unique_ptr<AlsaApi> create_libasound_api();

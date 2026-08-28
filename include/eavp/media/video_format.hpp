@@ -12,6 +12,7 @@ enum class PixelFormat {
     kNv12,
     kYuv420p,
     kRgb24,
+    kYuyv422,
 };
 
 Result<std::string> pixel_format_name(PixelFormat pixel_format) noexcept;

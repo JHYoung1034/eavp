@@ -4,6 +4,8 @@
 #include <cerrno>
 #include <ctime>
 #include <deque>
+#include <poll.h>
+#include <vector>
 
 #include "platform/linux/alsa_api.hpp"
 
@@ -55,10 +57,17 @@ public:
           sw_params_alloc_count(0), sw_params_free_count(0), pcm_prepare_count(0),
           pcm_start_count(0), pcm_drop_count(0), pcm_resume_count(0),
           htimestamp_count(0), avail_update_count(0), monotonic_now_count(0),
+          poll_descriptors_count_calls(0), poll_descriptors_calls(0),
+          poll_revents_calls(0),
           htimestamp_result(0), htimestamp_available(0U),
           htimestamp_value(), avail_update_result(0), monotonic_now_result(0),
           monotonic_now_value(), pcm_prepare_results(), pcm_start_results(),
-          pcm_resume_results(), pcm_read_results() {}
+          pcm_resume_results(), pcm_read_results(), poll_descriptor_values(),
+          poll_descriptor_arrays(),
+          poll_descriptor_count_results(), poll_descriptor_results(),
+          poll_revents_results(), poll_revents_values(),
+          poll_revents_value(0U), poll_descriptor_spaces(),
+          poll_revents_counts(), last_poll_revents_descriptors() {}
 
     int pcm_open(snd_pcm_t** pcm, const char*, snd_pcm_stream_t stream,
                  int mode) {
@@ -200,6 +209,52 @@ public:
         ++avail_update_count;
         return avail_update_result;
     }
+    int pcm_poll_descriptors_count(snd_pcm_t*) override {
+        ++poll_descriptors_count_calls;
+        return scripted_result(
+            poll_descriptor_count_results,
+            static_cast<int>(poll_descriptor_values.size()));
+    }
+    int pcm_poll_descriptors(snd_pcm_t*, struct pollfd* descriptors,
+                             unsigned int count) override {
+        ++poll_descriptors_calls;
+        poll_descriptor_spaces.push_back(count);
+        std::vector<struct pollfd> scripted_values;
+        const std::vector<struct pollfd>* values = &poll_descriptor_values;
+        if (!poll_descriptor_arrays.empty()) {
+            scripted_values = poll_descriptor_arrays.front();
+            poll_descriptor_arrays.pop_front();
+            values = &scripted_values;
+        }
+        const int scripted = scripted_result(
+            poll_descriptor_results,
+            static_cast<int>(values->size()));
+        if (scripted < 0) return scripted;
+        const unsigned int copied =
+            count < values->size()
+                ? count
+                : static_cast<unsigned int>(values->size());
+        for (unsigned int index = 0U; index < copied; ++index) {
+            descriptors[index] = (*values)[index];
+        }
+        return scripted;
+    }
+    int pcm_poll_descriptors_revents(
+        snd_pcm_t*, struct pollfd* descriptors, unsigned int count,
+        unsigned short* revents) override {
+        ++poll_revents_calls;
+        poll_revents_counts.push_back(count);
+        last_poll_revents_descriptors.assign(descriptors, descriptors + count);
+        const int scripted = scripted_result(poll_revents_results, 0);
+        if (scripted < 0) return scripted;
+        if (poll_revents_values.empty()) {
+            *revents = poll_revents_value;
+        } else {
+            *revents = poll_revents_values.front();
+            poll_revents_values.pop_front();
+        }
+        return scripted;
+    }
     int monotonic_now(struct timespec* value) {
         ++monotonic_now_count;
         *value = monotonic_now_value;
@@ -239,6 +294,9 @@ public:
     int htimestamp_count;
     int avail_update_count;
     int monotonic_now_count;
+    int poll_descriptors_count_calls;
+    int poll_descriptors_calls;
+    int poll_revents_calls;
     int htimestamp_result;
     snd_pcm_uframes_t htimestamp_available;
     snd_htimestamp_t htimestamp_value;
@@ -249,6 +307,16 @@ public:
     std::deque<int> pcm_start_results;
     std::deque<int> pcm_resume_results;
     std::deque<snd_pcm_sframes_t> pcm_read_results;
+    std::vector<struct pollfd> poll_descriptor_values;
+    std::deque<std::vector<struct pollfd> > poll_descriptor_arrays;
+    std::deque<int> poll_descriptor_count_results;
+    std::deque<int> poll_descriptor_results;
+    std::deque<int> poll_revents_results;
+    std::deque<unsigned short> poll_revents_values;
+    unsigned short poll_revents_value;
+    std::vector<unsigned int> poll_descriptor_spaces;
+    std::vector<unsigned int> poll_revents_counts;
+    std::vector<struct pollfd> last_poll_revents_descriptors;
 
 private:
     bool fails(Step step) const { return fail_step == static_cast<int>(step); }

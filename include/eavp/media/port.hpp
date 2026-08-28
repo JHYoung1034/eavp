@@ -70,6 +70,9 @@ public:
     }
 
     std::size_t queue_size() const { return queue_ ? queue_->size() : 0U; }
+    std::size_t dropped_count() const {
+        return queue_ ? queue_->dropped_count() : 0U;
+    }
     const std::string& name() const { return name_; }
 
 private:

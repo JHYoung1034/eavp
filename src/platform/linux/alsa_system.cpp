@@ -126,7 +126,8 @@ snd_pcm_format_t alsa_format(SampleFormat format, bool* supported) {
 
 AlsaSystem::AlsaSystem(std::unique_ptr<AlsaApi> api)
     : api_(std::move(api)), pcm_(NULL), hw_params_(NULL), sw_params_(NULL),
-      negotiated_(), state_(kCreated), suspended_(false) {}
+      negotiated_(), state_(kCreated), suspended_(false),
+      poll_descriptor_count_(0U) {}
 
 AlsaSystem::~AlsaSystem() noexcept {
     try {
@@ -138,13 +139,15 @@ AlsaSystem::~AlsaSystem() noexcept {
 AlsaSystem::AlsaSystem(AlsaSystem&& other) noexcept
     : api_(std::move(other.api_)), pcm_(other.pcm_), hw_params_(other.hw_params_),
       sw_params_(other.sw_params_), negotiated_(other.negotiated_),
-      state_(other.state_), suspended_(other.suspended_) {
+      state_(other.state_), suspended_(other.suspended_),
+      poll_descriptor_count_(other.poll_descriptor_count_) {
     other.pcm_ = NULL;
     other.hw_params_ = NULL;
     other.sw_params_ = NULL;
     other.negotiated_ = AlsaNegotiatedParameters();
     other.state_ = kCreated;
     other.suspended_ = false;
+    other.poll_descriptor_count_ = 0U;
 }
 
 AlsaSystem& AlsaSystem::operator=(AlsaSystem&& other) noexcept {
@@ -160,12 +163,14 @@ AlsaSystem& AlsaSystem::operator=(AlsaSystem&& other) noexcept {
         negotiated_ = other.negotiated_;
         state_ = other.state_;
         suspended_ = other.suspended_;
+        poll_descriptor_count_ = other.poll_descriptor_count_;
         other.pcm_ = NULL;
         other.hw_params_ = NULL;
         other.sw_params_ = NULL;
         other.negotiated_ = AlsaNegotiatedParameters();
         other.state_ = kCreated;
         other.suspended_ = false;
+        other.poll_descriptor_count_ = 0U;
     }
     return *this;
 }
@@ -187,7 +192,95 @@ int AlsaSystem::close_resources() {
     negotiated_ = AlsaNegotiatedParameters();
     state_ = kCreated;
     suspended_ = false;
+    poll_descriptor_count_ = 0U;
     return close_result;
+}
+
+Result<std::vector<struct pollfd> > AlsaSystem::poll_descriptors() {
+    if (state_ != kRunning || pcm_ == NULL || !api_) {
+        return Result<std::vector<struct pollfd> >(
+            Status(StatusCode::kInvalidState,
+                   "ALSA poll descriptors require a running device"));
+    }
+
+    const int count = api_->pcm_poll_descriptors_count(pcm_);
+    if (count < 0) {
+        return Result<std::vector<struct pollfd> >(
+            alsa_failure(system_error_code(count),
+                         "snd_pcm_poll_descriptors_count", count, *api_));
+    }
+    if (count == 0) {
+        return Result<std::vector<struct pollfd> >(Status(
+            StatusCode::kCapabilityMismatch,
+            "ALSA device exposes no poll descriptors", "alsa",
+            "snd_pcm_poll_descriptors_count", count));
+    }
+    if (poll_descriptor_count_ != 0U &&
+        static_cast<std::size_t>(count) != poll_descriptor_count_) {
+        return Result<std::vector<struct pollfd> >(Status(
+            StatusCode::kCorruptData,
+            "ALSA poll descriptor count changed while running", "alsa",
+            "snd_pcm_poll_descriptors_count", count));
+    }
+
+    std::vector<struct pollfd> descriptors(
+        static_cast<std::size_t>(count));
+    const int filled = api_->pcm_poll_descriptors(
+        pcm_, &descriptors[0], static_cast<unsigned int>(count));
+    if (filled < 0) {
+        return Result<std::vector<struct pollfd> >(
+            alsa_failure(system_error_code(filled),
+                         "snd_pcm_poll_descriptors", filled, *api_));
+    }
+    if (filled != count) {
+        return Result<std::vector<struct pollfd> >(Status(
+            StatusCode::kCorruptData,
+            "ALSA poll descriptor count changed while reading the array",
+            "alsa", "snd_pcm_poll_descriptors", filled));
+    }
+    poll_descriptor_count_ = descriptors.size();
+    return Result<std::vector<struct pollfd> >(std::move(descriptors));
+}
+
+Result<bool> AlsaSystem::evaluate_poll_events(
+    const std::vector<struct pollfd>& descriptors) {
+    if (state_ != kRunning || pcm_ == NULL || !api_ ||
+        poll_descriptor_count_ == 0U) {
+        return Result<bool>(Status(
+            StatusCode::kInvalidState,
+            "ALSA poll events require registered running descriptors"));
+    }
+    if (descriptors.size() != poll_descriptor_count_) {
+        return Result<bool>(Status(
+            StatusCode::kInvalidArgument,
+            "ALSA poll descriptor array length changed"));
+    }
+    if (descriptors.size() >
+        static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
+        return Result<bool>(Status(
+            StatusCode::kInvalidArgument,
+            "ALSA poll descriptor array is too large"));
+    }
+
+    unsigned short revents = 0U;
+    std::vector<struct pollfd> decoded_descriptors(descriptors);
+    const int result = api_->pcm_poll_descriptors_revents(
+        pcm_, &decoded_descriptors[0],
+        static_cast<unsigned int>(decoded_descriptors.size()), &revents);
+    if (result < 0) {
+        return Result<bool>(alsa_failure(
+            system_error_code(result),
+            "snd_pcm_poll_descriptors_revents", result, *api_));
+    }
+    if ((revents & static_cast<unsigned short>(POLLNVAL | POLLHUP)) != 0U) {
+        return Result<bool>(Status(
+            StatusCode::kDeviceLost,
+            "ALSA poll descriptor reports device loss", "alsa",
+            "snd_pcm_poll_descriptors_revents", revents));
+    }
+    return Result<bool>(
+        (revents & static_cast<unsigned short>(POLLIN | POLLOUT | POLLERR)) !=
+        0U);
 }
 
 Status AlsaSystem::prepare(const AlsaCaptureConfig& config) {

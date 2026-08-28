@@ -170,6 +170,38 @@ TEST(BufferTest, CpuPlaneMappingSharesStorageAndUnmapsOnScopeExit) {
     EXPECT_EQ(eavp::MemoryDomain::kCpu, copy.memory_domain());
 }
 
+TEST(BufferTest, AllocatesCpuStorageWithExplicitPlaneLayout) {
+    const std::vector<eavp::PlaneLayout> planes{
+        eavp::PlaneLayout(0U, 128U, 16U),
+        eavp::PlaneLayout(128U, 64U, 16U)};
+    const eavp::Result<eavp::Buffer> result =
+        eavp::Buffer::allocate(192U, planes);
+
+    ASSERT_TRUE(result.ok());
+    EXPECT_EQ(eavp::MemoryDomain::kCpu, result.value().memory_domain());
+    EXPECT_EQ(2U, result.value().plane_count());
+    EXPECT_EQ(128U, result.value().plane_layout(1U).value().offset);
+}
+
+TEST(BufferTest, ExplicitPlaneAllocationRejectsInvalidLayouts) {
+    const std::vector<eavp::PlaneLayout> overflowing{
+        eavp::PlaneLayout(std::numeric_limits<std::size_t>::max() - 1U,
+                          2U, 1U)};
+    const std::vector<eavp::PlaneLayout> overlapping{
+        eavp::PlaneLayout(0U, 128U, 16U),
+        eavp::PlaneLayout(64U, 64U, 16U)};
+    const std::vector<eavp::PlaneLayout> exceeds_capacity{
+        eavp::PlaneLayout(0U, 128U, 16U),
+        eavp::PlaneLayout(128U, 64U, 16U)};
+
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::Buffer::allocate(192U, overflowing).status().code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::Buffer::allocate(192U, overlapping).status().code());
+    EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
+              eavp::Buffer::allocate(191U, exceeds_capacity).status().code());
+}
+
 TEST(BufferTest, CpuStorageAllowsReentrantMappingsOfTheSamePlane) {
     eavp::Buffer buffer = eavp::Buffer::allocate(8U).take_value();
     eavp::MappedRegion writable =
@@ -412,6 +444,50 @@ TEST(VideoFormatTest, RejectsOddChromaDimensions) {
                   .code());
 }
 
+TEST(VideoFormatTest, DescribesPackedYuyv422Exactly) {
+    const std::vector<eavp::PlaneLayout> planes{
+        eavp::PlaneLayout(0U, 256U, 32U)};
+    const eavp::Result<eavp::VideoFormat> format =
+        eavp::VideoFormat::create(eavp::PixelFormat::kYuyv422,
+                                  16, 8, eavp::MemoryDomain::kCpu, planes);
+
+    ASSERT_TRUE(format.ok());
+    EXPECT_EQ("yuyv422",
+              eavp::pixel_format_name(eavp::PixelFormat::kYuyv422).value());
+}
+
+TEST(VideoFormatTest, RejectsInvalidPackedYuyv422Layouts) {
+    struct Case {
+        int width;
+        int height;
+        eavp::PlaneLayout plane;
+        eavp::StatusCode expected;
+    };
+    const Case cases[] = {
+        {15, 8, eavp::PlaneLayout(0U, 240U, 30U),
+         eavp::StatusCode::kUnsupported},
+        {16, 8, eavp::PlaneLayout(0U, 256U, 31U),
+         eavp::StatusCode::kInvalidArgument},
+        {16, 8, eavp::PlaneLayout(0U, 255U, 32U),
+         eavp::StatusCode::kInvalidArgument},
+        {16, 2,
+         eavp::PlaneLayout(0U, std::numeric_limits<std::size_t>::max(),
+                            std::numeric_limits<std::size_t>::max()),
+         eavp::StatusCode::kInvalidArgument},
+    };
+
+    for (std::size_t index = 0U; index < sizeof(cases) / sizeof(cases[0]); ++index) {
+        const std::vector<eavp::PlaneLayout> planes(1U, cases[index].plane);
+        EXPECT_EQ(cases[index].expected,
+                  eavp::VideoFormat::create(eavp::PixelFormat::kYuyv422,
+                                             cases[index].width,
+                                             cases[index].height,
+                                             eavp::MemoryDomain::kCpu, planes)
+                      .status().code())
+            << "case " << index;
+    }
+}
+
 TEST(VideoFormatTest, StableStateNamesCoverSupportedEnumsAndRejectUnknownValues) {
     EXPECT_EQ("rgb24",
               eavp::pixel_format_name(eavp::PixelFormat::kRgb24)
@@ -420,6 +496,8 @@ TEST(VideoFormatTest, StableStateNamesCoverSupportedEnumsAndRejectUnknownValues)
               eavp::pixel_format_name(eavp::PixelFormat::kNv12).value());
     EXPECT_EQ("yuv420p",
               eavp::pixel_format_name(eavp::PixelFormat::kYuv420p).value());
+    EXPECT_EQ("yuyv422",
+              eavp::pixel_format_name(eavp::PixelFormat::kYuyv422).value());
     EXPECT_EQ(eavp::StatusCode::kInvalidArgument,
               eavp::pixel_format_name(eavp::PixelFormat::kUnknown)
                   .status().code());

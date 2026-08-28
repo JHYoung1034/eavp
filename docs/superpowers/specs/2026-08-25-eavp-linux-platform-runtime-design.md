@@ -1,6 +1,6 @@
 # EAVP Linux Platform Runtime 0.3a 设计规格
 
-> 状态：已批准
+> 状态：已实现（2026-08-28）
 >
 > 适用版本：`0.3a`（`0.3.0` 开发阶段），稳定版本仍为 `0.2.0`
 >
@@ -238,7 +238,17 @@ EAVP_ENABLE_THREAD_SANITIZER=OFF
 
 0.3d 在同一 Reactor 时钟域内同时驱动 V4L2 与 ALSA，测量采集 PTS 偏差和漂移；首期只测量与告警，不自动校正。
 
-## 13. 参考依据
+## 13. 实现与验收记录
+
+本规格的 0.3a 实现已于 2026-08-28 完成开发验收；稳定安装包版本仍为 `0.2.0`。以下记录只证明 Host Linux、真实开发机设备和三套交叉编译边界，不宣称目标板运行、厂商 SDK 或产品 Service Mode 已接入。
+
+- Host clean 矩阵执行 `linux-debug`、`linux-release`、`linux-asan`、`linux-tsan` 的 configure、`--target clean`、build 与 CTest。Debug、Release、ASan/UBSan 控制台汇总均为 314/314 通过；TSan 控制台汇总为 313/313 通过，按既有裁定排除嵌套安装消费工程；四套均只有 64-bit 上不可达的 size-type 溢出用例按设计 skip 一次。
+- 安装消费工程在 `linux-debug` 下复验通过，覆盖 `EAVP_LINUX_RUNTIME_ENABLED`、`EAVP_V4L2_ENABLED` 与 `EAVP_ALSA_ENABLED` 能力变量下的公开头和链接组合。
+- 真实设备验收复验 `/dev/video10` 2/2 通过，其中 Runtime 驱动采集 300 帧约 10 秒完成；ALSA Loopback 3/3 通过，其中现有 producer 采集 300 帧约 3 秒完成。
+- 三套 ARM clean build 均关闭测试、示例、ALSA 和设备测试，并开启 Runtime/V4L2。`readelf -h` 验证 `v4l2_system.cpp.o`：aarch64 为 `ELF64 / AArch64`，Rockchip ARMHF 与 HiSilicon v600 为 `ELF32 / ARM`。
+- 最终范围检查确认 Runtime/V4L2 未链接 FFmpeg、libv4l2 或厂商 SDK，Core 公开头未包含 Linux/ALSA/epoll/eventfd 平台头。
+
+## 14. 参考依据
 
 - Linux V4L2 `poll()`：`https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/func-poll.html`
 - Linux `epoll`：`https://man7.org/linux/man-pages/man7/epoll.7.html`

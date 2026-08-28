@@ -1,6 +1,6 @@
 # EAVP Linux ALSA Capture 0.3b 设计规格
 
-> 状态：0.3b 采集已实现（2026-08-24）；0.3a readiness 适配已批准、待实现
+> 状态：0.3b 采集已实现（2026-08-24）；0.3a readiness 适配已实现（2026-08-28）
 >
 > 适用版本：`0.3b`（`0.3.0` 开发阶段），稳定版本仍为 `0.2.0`
 >
@@ -449,7 +449,7 @@ EAVP_ENABLE_ALSA_DEVICE_TESTS=OFF
 
 ## 16. 后续里程碑边界
 
-Linux 事件驱动线程模型由 `docs/superpowers/specs/2026-08-25-eavp-linux-platform-runtime-design.md` 冻结。0.3a 在不改变已验收音频数据契约的前提下，为 ALSA 增加 readiness 适配和 Runtime 回归测试。
+Linux 事件驱动线程模型由 `docs/superpowers/specs/2026-08-25-eavp-linux-platform-runtime-design.md` 冻结。0.3a 已在不改变已验收音频数据契约的前提下，为 ALSA 增加 readiness 适配和 Runtime 回归测试。
 
 ### 16.1 0.3c 开发机 FFmpeg 编码验证
 
@@ -484,3 +484,7 @@ ALSA AudioFrame -> frame aggregation / sample conversion
 - ARM clean 验证分别对 `rockchip-armhf-release`、`hisiv600-release`、`aarch64-release` 执行 configure、`--target clean` 和 build；每套构建 25 个目标，并对当前 clean build 的 `src/CMakeFiles/eavp_media.dir/media/audio_format.cpp.o` 执行 `readelf -h`。两套 ARM32 输出 `Machine: ARM`，aarch64 输出 `Machine: AArch64`；三个 preset 均为 `EAVP_ENABLE_ALSA=OFF`。
 - 真实设备验收执行 `EAVP_ALSA_DEVICE=hw:Loopback,1,0 EAVP_ALSA_SAMPLE_FORMAT=s16le EAVP_ALSA_SAMPLE_RATE=48000 EAVP_ALSA_CHANNELS=2 EAVP_ALSA_SAMPLES_PER_FRAME=480 EAVP_ALSA_FRAME_COUNT=300 EAVP_ALSA_TIMEOUT_SECONDS=10 ctest --test-dir build/linux-alsa-device -R '^eavp\\.alsa_device\\.' --output-on-failure`；3 项通过，其中现有 producer 的采集用例在 3 秒内完成 300 帧。
 - 最终静态检查确认公共头不包含 ALSA，0.3b 构建目标不链接 FFmpeg，且没有旧 AudioFrame API 或未完成标记。
+
+### 18.1 0.3a readiness 适配验收补充
+
+2026-08-28 复验确认 ALSA readiness 适配已随 Linux Runtime 0.3a 完成：Host clean 矩阵 Debug、Release、ASan/UBSan 为 314/314 通过，TSan 为 313/313 通过；真实 Loopback 设备验收执行 `EAVP_ALSA_DEVICE=hw:Loopback,1,0 EAVP_ALSA_SAMPLE_FORMAT=s16le EAVP_ALSA_SAMPLE_RATE=48000 EAVP_ALSA_CHANNELS=2 EAVP_ALSA_SAMPLES_PER_FRAME=480 EAVP_ALSA_FRAME_COUNT=300 EAVP_ALSA_TIMEOUT_SECONDS=10 ctest --test-dir build/linux-v4l2-device -R '^eavp\\.alsa_device\\.' --output-on-failure`，3 项通过，其中现有 producer 采集 300 帧约 3 秒完成。三套 ARM preset 仍关闭 ALSA 与设备测试，不宣称 ARM libasound 链接。
