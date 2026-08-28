@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
@@ -17,6 +18,7 @@
 #include <string>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 #include <vector>
 
@@ -301,6 +303,95 @@ int count_open_device_fds(const std::string& device) {
     return count;
 }
 
+bool parse_unsigned_value(const std::string& text, int base,
+                          unsigned long long* value) {
+    if (value == NULL || text.empty()) return false;
+    char* end = NULL;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(text.c_str(), &end, base);
+    if (errno != 0 || end == text.c_str() || *end != '\0') return false;
+    *value = parsed;
+    return true;
+}
+
+eavp::Result<int> count_device_mappings(const std::string& device) {
+    struct stat device_stat;
+    if (::stat(device.c_str(), &device_stat) != 0) {
+        return eavp::Result<int>(
+            errno_status(errno == ENOENT ? eavp::StatusCode::kNotFound
+                                         : eavp::StatusCode::kIoError,
+                         "无法 stat V4L2 设备 " + device, "stat", errno));
+    }
+
+    std::ifstream maps("/proc/self/maps");
+    if (!maps.is_open()) {
+        return eavp::Result<int>(eavp::Status(
+            eavp::StatusCode::kIoError, "无法打开 /proc/self/maps"));
+    }
+
+    const unsigned long long expected_major =
+        static_cast<unsigned long long>(major(device_stat.st_dev));
+    const unsigned long long expected_minor =
+        static_cast<unsigned long long>(minor(device_stat.st_dev));
+    const unsigned long long expected_inode =
+        static_cast<unsigned long long>(device_stat.st_ino);
+
+    int count = 0;
+    std::size_t line_number = 0U;
+    std::string line;
+    while (std::getline(maps, line)) {
+        ++line_number;
+        std::istringstream line_stream(line);
+        std::string address_range;
+        std::string permissions;
+        std::string offset_text;
+        std::string device_text;
+        std::string inode_text;
+        if (!(line_stream >> address_range >> permissions >> offset_text >>
+              device_text >> inode_text)) {
+            std::ostringstream message;
+            message << "无法解析 /proc/self/maps 第 " << line_number << " 行";
+            return eavp::Result<int>(eavp::Status(
+                eavp::StatusCode::kCorruptData, message.str()));
+        }
+
+        const std::size_t colon = device_text.find(':');
+        if (colon == std::string::npos || colon == 0U ||
+            colon + 1U >= device_text.size()) {
+            std::ostringstream message;
+            message << "无法解析 /proc/self/maps 第 " << line_number
+                    << " 行的 dev 字段: " << device_text;
+            return eavp::Result<int>(eavp::Status(
+                eavp::StatusCode::kCorruptData, message.str()));
+        }
+
+        unsigned long long line_major = 0U;
+        unsigned long long line_minor = 0U;
+        unsigned long long line_inode = 0U;
+        if (!parse_unsigned_value(device_text.substr(0U, colon), 16,
+                                  &line_major) ||
+            !parse_unsigned_value(device_text.substr(colon + 1U), 16,
+                                  &line_minor) ||
+            !parse_unsigned_value(inode_text, 10, &line_inode)) {
+            std::ostringstream message;
+            message << "无法解析 /proc/self/maps 第 " << line_number
+                    << " 行的设备或 inode 字段";
+            return eavp::Result<int>(eavp::Status(
+                eavp::StatusCode::kCorruptData, message.str()));
+        }
+
+        if (line_major == expected_major && line_minor == expected_minor &&
+            line_inode == expected_inode) {
+            ++count;
+        }
+    }
+    if (maps.bad()) {
+        return eavp::Result<int>(eavp::Status(
+            eavp::StatusCode::kIoError, "读取 /proc/self/maps 失败"));
+    }
+    return eavp::Result<int>(count);
+}
+
 class DeviceVideoSink : public eavp::MediaNode {
 public:
     DeviceVideoSink(const DeviceTestConfig& config, eavp::HealthManager* health)
@@ -520,6 +611,12 @@ TEST(V4L2CaptureDeviceTest, CapturesConfiguredFramesViaRuntime) {
         return;
     }
 
+    const eavp::Result<int> active_device_mappings =
+        count_device_mappings(config.device);
+    ASSERT_TRUE(active_device_mappings.ok())
+        << status_description(active_device_mappings.status());
+    EXPECT_GE(active_device_mappings.value(), 1);
+
     const eavp::Status stopped = runtime->stop();
     EXPECT_TRUE(stopped.ok()) << status_description(stopped);
     EXPECT_EQ(eavp::PlatformRuntimeState::kStopped, runtime->state());
@@ -546,6 +643,11 @@ TEST(V4L2CaptureDeviceTest, CapturesConfiguredFramesViaRuntime) {
     const int open_device_fds = count_open_device_fds(config.device);
     ASSERT_GE(open_device_fds, 0);
     EXPECT_EQ(0, open_device_fds);
+    const eavp::Result<int> stopped_device_mappings =
+        count_device_mappings(config.device);
+    ASSERT_TRUE(stopped_device_mappings.ok())
+        << status_description(stopped_device_mappings.status());
+    EXPECT_EQ(0, stopped_device_mappings.value());
 }
 
 }  // namespace
