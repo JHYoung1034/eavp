@@ -176,10 +176,13 @@ TEST(AlsaCaptureRuntimeTest,
     std::unique_ptr<eavp::detail::AlsaSystem> system(
         new eavp::detail::AlsaSystem(
             std::unique_ptr<eavp::detail::AlsaApi>(fake.release())));
-    std::unique_ptr<eavp::AlsaSourceNode> capture =
+    eavp::Result<std::unique_ptr<eavp::AlsaSourceNode> > capture_result =
         eavp::detail::AlsaSourceNodeTestPeer::create(
             "mic0", eavp_test::make_alsa_config(), &metrics, &health,
-            std::move(system)).take_value();
+            std::move(system));
+    ASSERT_TRUE(capture_result.ok());
+    std::unique_ptr<eavp::AlsaSourceNode> capture =
+        capture_result.take_value();
     eavp::AlsaSourceNode* wait_source = capture.get();
     std::unique_ptr<AudioChecksumSink> sink(new AudioChecksumSink());
     AudioChecksumSink* observed_sink = sink.get();
@@ -189,10 +192,14 @@ TEST(AlsaCaptureRuntimeTest,
     ASSERT_TRUE(pipeline.add_node(std::move(capture)).ok());
     ASSERT_TRUE(pipeline.add_node(std::move(sink)).ok());
     ASSERT_TRUE(pipeline.connect("mic0", "audio-checksum").ok());
-    const eavp::LinuxPlatformRuntimeConfig runtime_config =
-        eavp::LinuxPlatformRuntimeConfig::create(1, 2000).take_value();
+    const eavp::Result<eavp::LinuxPlatformRuntimeConfig> runtime_config =
+        eavp::LinuxPlatformRuntimeConfig::create(1, 2000);
+    ASSERT_TRUE(runtime_config.ok());
+    eavp::Result<std::unique_ptr<eavp::LinuxPlatformRuntime> > runtime_result =
+        eavp::LinuxPlatformRuntime::create(runtime_config.value(), &metrics);
+    ASSERT_TRUE(runtime_result.ok());
     std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
-        eavp::LinuxPlatformRuntime::create(runtime_config, &metrics).take_value();
+        runtime_result.take_value();
     ASSERT_TRUE(runtime->register_pipeline(
         &pipeline,
         std::vector<eavp::LinuxWaitSource*>(1U, wait_source)).ok());

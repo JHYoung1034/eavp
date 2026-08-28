@@ -243,10 +243,14 @@ TEST(V4L2CapturePipelineTest, CapturesExactlyThreeHundredFramesViaRuntime) {
     EXPECT_EQ(8U, layouts[2].stride);
     EXPECT_EQ(0U, fixture.sink->dropped_count());
     EXPECT_EQ(checksum_for(300U), fixture.sink->checksum());
-    EXPECT_EQ(300U,
-              fixture.metrics.counter("v4l2.frames.captured").value());
-    EXPECT_EQ(eavp::HealthStatus::kOk,
-              fixture.health.component("v4l2.capture").value().status);
+    const eavp::Result<std::uint64_t> captured_metric =
+        fixture.metrics.counter("v4l2.frames.captured");
+    ASSERT_TRUE(captured_metric.ok());
+    EXPECT_EQ(300U, captured_metric.value());
+    const eavp::Result<eavp::HealthComponent> capture_health =
+        fixture.health.component("v4l2.capture");
+    ASSERT_TRUE(capture_health.ok());
+    EXPECT_EQ(eavp::HealthStatus::kOk, capture_health.value().status);
     EXPECT_EQ(300U, fixture.trace->dequeued_buffer_types.size());
     EXPECT_EQ(0, fixture.open_handles());
 }
