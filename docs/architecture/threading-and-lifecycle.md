@@ -20,4 +20,4 @@ Pipeline 的普通 `stop()` 按拓扑跨 Executor 调用逐步排空，`kWouldBl
 
 0.3b `AlsaSourceNode` 不创建线程，也不调用 `snd_pcm_wait`。每次 tick 至多进行一次非阻塞读取：短读仅累积，绝不补零或输出不足 `samples_per_frame` 的帧；`-EAGAIN` 或零读取返回 `kWouldBlock`。若存在 pending AudioFrame，必须优先重试下游发送；背压时不得继续读取 ALSA。XRUN/suspend 恢复有界地跨 tick 推进，恢复时丢弃 partial、重新锚定时间线，并仅在恢复后的第一个完整帧设置 `discontinuity`。`stop` 丢弃 partial/pending 并关闭设备，重复 stop/reset 保持幂等。
 
-0.3a V4L2 与 ALSA Source 实现 Linux readiness 接口。V4L2 使用设备 fd，ALSA 保留 libasound 返回的完整 descriptor 数组并通过 libasound 解释 revents。Runtime 的 start 等待 Reactor 在线程内完成 Pipeline prepare/start；stop 使用 eventfd 唤醒，在同一 Reactor 线程 stop/reset Pipeline 后 join。不得 detach 线程，启动失败不得遗留运行线程。
+0.3a V4L2 与 ALSA Source 已实现 Linux readiness 接口并完成开发验收。V4L2 使用设备 fd，ALSA 保留 libasound 返回的完整 descriptor 数组并通过 libasound 解释 revents。Runtime 的 start 等待 Reactor 在线程内完成 Pipeline prepare/start；stop 使用 eventfd 唤醒，在同一 Reactor 线程 stop/reset Pipeline 后 join。不得 detach 线程，启动失败不得遗留运行线程。
