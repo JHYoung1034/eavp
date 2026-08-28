@@ -98,6 +98,8 @@ private:
     int bounded_open(const char* path, int flags);
     int bounded_ioctl(unsigned long request, void* argument);
     Status queue_buffer(std::uint32_t index);
+    Status rollback_start(const Status& primary_failure,
+                          std::size_t queued_count);
     Status rollback(const Status& first_failure);
     void cleanup_noexcept() noexcept;
 

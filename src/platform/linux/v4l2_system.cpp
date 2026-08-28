@@ -582,18 +582,42 @@ Status V4L2System::start() {
                             "V4L2 device is not prepared",
                             "VIDIOC_STREAMON", 0);
     }
+    std::size_t queued_count = 0U;
     for (std::size_t index = 0U; index < regions_.size(); ++index) {
         const Status queue_status = queue_buffer(
             static_cast<std::uint32_t>(index));
-        if (!queue_status.ok()) return queue_status;
+        if (!queue_status.ok()) {
+            return rollback_start(queue_status, queued_count);
+        }
+        ++queued_count;
     }
 
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (bounded_ioctl(VIDIOC_STREAMON, &type) < 0) {
-        return syscall_failure("VIDIOC_STREAMON", api_->last_error());
+        return rollback_start(
+            syscall_failure("VIDIOC_STREAMON", api_->last_error()),
+            queued_count);
     }
     state_ = kRunning;
     return Status::ok_status();
+}
+
+Status V4L2System::rollback_start(const Status& primary_failure,
+                                  std::size_t queued_count) {
+    if (queued_count == 0U) return primary_failure;
+
+    bool rollback_failed = false;
+    try {
+        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        rollback_failed = bounded_ioctl(VIDIOC_STREAMOFF, &type) < 0;
+    } catch (...) {
+        rollback_failed = true;
+    }
+    if (rollback_failed) {
+        // STREAMOFF 已无法恢复可重试的 Prepared 会话，完整释放资源。
+        (void)reset();
+    }
+    return primary_failure;
 }
 
 Status V4L2System::queue_buffer(std::uint32_t index) {

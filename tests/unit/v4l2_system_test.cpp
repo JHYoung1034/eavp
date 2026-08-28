@@ -612,7 +612,7 @@ TEST(V4L2SystemTest, QueuesEveryMappedBufferBeforeStreamOn) {
     }
 }
 
-TEST(V4L2SystemTest, StartStopsBeforeStreamOnWhenQueueingFails) {
+TEST(V4L2SystemTest, QueueFailureRollsBackQueuedBuffersAndAllowsRetry) {
     ScriptedV4L2 fixture;
     ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
     fixture.observed->script_error("VIDIOC_QBUF:1", EIO);
@@ -622,14 +622,21 @@ TEST(V4L2SystemTest, StartStopsBeforeStreamOnWhenQueueingFails) {
     EXPECT_EQ(eavp::StatusCode::kIoError, status.code());
     expect_provider_context(status, "VIDIOC_QBUF", EIO);
     const std::vector<std::string> expected = {
-        "VIDIOC_QBUF:0", "VIDIOC_QBUF:1"};
+        "VIDIOC_QBUF:0", "VIDIOC_QBUF:1", "VIDIOC_STREAMOFF"};
     EXPECT_EQ(expected, fixture.trace->streaming_calls);
     EXPECT_EQ(0U, fixture.trace->stream_on_calls);
-    EXPECT_TRUE(fixture.system->stop().ok());
-    EXPECT_EQ(0U, fixture.trace->stream_off_calls);
+    EXPECT_EQ(1U, fixture.trace->stream_off_calls);
+    EXPECT_TRUE(fixture.system->poll_descriptors().ok());
+
+    fixture.trace->streaming_calls.clear();
+    ASSERT_TRUE(fixture.system->start().ok());
+    const std::vector<std::string> retried = {
+        "VIDIOC_QBUF:0", "VIDIOC_QBUF:1", "VIDIOC_QBUF:2",
+        "VIDIOC_STREAMON"};
+    EXPECT_EQ(retried, fixture.trace->streaming_calls);
 }
 
-TEST(V4L2SystemTest, StreamOnFailureLeavesPreparedStateWithoutStreamOff) {
+TEST(V4L2SystemTest, StreamOnFailureRollsBackQueuedBuffersAndAllowsRetry) {
     ScriptedV4L2 fixture;
     ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
     fixture.observed->script_error("VIDIOC_STREAMON", EBUSY);
@@ -640,13 +647,62 @@ TEST(V4L2SystemTest, StreamOnFailureLeavesPreparedStateWithoutStreamOff) {
     expect_provider_context(status, "VIDIOC_STREAMON", EBUSY);
     const std::vector<std::string> expected = {
         "VIDIOC_QBUF:0", "VIDIOC_QBUF:1", "VIDIOC_QBUF:2",
-        "VIDIOC_STREAMON"};
+        "VIDIOC_STREAMON", "VIDIOC_STREAMOFF"};
     EXPECT_EQ(expected, fixture.trace->streaming_calls);
     EXPECT_TRUE(fixture.system->poll_descriptors().ok());
+    EXPECT_EQ(1U, fixture.trace->stream_off_calls);
 
-    EXPECT_TRUE(fixture.system->stop().ok());
+    fixture.trace->streaming_calls.clear();
+    ASSERT_TRUE(fixture.system->start().ok());
+    const std::vector<std::string> retried = {
+        "VIDIOC_QBUF:0", "VIDIOC_QBUF:1", "VIDIOC_QBUF:2",
+        "VIDIOC_STREAMON"};
+    EXPECT_EQ(retried, fixture.trace->streaming_calls);
+}
+
+TEST(V4L2SystemTest,
+     QueueRollbackFailureClosesSessionWithoutOverwritingPrimaryFailure) {
+    ScriptedV4L2 fixture;
+    ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
+    fixture.observed->script_error("VIDIOC_QBUF:1", EIO);
+    fixture.observed->script_error("VIDIOC_STREAMOFF", EPIPE);
+
+    const eavp::Status status = fixture.system->start();
+
+    EXPECT_EQ(eavp::StatusCode::kIoError, status.code());
+    expect_provider_context(status, "VIDIOC_QBUF", EIO);
+    const std::vector<std::string> expected = {
+        "VIDIOC_QBUF:0", "VIDIOC_QBUF:1", "VIDIOC_STREAMOFF"};
     EXPECT_EQ(expected, fixture.trace->streaming_calls);
-    EXPECT_EQ(0U, fixture.trace->stream_off_calls);
+    EXPECT_EQ(3U, fixture.trace->munmap_calls.size());
+    EXPECT_EQ(1U, fixture.trace->request_buffers_zero_calls);
+    EXPECT_EQ(1U, fixture.trace->close_calls);
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              fixture.system->poll_descriptors().status().code());
+    EXPECT_TRUE(fixture.system->reset().ok());
+    EXPECT_EQ(1U, fixture.trace->close_calls);
+}
+
+TEST(V4L2SystemTest,
+     StreamOnRollbackFailureClosesSessionWithoutOverwritingPrimaryFailure) {
+    ScriptedV4L2 fixture;
+    ASSERT_TRUE(fixture.system->prepare(make_config()).ok());
+    fixture.observed->script_error("VIDIOC_STREAMON", EBUSY);
+    fixture.observed->script_error("VIDIOC_STREAMOFF", EPIPE);
+
+    const eavp::Status status = fixture.system->start();
+
+    EXPECT_EQ(eavp::StatusCode::kIoError, status.code());
+    expect_provider_context(status, "VIDIOC_STREAMON", EBUSY);
+    const std::vector<std::string> expected = {
+        "VIDIOC_QBUF:0", "VIDIOC_QBUF:1", "VIDIOC_QBUF:2",
+        "VIDIOC_STREAMON", "VIDIOC_STREAMOFF"};
+    EXPECT_EQ(expected, fixture.trace->streaming_calls);
+    EXPECT_EQ(3U, fixture.trace->munmap_calls.size());
+    EXPECT_EQ(1U, fixture.trace->request_buffers_zero_calls);
+    EXPECT_EQ(1U, fixture.trace->close_calls);
+    EXPECT_EQ(eavp::StatusCode::kInvalidState,
+              fixture.system->poll_descriptors().status().code());
 }
 
 TEST(V4L2SystemTest, FailedStreamOffRemainsRunningUntilSuccessfulRetry) {

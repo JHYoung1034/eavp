@@ -180,12 +180,17 @@ Node 不创建私有线程，设备以 `O_RDWR | O_NONBLOCK | O_CLOEXEC` 打开�
 | Node 操作 | V4L2 行为 | 结果 |
 |---|---|---|
 | `prepare` | open、QUERYCAP、S/G_FMT、S/G_PARM、REQBUFS、QUERYBUF、mmap | Prepared |
-| `start` | 全部 QBUF 后 STREAMON | Running |
+| `start` | 全部 QBUF 后 STREAMON；失败时 STREAMOFF 清除已排队 Buffer | Running，或回到 Prepared |
 | `tick` | 至多一次 DQBUF/copy/QBUF/send | Running 或 Error |
 | `stop` | 立即 STREAMOFF，丢弃内部 pending | Stopped |
 | `reset` | munmap、REQBUFS(0)、close | Created |
 
 stop 不再采集新 Frame；已经进入端口队列的 Frame 由现有 Pipeline 继续排空。尚未进入队列的 pending Frame 在 stop 时丢弃，并计入 `v4l2.frames.dropped_on_stop`。重复 stop/reset 必须幂等。
+
+start 的 QBUF 部分失败或 STREAMON 失败必须保留原始失败为首因，并用
+STREAMOFF 清除本次已排队 Buffer；回滚成功后会话保持 Prepared，允许再次
+start。若回滚 STREAMOFF 失败，会话不得伪装为可重试状态，必须继续完整
+reset/close 收束到 Created，同时仍向调用方返回原始 QBUF/STREAMON 失败。
 
 所有 `open`/`ioctl` 的 `EINTR` 最多重试 64 次；达到上限后返回 enriched I/O 错误，避免单线程 Executor 永久停留在一次 tick 中。DQBUF 成功后，无论复制或 Frame 构造是否成功都必须尝试 QBUF；若原媒体操作和 QBUF 同时失败，优先返回会破坏后续驱动队列可用性的 QBUF 错误。
 
