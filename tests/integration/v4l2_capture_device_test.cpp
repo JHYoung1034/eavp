@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -9,13 +10,13 @@
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
-#include <limits.h>
 #include <linux/videodev2.h>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -272,6 +273,9 @@ eavp::Status preflight_device(const DeviceTestConfig& config) {
 }
 
 int count_open_device_fds(const std::string& device) {
+    struct stat device_stat;
+    if (::stat(device.c_str(), &device_stat) != 0) return -1;
+
     DIR* directory = ::opendir("/proc/self/fd");
     if (directory == NULL) return -1;
 
@@ -279,13 +283,19 @@ int count_open_device_fds(const std::string& device) {
     struct dirent* entry = NULL;
     while ((entry = ::readdir(directory)) != NULL) {
         if (entry->d_name[0] == '.') continue;
-        std::string fd_path("/proc/self/fd/");
-        fd_path += entry->d_name;
-        char target[PATH_MAX];
-        const ssize_t size = ::readlink(fd_path.c_str(), target, sizeof(target) - 1U);
-        if (size < 0) continue;
-        target[size] = '\0';
-        if (device == target) ++count;
+        char* end = NULL;
+        errno = 0;
+        const long descriptor = std::strtol(entry->d_name, &end, 10);
+        if (errno != 0 || end == entry->d_name || *end != '\0' ||
+            descriptor < 0 || descriptor > INT_MAX) {
+            continue;
+        }
+        struct stat fd_stat;
+        if (::fstat(static_cast<int>(descriptor), &fd_stat) != 0) continue;
+        if (fd_stat.st_dev == device_stat.st_dev &&
+            fd_stat.st_ino == device_stat.st_ino) {
+            ++count;
+        }
     }
     ::closedir(directory);
     return count;
