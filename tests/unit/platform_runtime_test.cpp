@@ -631,6 +631,9 @@ public:
         }
         return delegate_->monotonic_now(value);
     }
+    int monotonic_sleep_until(const struct timespec* deadline) override {
+        return delegate_->monotonic_sleep_until(deadline);
+    }
     int last_error() const override { return delegate_->last_error(); }
 
     void set_fixed_time(const struct timespec& value) {
@@ -908,6 +911,168 @@ TEST(LinuxPlatformRuntimeTest, CancelsDrainAndReturnsTimeoutAtTheDeadline) {
     EXPECT_GT(harness.node->stop_count(), 0);
     EXPECT_GE(harness.node->reset_count(), 1);
     EXPECT_EQ(stopped.code(), runtime->stop().code());
+}
+
+TEST(LinuxPlatformRuntimeTest,
+     BacksOffWhenAnEntireDrainRoundMakesNoProgress) {
+    RuntimePipelineHarness harness(
+        "bounded-drain", eavp::Status::ok_status(),
+        eavp::Status::ok_status(), true);
+    FakeLinuxRuntimeApi* raw_api = new FakeLinuxRuntimeApi();
+    raw_api->set_monotonic_step_ns(1000L);
+    std::unique_ptr<eavp::detail::LinuxRuntimeApi> api(raw_api);
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_injected_runtime(std::move(api), NULL, NULL, 1);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+
+    const eavp::Status stopped = runtime->stop();
+
+    EXPECT_EQ(eavp::StatusCode::kTimeout, stopped.code());
+    EXPECT_LE(harness.node->stop_count(), 2);
+    EXPECT_EQ(1, raw_api->monotonic_sleep_count);
+    ASSERT_EQ(1U, raw_api->sleep_deadlines.size());
+    EXPECT_EQ(0, raw_api->sleep_deadlines[0].tv_sec);
+    EXPECT_EQ(1000000L, raw_api->sleep_deadlines[0].tv_nsec);
+}
+
+TEST(LinuxPlatformRuntimeTest,
+     DoesNotBackOffUntilAWholeDrainRoundMakesNoProgress) {
+    RuntimePipelineHarness blocked(
+        "blocked-progress", eavp::Status::ok_status(),
+        eavp::Status::ok_status(), true);
+    RuntimePipelineHarness completed("completed-progress");
+    FakeLinuxRuntimeApi* raw_api = new FakeLinuxRuntimeApi();
+    raw_api->set_monotonic_step_ns(1000L);
+    int blocked_calls_at_first_sleep = 0;
+    raw_api->sleep_callback = [&]() {
+        if (blocked_calls_at_first_sleep == 0) {
+            blocked_calls_at_first_sleep = blocked.node->stop_count();
+        }
+    };
+    std::unique_ptr<eavp::detail::LinuxRuntimeApi> api(raw_api);
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_injected_runtime(std::move(api), NULL, NULL, 1);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &blocked.pipeline, blocked.wait_sources()).ok());
+    ASSERT_TRUE(runtime->register_pipeline(
+        &completed.pipeline, completed.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+
+    const eavp::Status stopped = runtime->stop();
+
+    EXPECT_EQ(eavp::StatusCode::kTimeout, stopped.code());
+    EXPECT_EQ(1, completed.node->stop_count());
+    EXPECT_EQ(2, blocked_calls_at_first_sleep);
+    EXPECT_EQ(1, raw_api->monotonic_sleep_count);
+}
+
+TEST(LinuxPlatformRuntimeTest,
+     RetriesInterruptedDrainBackoffWithABoundedAbsoluteDeadline) {
+    RuntimePipelineHarness harness(
+        "interrupted-backoff", eavp::Status::ok_status(),
+        eavp::Status::ok_status(), true);
+    FakeLinuxRuntimeApi* raw_api = new FakeLinuxRuntimeApi();
+    raw_api->set_monotonic_step_ns(1000L);
+    raw_api->queue_sleep_error(EINTR);
+    raw_api->queue_sleep_error(0);
+    std::unique_ptr<eavp::detail::LinuxRuntimeApi> api(raw_api);
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_injected_runtime(std::move(api), NULL, NULL, 1);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+
+    const eavp::Status stopped = runtime->stop();
+
+    EXPECT_EQ(eavp::StatusCode::kTimeout, stopped.code());
+    EXPECT_LE(harness.node->stop_count(), 2);
+    EXPECT_EQ(2, raw_api->monotonic_sleep_count);
+    ASSERT_EQ(2U, raw_api->sleep_deadlines.size());
+    EXPECT_EQ(raw_api->sleep_deadlines[0].tv_sec,
+              raw_api->sleep_deadlines[1].tv_sec);
+    EXPECT_EQ(raw_api->sleep_deadlines[0].tv_nsec,
+              raw_api->sleep_deadlines[1].tv_nsec);
+}
+
+TEST(LinuxPlatformRuntimeTest,
+     BoundsRepeatedInterruptionsDuringDrainBackoff) {
+    RuntimePipelineHarness harness(
+        "bounded-interrupts", eavp::Status::ok_status(),
+        eavp::Status::ok_status(), true);
+    FakeLinuxRuntimeApi* raw_api = new FakeLinuxRuntimeApi();
+    raw_api->set_monotonic_step_ns(1000L);
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        raw_api->queue_sleep_error(EINTR);
+    }
+    std::unique_ptr<eavp::detail::LinuxRuntimeApi> api(raw_api);
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_injected_runtime(std::move(api), NULL, NULL, 1);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+
+    const eavp::Status stopped = runtime->stop();
+
+    EXPECT_EQ(eavp::StatusCode::kIoError, stopped.code());
+    EXPECT_EQ("linux_runtime", stopped.provider_id());
+    EXPECT_EQ("clock_nanosleep", stopped.operation());
+    EXPECT_EQ(EINTR, stopped.native_code());
+    EXPECT_EQ(64, raw_api->monotonic_sleep_count);
+    EXPECT_EQ(1, harness.node->stop_count());
+    EXPECT_GE(harness.node->reset_count(), 1);
+}
+
+TEST(LinuxPlatformRuntimeTest,
+     DoesNotBackOffAfterTheDrainClockFails) {
+    RuntimePipelineHarness harness(
+        "clock-failure", eavp::Status::ok_status(),
+        eavp::Status::ok_status(), true);
+    FakeLinuxRuntimeApi* raw_api = new FakeLinuxRuntimeApi();
+    raw_api->queue_monotonic_error(0);
+    raw_api->queue_monotonic_error(EIO);
+    std::unique_ptr<eavp::detail::LinuxRuntimeApi> api(raw_api);
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_injected_runtime(std::move(api), NULL, NULL, 10);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+
+    const eavp::Status stopped = runtime->stop();
+
+    EXPECT_EQ(eavp::StatusCode::kIoError, stopped.code());
+    EXPECT_EQ("clock_gettime", stopped.operation());
+    EXPECT_EQ(EIO, stopped.native_code());
+    EXPECT_EQ(0, raw_api->monotonic_sleep_count);
+    EXPECT_EQ(1, harness.node->stop_count());
+}
+
+TEST(LinuxPlatformRuntimeTest,
+     DrainBackoffFailureDoesNotOverrideTheCancelRootCause) {
+    RuntimePipelineHarness harness(
+        "backoff-priority", eavp::Status::ok_status(),
+        eavp::Status::ok_status(), true);
+    harness.node->set_reset_status(eavp::Status(
+        eavp::StatusCode::kDeviceLost, "cancel root cause",
+        "camera", "reset", 29));
+    FakeLinuxRuntimeApi* raw_api = new FakeLinuxRuntimeApi();
+    raw_api->set_monotonic_step_ns(1000L);
+    raw_api->queue_sleep_error(EIO);
+    std::unique_ptr<eavp::detail::LinuxRuntimeApi> api(raw_api);
+    std::unique_ptr<eavp::LinuxPlatformRuntime> runtime =
+        create_injected_runtime(std::move(api), NULL, NULL, 10);
+    ASSERT_TRUE(runtime->register_pipeline(
+        &harness.pipeline, harness.wait_sources()).ok());
+    ASSERT_TRUE(runtime->start().ok());
+
+    const eavp::Status stopped = runtime->stop();
+
+    EXPECT_EQ(eavp::StatusCode::kDeviceLost, stopped.code());
+    EXPECT_EQ("camera", stopped.provider_id());
+    EXPECT_EQ("reset", stopped.operation());
+    EXPECT_EQ(29, stopped.native_code());
+    EXPECT_EQ(1, raw_api->monotonic_sleep_count);
 }
 
 TEST(LinuxPlatformRuntimeTest, DestructorStopsAndJoinsTheOwnedReactor) {

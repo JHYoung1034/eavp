@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <sys/eventfd.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace eavp {
@@ -63,6 +64,14 @@ public:
 
     int monotonic_now(struct timespec* value) {
         return save_failure(::clock_gettime(CLOCK_MONOTONIC, value));
+    }
+
+    int monotonic_sleep_until(const struct timespec* deadline) {
+        const int result = ::clock_nanosleep(
+            CLOCK_MONOTONIC, TIMER_ABSTIME, deadline, NULL);
+        if (result == 0) return 0;
+        last_error_slot() = result;
+        return -1;
     }
 
     int last_error() const { return last_error_slot(); }

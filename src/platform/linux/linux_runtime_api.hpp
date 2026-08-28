@@ -24,6 +24,7 @@ public:
     virtual int write_event_fd(int fd, std::uint64_t value) = 0;
     virtual int close_fd(int fd) = 0;
     virtual int monotonic_now(struct timespec* value) = 0;
+    virtual int monotonic_sleep_until(const struct timespec* deadline) = 0;
     virtual int last_error() const = 0;
 };
 

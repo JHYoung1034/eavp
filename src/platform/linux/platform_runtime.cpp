@@ -1,5 +1,6 @@
 #include "eavp/platform/linux/platform_runtime.hpp"
 
+#include <cerrno>
 #include <condition_variable>
 #include <ctime>
 #include <limits>
@@ -18,6 +19,9 @@
 
 namespace eavp {
 namespace {
+
+const int kMaximumInterruptedSleepAttempts = 64;
+const int kDrainBackoffMilliseconds = 1;
 
 Status allocation_failure() {
     return Status(StatusCode::kResourceExhausted);
@@ -42,6 +46,11 @@ Status selected_failure(const Status& media_failure,
 Status clock_failure(detail::LinuxRuntimeApi* api) {
     return Status(StatusCode::kIoError, "无法读取 Linux 单调时钟",
                   "linux_runtime", "clock_gettime", api->last_error());
+}
+
+Status sleep_failure(detail::LinuxRuntimeApi* api) {
+    return Status(StatusCode::kIoError, "Linux Runtime 停止排空等待失败",
+                  "linux_runtime", "clock_nanosleep", api->last_error());
 }
 
 Status add_milliseconds(const struct timespec& start, int milliseconds,
@@ -69,6 +78,32 @@ Status add_milliseconds(const struct timespec& start, int milliseconds,
 bool reached(const struct timespec& now, const struct timespec& deadline) {
     return now.tv_sec > deadline.tv_sec ||
            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec);
+}
+
+bool earlier(const struct timespec& left, const struct timespec& right) {
+    return left.tv_sec < right.tv_sec ||
+           (left.tv_sec == right.tv_sec && left.tv_nsec < right.tv_nsec);
+}
+
+Status wait_before_retry(detail::LinuxRuntimeApi* api,
+                         const struct timespec& now,
+                         const struct timespec& deadline) {
+    struct timespec retry_deadline = deadline;
+    struct timespec candidate = {0, 0};
+    const Status candidate_status = add_milliseconds(
+        now, kDrainBackoffMilliseconds, &candidate);
+    if (candidate_status.ok() && earlier(candidate, deadline)) {
+        retry_deadline = candidate;
+    }
+
+    for (int attempt = 0; attempt < kMaximumInterruptedSleepAttempts;
+         ++attempt) {
+        if (api->monotonic_sleep_until(&retry_deadline) == 0) {
+            return Status::ok_status();
+        }
+        if (api->last_error() != EINTR) return sleep_failure(api);
+    }
+    return sleep_failure(api);
 }
 
 template <typename ObserverCall>
@@ -574,6 +609,7 @@ private:
         std::vector<bool> stopped(pipelines_.size(), false);
         std::size_t remaining = pipelines_.size();
         while (remaining > 0U && media_failure->ok() && reactor_failure->ok()) {
+            bool made_progress = false;
             for (std::size_t reverse = pipelines_.size(); reverse > 0U;
                  --reverse) {
                 const std::size_t index = reverse - 1U;
@@ -582,6 +618,7 @@ private:
                 if (status.ok()) {
                     stopped[index] = true;
                     --remaining;
+                    made_progress = true;
                     continue;
                 }
                 if (status.code() == StatusCode::kWouldBlock ||
@@ -605,6 +642,14 @@ private:
                              media_failure);
                 record_first(observe_pipeline_failure(), observer_failure);
                 break;
+            }
+            if (!made_progress) {
+                const Status wait_status = wait_before_retry(
+                    runtime_api_, now, deadline);
+                if (!wait_status.ok()) {
+                    record_first(wait_status, reactor_failure);
+                    break;
+                }
             }
         }
 

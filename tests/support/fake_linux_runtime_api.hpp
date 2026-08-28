@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -55,14 +56,21 @@ public:
           throw_on_epoll_create(false), throw_on_create_event_fd(false),
           throw_on_epoll_add_call(0), throw_bad_alloc_on_epoll_add_call(0),
           read_event_fd_result(0), write_event_fd_result(0), close_fd_result(0),
-          monotonic_now_result(0), saved_error(EIO), event_fd_value(1U),
+          monotonic_now_result(0), monotonic_step_ns(0L),
+          saved_error(EIO), event_fd_value(1U),
           epoll_create_count(0), create_event_fd_count(0), epoll_add_count(0),
           epoll_wait_count(0),
           read_event_fd_count(0), write_event_fd_count(0),
-          monotonic_now_count(0), written_event_fd(-1), written_value(0U),
+          monotonic_now_count(0), monotonic_sleep_count(0),
+          written_event_fd(-1), written_value(0U),
           add_calls(), remove_calls(), closed_fds(),
+          sleep_deadlines(), sleep_callback(), monotonic_time_(),
+          monotonic_errors_(), sleep_errors_(),
           external_closed_fds_(external_closed_fds), registered_fds_(),
-          wait_steps(), blocking_wait_(false) {}
+          wait_steps(), blocking_wait_(false) {
+        monotonic_time_.tv_sec = 0;
+        monotonic_time_.tv_nsec = 0L;
+    }
 
     int epoll_create() {
         ++epoll_create_count;
@@ -161,12 +169,44 @@ public:
 
     int monotonic_now(struct timespec* value) {
         ++monotonic_now_count;
+        if (!monotonic_errors_.empty()) {
+            const int error = monotonic_errors_.front();
+            monotonic_errors_.pop_front();
+            if (error != 0) {
+                saved_error = error;
+                return -1;
+            }
+        }
         if (monotonic_now_result == 0) {
-            value->tv_sec = 0;
-            value->tv_nsec = 0L;
+            *value = monotonic_time_;
+            advance_monotonic(monotonic_step_ns);
         }
         return monotonic_now_result;
     }
+
+    int monotonic_sleep_until(const struct timespec* deadline) override {
+        ++monotonic_sleep_count;
+        sleep_deadlines.push_back(*deadline);
+        if (sleep_callback) sleep_callback();
+        if (!sleep_errors_.empty()) {
+            const int error = sleep_errors_.front();
+            sleep_errors_.pop_front();
+            if (error != 0) {
+                saved_error = error;
+                return -1;
+            }
+        }
+        monotonic_time_ = *deadline;
+        return 0;
+    }
+
+    void set_monotonic_step_ns(long step_ns) { monotonic_step_ns = step_ns; }
+
+    void queue_monotonic_error(int error) {
+        monotonic_errors_.push_back(error);
+    }
+
+    void queue_sleep_error(int error) { sleep_errors_.push_back(error); }
 
     int last_error() const { return saved_error; }
 
@@ -226,6 +266,7 @@ public:
     int write_event_fd_result;
     int close_fd_result;
     int monotonic_now_result;
+    long monotonic_step_ns;
     int saved_error;
     std::uint64_t event_fd_value;
     int epoll_create_count;
@@ -235,11 +276,14 @@ public:
     int read_event_fd_count;
     int write_event_fd_count;
     int monotonic_now_count;
+    int monotonic_sleep_count;
     int written_event_fd;
     std::uint64_t written_value;
     std::vector<AddCall> add_calls;
     std::vector<RemoveCall> remove_calls;
     std::vector<int> closed_fds;
+    std::vector<struct timespec> sleep_deadlines;
+    std::function<void()> sleep_callback;
 
 private:
     struct WaitStep {
@@ -256,6 +300,17 @@ private:
         return std::numeric_limits<std::uint64_t>::max();
     }
 
+    void advance_monotonic(long nanoseconds) {
+        if (nanoseconds <= 0L) return;
+        monotonic_time_.tv_nsec += nanoseconds;
+        monotonic_time_.tv_sec +=
+            static_cast<time_t>(monotonic_time_.tv_nsec / 1000000000L);
+        monotonic_time_.tv_nsec %= 1000000000L;
+    }
+
+    struct timespec monotonic_time_;
+    std::deque<int> monotonic_errors_;
+    std::deque<int> sleep_errors_;
     std::vector<int>* external_closed_fds_;
     std::set<int> registered_fds_;
     std::deque<WaitStep> wait_steps;
